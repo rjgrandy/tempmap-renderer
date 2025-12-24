@@ -1,0 +1,50 @@
+    name: Publish Docker Image to GHCR
+
+    on:
+      push:
+        branches:
+          - main # Trigger on pushes to the main branch
+          - dev
+
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true
+          
+    jobs:
+      build-and-push-image:
+        runs-on: ubuntu-latest
+        permissions:
+          contents: read
+          packages: write
+
+        steps:
+          - name: Checkout repository
+            uses: actions/checkout@v4
+
+          - name: Log in to the Container registry
+            uses: docker/login-action@v3
+            with:
+              registry: ghcr.io
+              username: ${{ github.actor }}
+              password: ${{ secrets.GITHUB_TOKEN }}
+
+          # Generate tags/labels based on the branch
+          - name: Docker meta
+            id: meta
+            uses: docker/metadata-action@v5
+            with:
+              images: ghcr.io/${{ github.repository }}
+              tags: |
+                # main → latest
+                type=raw,value=latest,enable=${{ github.ref_name == 'main' }}
+                # dev  → dev (and in general publish a branch tag)
+                type=raw,value=${{ github.ref_name }}
+    
+          - name: Build and push Docker image
+            uses: docker/build-push-action@v5
+            with:
+              context: .
+              push: true
+              tags: ${{ steps.meta.outputs.tags }}
+              labels: ${{ steps.meta.outputs.labels }}
+    
