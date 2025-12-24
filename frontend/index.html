@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>TempMap Renderer</title>
+    <style>
+      body {
+        margin: 0;
+        background: #101010;
+        color: #f0f0f0;
+        font-family: Arial, sans-serif;
+      }
+      header {
+        padding: 12px 20px;
+        background: #1b1b1b;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+      }
+      #canvas {
+        display: block;
+        width: 100%;
+        height: calc(100vh - 64px);
+        background: #151515;
+      }
+      select, button {
+        background: #2a2a2a;
+        color: #fff;
+        border: 1px solid #444;
+        padding: 6px 10px;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <strong>TempMap Renderer</strong>
+      <label for="floorSelect">Floorplan</label>
+      <select id="floorSelect"></select>
+      <button id="reload">Reload</button>
+    </header>
+    <canvas id="canvas" width="1600" height="1000"></canvas>
+    <script src="app.js"></script>
+  </body>
+</html>
