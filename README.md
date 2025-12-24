@@ -27,6 +27,10 @@ docker build -f docker/Dockerfile -t tempmap-renderer .
 docker run --rm -p 8000:8000 -v $(pwd)/data:/data tempmap-renderer
 ```
 
+## Unraid template
+
+Import the template in Unraid via **Unraid > Docker > Add Container > Template** dropdown, then select the TempMap Renderer template from the list.
+
 ## Floorplan schema (version 1)
 
 Stored at `/data/floorplans/{floor_id}.json`.
