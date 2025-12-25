@@ -1,6 +1,6 @@
 # TempMap Renderer
 
-A lightweight FastAPI service plus vanilla JS canvas editor for visualizing Home Assistant temperature maps.
+A lightweight FastAPI service plus vanilla JS canvas editor for visualizing Home Assistant temperature maps
 
 ## Stack
 - **Backend:** FastAPI (Python)
