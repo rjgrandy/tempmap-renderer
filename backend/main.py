@@ -94,9 +94,9 @@ class Stairwell(BaseModel):
 class SolverParams(BaseModel):
     grid_w: int = 400
     grid_h: int = 250
-    # Increased iterations for smoother gradients (enabled by vectorization speedup)
+    # High iteration count for smooth gradients
     iterations: int = 500
-    # Increased pull to 1.0 so sensors act as strong heat sources to fill the room
+    # Strong pull to anchor sensor values
     sensor_pull: float = 1.0
     wall_resistance: float = 5000.0
     default_passage_resistance: float = 2.0
@@ -515,23 +515,33 @@ def initialize_grid(fp: FloorplanV1) -> np.ndarray:
             weight = max(sensor.weight, 0.01)
             sensor_samples.append((gx, gy, temp, weight))
             temps.append(temp)
+    
+    # Calculate a default temp as a fallback, but we primarily use IDW now
     default_temp = float(np.mean(temps)) if temps else 70.0
+    
     if not sensor_samples:
         return np.full((fp.solver.grid_h, fp.solver.grid_w), default_temp, dtype=float)
+
     h_edges, v_edges = build_edge_conductance(fp)
     height, width = fp.solver.grid_h, fp.solver.grid_w
     
-    # MODIFIED: Increased scale to 2.0 to ensure temperature fills the room.
-    # Because wall resistance is high (5000), walls will still block the heat.
-    distance_scale = max(height, width) * 2.0
-    
+    # Initialize accumulators for Inverse Distance Weighting (IDW)
     weighted_sum = np.zeros((height, width), dtype=float)
     weight_sum = np.zeros((height, width), dtype=float)
+    
     for gx, gy, temp, weight in sensor_samples:
         distances = dijkstra_distances(gx, gy, h_edges, v_edges)
-        sensor_weight = weight * np.exp(-distances / distance_scale)
+        
+        # KEY CHANGE: Inverse Distance Weighting (1 / distance^2)
+        # This ensures the sensor's influence extends infinitely (filling the room)
+        # unless blocked by a wall (where distance becomes infinite).
+        # We add +1.0 to avoid division by zero at the sensor's own pixel.
+        sensor_weight = weight * (1.0 / (distances**2 + 1.0))
+        
         weighted_sum += sensor_weight * temp
         weight_sum += sensor_weight
+    
+    # Normalize
     grid = np.divide(
         weighted_sum,
         weight_sum,
@@ -552,37 +562,23 @@ def diffuse_grid(fp: FloorplanV1, grid: np.ndarray) -> np.ndarray:
     height, width = grid.shape
     h_edges, v_edges = build_edge_conductance(fp)
 
-    # MODIFIED: Vectorized diffusion for performance.
-    # This replaces the slow nested loop with fast numpy operations.
+    # Vectorized diffusion using numpy shifting
     
-    # Pad edges to alignment with grid for shifting
-    # h_edges is (H, W-1).
-    # Left flow weights (from x-1 to x): pad right with 0, pad left with 0
-    # Actually, we align them to the grid cells.
-    # w_left[y, x] is conductance between (y, x) and (y, x-1)
+    # Pad edges to align with grid
     w_left = np.pad(h_edges, ((0, 0), (1, 0)), mode='constant', constant_values=0)
-    # w_right[y, x] is conductance between (y, x) and (y, x+1)
     w_right = np.pad(h_edges, ((0, 0), (0, 1)), mode='constant', constant_values=0)
-    
-    # v_edges is (H-1, W).
-    # w_up[y, x] is conductance between (y, x) and (y-1, x)
     w_up = np.pad(v_edges, ((1, 0), (0, 0)), mode='constant', constant_values=0)
-    # w_down[y, x] is conductance between (y, x) and (y+1, x)
     w_down = np.pad(v_edges, ((0, 1), (0, 0)), mode='constant', constant_values=0)
     
-    # Get neighbors using array shifts
+    # Neighbors
     n_left = np.roll(grid, 1, axis=1)
     n_right = np.roll(grid, -1, axis=1)
     n_up = np.roll(grid, 1, axis=0)
     n_down = np.roll(grid, -1, axis=0)
     
-    # Note: np.roll wraps around, but the weights at the edges are 0,
-    # so the wrapped values will be multiplied by 0 and ignored.
-
     numerator = (n_left * w_left) + (n_right * w_right) + (n_up * w_up) + (n_down * w_down)
     denominator = w_left + w_right + w_up + w_down
     
-    # Prevent division by zero (isolated pixels stay as they are)
     mask = denominator > 0
     new_grid = grid.copy()
     new_grid[mask] = numerator[mask] / denominator[mask]
