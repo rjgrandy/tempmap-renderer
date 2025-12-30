@@ -94,8 +94,10 @@ class Stairwell(BaseModel):
 class SolverParams(BaseModel):
     grid_w: int = 400
     grid_h: int = 250
-    iterations: int = 200
-    sensor_pull: float = 0.15
+    # Increased iterations for smoother gradients (enabled by vectorization speedup)
+    iterations: int = 500
+    # Increased pull to 1.0 so sensors act as strong heat sources to fill the room
+    sensor_pull: float = 1.0
     wall_resistance: float = 5000.0
     default_passage_resistance: float = 2.0
 
@@ -348,14 +350,12 @@ def parse_floorplan(payload: Dict) -> Dict:
     return json.loads(parsed.json())
 
 
-
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
 def point_xy(point: Point) -> Tuple[float, float]:
     return float(point[0]), float(point[1])
-
 
 
 def gather_entities(floorplans: Dict[str, Dict]) -> List[str]:
@@ -374,7 +374,6 @@ def gather_entities(floorplans: Dict[str, Dict]) -> List[str]:
     return sorted({e for e in entities if e})
 
 
-
 def ha_poll_loop() -> None:
     global ha_last_poll
     while True:
@@ -390,7 +389,6 @@ def ha_poll_loop() -> None:
         time.sleep(config.refresh_seconds)
 
 
-
 def load_all_floorplans() -> Dict[str, Dict]:
     floor_dir = Path(config.data_path) / "floorplans"
     floorplans = {}
@@ -398,7 +396,6 @@ def load_all_floorplans() -> Dict[str, Dict]:
         with path.open("r", encoding="utf-8") as handle:
             floorplans[path.stem] = json.load(handle)
     return floorplans
-
 
 
 def poll_home_assistant(entities: List[str]) -> None:
@@ -438,7 +435,6 @@ def poll_home_assistant(entities: List[str]) -> None:
         ha_unavailable.update(unavailable)
 
 
-
 def render_frames_for_floorplans(floorplans: Dict[str, Dict]) -> None:
     grids, metadata = solve_all_floorplans(floorplans)
     for floor_id, floorplan in floorplans.items():
@@ -450,14 +446,12 @@ def render_frames_for_floorplans(floorplans: Dict[str, Dict]) -> None:
     cleanup_frames()
 
 
-
 def save_frame(floor_id: str, image: Image.Image) -> None:
     frames_dir = Path(config.data_path) / "frames" / floor_id
     frames_dir.mkdir(parents=True, exist_ok=True)
     timestamp = int(time.time())
     path = frames_dir / f"{timestamp}.png"
     image.save(path)
-
 
 
 def cleanup_frames() -> None:
@@ -473,7 +467,6 @@ def cleanup_frames() -> None:
                 path.unlink(missing_ok=True)
 
 
-
 def render_floorplan(floor_id: str) -> Image.Image:
     floorplans = load_all_floorplans()
     if floor_id not in floorplans:
@@ -483,7 +476,6 @@ def render_floorplan(floor_id: str) -> Image.Image:
     if grid is None:
         raise HTTPException(status_code=404, detail="Floorplan not found")
     return render_floorplan_image(floor_id, floorplans[floor_id], grid, metadata.get(floor_id, {}))
-
 
 
 def solve_all_floorplans(floorplans: Dict[str, Dict]) -> Tuple[Dict[str, np.ndarray], Dict[str, Dict]]:
@@ -504,7 +496,6 @@ def solve_all_floorplans(floorplans: Dict[str, Dict]) -> Tuple[Dict[str, np.ndar
             "iterations": fp.solver.iterations,
         }
     return grids, metadata
-
 
 
 def initialize_grid(fp: FloorplanV1) -> np.ndarray:
@@ -529,7 +520,11 @@ def initialize_grid(fp: FloorplanV1) -> np.ndarray:
         return np.full((fp.solver.grid_h, fp.solver.grid_w), default_temp, dtype=float)
     h_edges, v_edges = build_edge_conductance(fp)
     height, width = fp.solver.grid_h, fp.solver.grid_w
-    distance_scale = max(height, width) * 0.35
+    
+    # MODIFIED: Increased scale to 2.0 to ensure temperature fills the room.
+    # Because wall resistance is high (5000), walls will still block the heat.
+    distance_scale = max(height, width) * 2.0
+    
     weighted_sum = np.zeros((height, width), dtype=float)
     weight_sum = np.zeros((height, width), dtype=float)
     for gx, gy, temp, weight in sensor_samples:
@@ -546,7 +541,6 @@ def initialize_grid(fp: FloorplanV1) -> np.ndarray:
     return grid
 
 
-
 def parse_float(value: str) -> float:
     try:
         return float(value)
@@ -554,38 +548,45 @@ def parse_float(value: str) -> float:
         return 0.0
 
 
-
 def diffuse_grid(fp: FloorplanV1, grid: np.ndarray) -> np.ndarray:
     height, width = grid.shape
     h_edges, v_edges = build_edge_conductance(fp)
+
+    # MODIFIED: Vectorized diffusion for performance.
+    # This replaces the slow nested loop with fast numpy operations.
+    
+    # Pad edges to alignment with grid for shifting
+    # h_edges is (H, W-1).
+    # Left flow weights (from x-1 to x): pad right with 0, pad left with 0
+    # Actually, we align them to the grid cells.
+    # w_left[y, x] is conductance between (y, x) and (y, x-1)
+    w_left = np.pad(h_edges, ((0, 0), (1, 0)), mode='constant', constant_values=0)
+    # w_right[y, x] is conductance between (y, x) and (y, x+1)
+    w_right = np.pad(h_edges, ((0, 0), (0, 1)), mode='constant', constant_values=0)
+    
+    # v_edges is (H-1, W).
+    # w_up[y, x] is conductance between (y, x) and (y-1, x)
+    w_up = np.pad(v_edges, ((1, 0), (0, 0)), mode='constant', constant_values=0)
+    # w_down[y, x] is conductance between (y, x) and (y+1, x)
+    w_down = np.pad(v_edges, ((0, 1), (0, 0)), mode='constant', constant_values=0)
+    
+    # Get neighbors using array shifts
+    n_left = np.roll(grid, 1, axis=1)
+    n_right = np.roll(grid, -1, axis=1)
+    n_up = np.roll(grid, 1, axis=0)
+    n_down = np.roll(grid, -1, axis=0)
+    
+    # Note: np.roll wraps around, but the weights at the edges are 0,
+    # so the wrapped values will be multiplied by 0 and ignored.
+
+    numerator = (n_left * w_left) + (n_right * w_right) + (n_up * w_up) + (n_down * w_down)
+    denominator = w_left + w_right + w_up + w_down
+    
+    # Prevent division by zero (isolated pixels stay as they are)
+    mask = denominator > 0
     new_grid = grid.copy()
-    for y in range(height):
-        for x in range(width):
-            neighbors = []
-            weights = []
-            if x > 0:
-                conductance = h_edges[y, x - 1]
-                if conductance > 0:
-                    weights.append(conductance)
-                    neighbors.append(grid[y, x - 1])
-            if x < width - 1:
-                conductance = h_edges[y, x]
-                if conductance > 0:
-                    weights.append(conductance)
-                    neighbors.append(grid[y, x + 1])
-            if y > 0:
-                conductance = v_edges[y - 1, x]
-                if conductance > 0:
-                    weights.append(conductance)
-                    neighbors.append(grid[y - 1, x])
-            if y < height - 1:
-                conductance = v_edges[y, x]
-                if conductance > 0:
-                    weights.append(conductance)
-                    neighbors.append(grid[y + 1, x])
-            total_weight = sum(weights)
-            if total_weight > 0:
-                new_grid[y, x] = float(np.dot(neighbors, weights) / total_weight)
+    new_grid[mask] = numerator[mask] / denominator[mask]
+
     apply_sensor_pull(fp, new_grid)
     return new_grid
 
@@ -649,7 +650,6 @@ def dijkstra_distances(
     return distances
 
 
-
 def rasterize_walls(fp: FloorplanV1, h_edges: np.ndarray, v_edges: np.ndarray) -> None:
     conductance = 0.0
     for wall in fp.walls:
@@ -658,13 +658,11 @@ def rasterize_walls(fp: FloorplanV1, h_edges: np.ndarray, v_edges: np.ndarray) -
             mark_segment(fp, points[idx], points[idx + 1], h_edges, v_edges, conductance)
 
 
-
 def rasterize_doors(fp: FloorplanV1, h_edges: np.ndarray, v_edges: np.ndarray) -> None:
     for door in fp.doors:
         resistance = door_resistance(fp, door)
         conductance = 0.0 if resistance >= fp.solver.wall_resistance else 1.0 / resistance
         mark_segment(fp, door.segment[0], door.segment[1], h_edges, v_edges, conductance)
-
 
 
 def door_resistance(fp: FloorplanV1, door: Door) -> float:
@@ -712,7 +710,6 @@ def mark_segment(
             prev = current
 
 
-
 def mark_edge(
     a: Tuple[int, int],
     b: Tuple[int, int],
@@ -732,7 +729,6 @@ def mark_edge(
             v_edges[y, ax] = min(v_edges[y, ax], conductance)
 
 
-
 def apply_sensor_pull(fp: FloorplanV1, grid: np.ndarray) -> None:
     for sensor in fp.sensors:
         with ha_lock:
@@ -747,7 +743,6 @@ def apply_sensor_pull(fp: FloorplanV1, grid: np.ndarray) -> None:
         gy = min(max(gy, 0), fp.solver.grid_h - 1)
         pull = min(max(fp.solver.sensor_pull * sensor.weight, 0.0), 1.0)
         grid[gy, gx] = (1 - pull) * grid[gy, gx] + pull * temp
-
 
 
 def apply_stairwell_coupling(parsed: Dict[str, FloorplanV1], grids: Dict[str, np.ndarray]) -> None:
@@ -768,7 +763,6 @@ def apply_stairwell_coupling(parsed: Dict[str, FloorplanV1], grids: Dict[str, np
         grids[target] = target_grid
 
 
-
 def polygon_mask(fp: FloorplanV1, polygon: List[Point]) -> np.ndarray:
     height, width = fp.solver.grid_h, fp.solver.grid_w
     xs = [point_xy(p)[0] / fp.canvas.width * width for p in polygon]
@@ -787,7 +781,6 @@ def polygon_mask(fp: FloorplanV1, polygon: List[Point]) -> np.ndarray:
     return mask
 
 
-
 def point_in_polygon(x: float, y: float, xs: List[float], ys: List[float]) -> bool:
     inside = False
     j = len(xs) - 1
@@ -801,7 +794,6 @@ def point_in_polygon(x: float, y: float, xs: List[float], ys: List[float]) -> bo
             inside = not inside
         j = i
     return inside
-
 
 
 def render_floorplan_image(
@@ -846,7 +838,6 @@ def render_floorplan_image(
     if fp.render.show_timestamp:
         draw_timestamp(draw, fp.render.exterior_margin)
     return canvas.convert("RGB")
-
 
 
 def render_heatmap(
