@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <Container version="2">
   <Name>TempMap Renderer</Name>
-  <Repository>ghcr.io/&lt;owner&gt;/&lt;repo&gt;:latest</Repository>
+  <Repository>ghcr.io/rjgrandy/tempmap-renderer:main</Repository>
   <Network>bridge</Network>
   <MyIP/>
   <Shell>bash</Shell>
