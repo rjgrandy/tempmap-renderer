@@ -14,9 +14,10 @@ import numpy as np
 import requests
 import yaml
 from fastapi import FastAPI, HTTPException, Response
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, conlist
 from PIL import Image, ImageDraw, ImageFont
 
 DATA_ENV = "TEMP_MAP_DATA_PATH"
@@ -27,78 +28,100 @@ class CanvasSize(BaseModel):
     height: int = 1000
 
 
+Point = conlist(float, min_length=2, max_length=2)
+Segment = conlist(Point, min_length=2, max_length=2)
+
+
+class Calibration(BaseModel):
+    p1: Point = Field(default_factory=lambda: [0.0, 0.0])
+    p2: Point = Field(default_factory=lambda: [100.0, 0.0])
+    distance_m: float = 1.0
+
+
 class ScaleCalibration(BaseModel):
-    pixels_per_unit: float = 10.0
-    unit: str = "ft"
+    mode: str = "calibrated"
+    px_per_meter: float = 100.0
+    calibration: Calibration = Field(default_factory=Calibration)
 
 
-class Point(BaseModel):
-    x: float
-    y: float
-
-
-class Polyline(BaseModel):
+class Wall(BaseModel):
+    id: str
     points: List[Point]
 
 
-class Segment(BaseModel):
-    a: Point
-    b: Point
-
-
 class DoorMapping(BaseModel):
-    open_states: List[str] = Field(default_factory=lambda: ["on", "open"])
-    closed_states: List[str] = Field(default_factory=lambda: ["off", "closed"])
+    open_values: List[str] = Field(default_factory=lambda: ["on", "open"])
+    closed_values: List[str] = Field(default_factory=lambda: ["off", "closed"])
+    unknown_as: str = "closed"
 
 
 class Door(BaseModel):
+    id: str
     segment: Segment
-    entity_id: str
+    entity_id: Optional[str] = None
     mapping: DoorMapping = Field(default_factory=DoorMapping)
+    open: bool = False
+    open_resistance: Optional[float] = None
+    closed_resistance: Optional[float] = None
 
 
 class Sensor(BaseModel):
+    id: str
+    entity: Optional[str] = None
     pos: Point
-    entity_id: str
+    label: str = ""
+    weight: float = 1.0
 
 
 class Thermostat(BaseModel):
+    id: str
     pos: Point
     temperature_entity: str
     setpoint_entity: str
-    climate_entity: Optional[str] = None
+    mode_entity: Optional[str] = None
+    device_label: str = ""
 
 
 class Stairwell(BaseModel):
+    id: str
     polygon: List[Point]
-    target_floor_id: str
-
-
-class SolverParams(BaseModel):
-    grid_width: int = 400
-    grid_height: int = 250
-    iterations: int = 200
-    wall_resistance: float = 5000.0
-    door_open_resistance: float = 2.0
-    door_closed_resistance: float = 500.0
-    sensor_pull: float = 0.15
+    link_to_floor_id: str
     coupling: float = 0.05
 
 
+class SolverParams(BaseModel):
+    grid_w: int = 400
+    grid_h: int = 250
+    iterations: int = 200
+    sensor_pull: float = 0.15
+    wall_resistance: float = 5000.0
+    default_passage_resistance: float = 2.0
+
+
+class TemperatureRange(BaseModel):
+    min: float = 60.0
+    max: float = 80.0
+
+
 class RenderParams(BaseModel):
-    legend_min_f: float = 60.0
-    legend_max_f: float = 80.0
+    temp_range_f: TemperatureRange = Field(default_factory=TemperatureRange)
+    overlay_alpha: float = 0.6
+    show_walls: bool = True
+    show_labels: bool = True
+    show_legend: bool = True
+    show_timestamp: bool = True
 
 
 class FloorplanV1(BaseModel):
     version: int = 1
+    floor_id: str = "floor1"
     canvas: CanvasSize = Field(default_factory=CanvasSize)
     scale: ScaleCalibration = Field(default_factory=ScaleCalibration)
-    walls: List[Polyline] = Field(default_factory=list)
+    walls: List[Wall] = Field(default_factory=list)
     doors: List[Door] = Field(default_factory=list)
     sensors: List[Sensor] = Field(default_factory=list)
     thermostats: List[Thermostat] = Field(default_factory=list)
-    stairwells: List[Stairwell] = Field(default_factory=list)
+    stairwell: Optional[Stairwell] = None
     solver: SolverParams = Field(default_factory=SolverParams)
     render: RenderParams = Field(default_factory=RenderParams)
 
@@ -123,6 +146,12 @@ class EntityState:
 
 
 app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 CONFIG_PATH = Path(__file__).with_name("config.yaml")
 
@@ -216,7 +245,7 @@ def render_live_png(floor_id: str) -> Response:
     return Response(content=image_bytes, media_type="image/png", headers={"Cache-Control": "no-store"})
 
 
-app.mount("/", StaticFiles(directory=Path(__file__).parents[1] / "frontend", html=True), name="frontend")
+app.mount("/editor", StaticFiles(directory=Path(__file__).parents[1] / "frontend", html=True), name="frontend")
 
 
 @app.get("/render/live/{floor_id}.json")
@@ -317,6 +346,10 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def point_xy(point: Point) -> Tuple[float, float]:
+    return float(point[0]), float(point[1])
+
+
 
 def gather_entities(floorplans: Dict[str, Dict]) -> List[str]:
     entities = []
@@ -324,13 +357,13 @@ def gather_entities(floorplans: Dict[str, Dict]) -> List[str]:
         for door in floorplan.get("doors", []):
             entities.append(door.get("entity_id"))
         for sensor in floorplan.get("sensors", []):
-            entities.append(sensor.get("entity_id"))
+            entities.append(sensor.get("entity"))
         for thermo in floorplan.get("thermostats", []):
             entities.append(thermo.get("temperature_entity"))
             entities.append(thermo.get("setpoint_entity"))
-            climate = thermo.get("climate_entity")
-            if climate:
-                entities.append(climate)
+            mode_entity = thermo.get("mode_entity")
+            if mode_entity:
+                entities.append(mode_entity)
     return sorted({e for e in entities if e})
 
 
@@ -459,8 +492,8 @@ def solve_all_floorplans(floorplans: Dict[str, Dict]) -> Tuple[Dict[str, np.ndar
         apply_stairwell_coupling(parsed, grids)
     for floor_id, fp in parsed.items():
         metadata[floor_id] = {
-            "grid_width": fp.solver.grid_width,
-            "grid_height": fp.solver.grid_height,
+            "grid_width": fp.solver.grid_w,
+            "grid_height": fp.solver.grid_h,
             "iterations": fp.solver.iterations,
         }
     return grids, metadata
@@ -471,11 +504,11 @@ def initialize_grid(fp: FloorplanV1) -> np.ndarray:
     temps = []
     with ha_lock:
         for sensor in fp.sensors:
-            state = ha_states.get(sensor.entity_id)
+            state = ha_states.get(sensor.entity) if sensor.entity else None
             if state:
                 temps.append(parse_float(state.state))
     default_temp = float(np.mean(temps)) if temps else 70.0
-    grid = np.full((fp.solver.grid_height, fp.solver.grid_width), default_temp, dtype=float)
+    grid = np.full((fp.solver.grid_h, fp.solver.grid_w), default_temp, dtype=float)
     return grid
 
 
@@ -532,15 +565,27 @@ def rasterize_walls(fp: FloorplanV1, h_edges: np.ndarray, v_edges: np.ndarray) -
 
 def rasterize_doors(fp: FloorplanV1, h_edges: np.ndarray, v_edges: np.ndarray) -> None:
     for door in fp.doors:
+        resistance = door_resistance(fp, door)
+        conductance = 1.0 / resistance
+        mark_segment(fp, door.segment[0], door.segment[1], h_edges, v_edges, conductance)
+
+
+
+def door_resistance(fp: FloorplanV1, door: Door) -> float:
+    door_open = door.open
+    if door.entity_id:
         with ha_lock:
             state = ha_states.get(door.entity_id)
-        if state and state.state in door.mapping.open_states:
-            resistance = fp.solver.door_open_resistance
-        else:
-            resistance = fp.solver.door_closed_resistance
-        conductance = 1.0 / resistance
-        mark_segment(fp, door.segment.a, door.segment.b, h_edges, v_edges, conductance)
-
+        if state:
+            if state.state in door.mapping.open_values:
+                door_open = True
+            elif state.state in door.mapping.closed_values:
+                door_open = False
+            else:
+                door_open = door.mapping.unknown_as == "open"
+    if door_open:
+        return door.open_resistance or fp.solver.default_passage_resistance
+    return door.closed_resistance or fp.solver.wall_resistance
 
 
 def mark_segment(
@@ -551,12 +596,14 @@ def mark_segment(
     v_edges: np.ndarray,
     conductance: float,
 ) -> None:
-    grid_w = fp.solver.grid_width
-    grid_h = fp.solver.grid_height
-    x0 = int(a.x / fp.canvas.width * grid_w)
-    y0 = int(a.y / fp.canvas.height * grid_h)
-    x1 = int(b.x / fp.canvas.width * grid_w)
-    y1 = int(b.y / fp.canvas.height * grid_h)
+    grid_w = fp.solver.grid_w
+    grid_h = fp.solver.grid_h
+    ax, ay = point_xy(a)
+    bx, by = point_xy(b)
+    x0 = int(ax / fp.canvas.width * grid_w)
+    y0 = int(ay / fp.canvas.height * grid_h)
+    x1 = int(bx / fp.canvas.width * grid_w)
+    y1 = int(by / fp.canvas.height * grid_h)
     steps = max(abs(x1 - x0), abs(y1 - y0), 1) * 2
     prev = (x0, y0)
     for step in range(1, steps + 1):
@@ -593,39 +640,43 @@ def mark_edge(
 def apply_sensor_pull(fp: FloorplanV1, grid: np.ndarray) -> None:
     for sensor in fp.sensors:
         with ha_lock:
-            state = ha_states.get(sensor.entity_id)
+            state = ha_states.get(sensor.entity) if sensor.entity else None
         if not state:
             continue
         temp = parse_float(state.state)
-        gx = int(sensor.pos.x / fp.canvas.width * fp.solver.grid_width)
-        gy = int(sensor.pos.y / fp.canvas.height * fp.solver.grid_height)
-        gx = min(max(gx, 0), fp.solver.grid_width - 1)
-        gy = min(max(gy, 0), fp.solver.grid_height - 1)
-        grid[gy, gx] = (1 - fp.solver.sensor_pull) * grid[gy, gx] + fp.solver.sensor_pull * temp
+        sx, sy = point_xy(sensor.pos)
+        gx = int(sx / fp.canvas.width * fp.solver.grid_w)
+        gy = int(sy / fp.canvas.height * fp.solver.grid_h)
+        gx = min(max(gx, 0), fp.solver.grid_w - 1)
+        gy = min(max(gy, 0), fp.solver.grid_h - 1)
+        pull = min(max(fp.solver.sensor_pull * sensor.weight, 0.0), 1.0)
+        grid[gy, gx] = (1 - pull) * grid[gy, gx] + pull * temp
 
 
 
 def apply_stairwell_coupling(parsed: Dict[str, FloorplanV1], grids: Dict[str, np.ndarray]) -> None:
     for floor_id, fp in parsed.items():
-        for stair in fp.stairwells:
-            target = stair.target_floor_id
-            if target not in grids:
-                continue
-            source_grid = grids[floor_id]
-            target_grid = grids[target]
-            mask = polygon_mask(fp, stair.polygon)
-            coupling = fp.solver.coupling
-            source_grid[mask] = source_grid[mask] + coupling * (target_grid[mask] - source_grid[mask])
-            target_grid[mask] = target_grid[mask] + coupling * (source_grid[mask] - target_grid[mask])
-            grids[floor_id] = source_grid
-            grids[target] = target_grid
+        stair = fp.stairwell
+        if not stair:
+            continue
+        target = stair.link_to_floor_id
+        if target not in grids:
+            continue
+        source_grid = grids[floor_id]
+        target_grid = grids[target]
+        mask = polygon_mask(fp, stair.polygon)
+        coupling = stair.coupling
+        source_grid[mask] = source_grid[mask] + coupling * (target_grid[mask] - source_grid[mask])
+        target_grid[mask] = target_grid[mask] + coupling * (source_grid[mask] - target_grid[mask])
+        grids[floor_id] = source_grid
+        grids[target] = target_grid
 
 
 
 def polygon_mask(fp: FloorplanV1, polygon: List[Point]) -> np.ndarray:
-    height, width = fp.solver.grid_height, fp.solver.grid_width
-    xs = [p.x / fp.canvas.width * width for p in polygon]
-    ys = [p.y / fp.canvas.height * height for p in polygon]
+    height, width = fp.solver.grid_h, fp.solver.grid_w
+    xs = [point_xy(p)[0] / fp.canvas.width * width for p in polygon]
+    ys = [point_xy(p)[1] / fp.canvas.height * height for p in polygon]
     mask = np.zeros((height, width), dtype=bool)
     if not xs or not ys:
         return mask
@@ -665,25 +716,40 @@ def render_floorplan_image(
 ) -> Image.Image:
     fp = FloorplanV1.parse_obj(payload)
     canvas = Image.new("RGBA", (fp.canvas.width, fp.canvas.height), (20, 20, 20, 255))
-    heatmap = render_heatmap(grid, fp.render.legend_min_f, fp.render.legend_max_f, canvas.size)
+    heatmap = render_heatmap(
+        grid,
+        fp.render.temp_range_f.min,
+        fp.render.temp_range_f.max,
+        fp.render.overlay_alpha,
+        canvas.size,
+    )
     canvas = Image.alpha_composite(canvas, heatmap)
     draw = ImageDraw.Draw(canvas)
-    draw_walls(draw, fp)
+    if fp.render.show_walls:
+        draw_walls(draw, fp)
     draw_sensors(draw, fp)
     draw_thermostats(draw, fp)
-    draw_legend(draw, fp)
-    draw_timestamp(draw)
+    if fp.render.show_legend:
+        draw_legend(draw, fp)
+    if fp.render.show_timestamp:
+        draw_timestamp(draw)
     return canvas.convert("RGB")
 
 
 
-def render_heatmap(grid: np.ndarray, min_f: float, max_f: float, size: Tuple[int, int]) -> Image.Image:
+def render_heatmap(
+    grid: np.ndarray,
+    min_f: float,
+    max_f: float,
+    overlay_alpha: float,
+    size: Tuple[int, int],
+) -> Image.Image:
     norm = np.clip((grid - min_f) / (max_f - min_f + 1e-6), 0, 1)
     colors = np.zeros((grid.shape[0], grid.shape[1], 4), dtype=np.uint8)
     colors[..., 0] = (255 * norm).astype(np.uint8)
     colors[..., 2] = (255 * (1 - norm)).astype(np.uint8)
     colors[..., 1] = (128 * (1 - np.abs(norm - 0.5) * 2)).astype(np.uint8)
-    colors[..., 3] = int(255 * 0.55)
+    colors[..., 3] = int(255 * min(max(overlay_alpha, 0.0), 1.0))
     image = Image.fromarray(colors, mode="RGBA")
     return image.resize(size, resample=Image.Resampling.BILINEAR)
 
@@ -691,10 +757,10 @@ def render_heatmap(grid: np.ndarray, min_f: float, max_f: float, size: Tuple[int
 
 def draw_walls(draw: ImageDraw.ImageDraw, fp: FloorplanV1) -> None:
     for wall in fp.walls:
-        points = [(p.x, p.y) for p in wall.points]
+        points = [point_xy(p) for p in wall.points]
         draw.line(points, fill=(230, 230, 230), width=3)
     for door in fp.doors:
-        points = [(door.segment.a.x, door.segment.a.y), (door.segment.b.x, door.segment.b.y)]
+        points = [point_xy(door.segment[0]), point_xy(door.segment[1])]
         draw.line(points, fill=(120, 200, 255), width=4)
 
 
@@ -702,24 +768,29 @@ def draw_walls(draw: ImageDraw.ImageDraw, fp: FloorplanV1) -> None:
 def draw_sensors(draw: ImageDraw.ImageDraw, fp: FloorplanV1) -> None:
     font = ImageFont.load_default()
     for sensor in fp.sensors:
-        x, y = sensor.pos.x, sensor.pos.y
+        x, y = point_xy(sensor.pos)
         draw.ellipse((x - 6, y - 6, x + 6, y + 6), fill=(255, 255, 255))
-        draw.text((x + 8, y - 8), sensor.entity_id, fill=(255, 255, 255), font=font)
+        if fp.render.show_labels:
+            label = sensor.label or sensor.entity or ""
+            draw.text((x + 8, y - 8), label, fill=(255, 255, 255), font=font)
 
 
 
 def draw_thermostats(draw: ImageDraw.ImageDraw, fp: FloorplanV1) -> None:
     font = ImageFont.load_default()
     for thermo in fp.thermostats:
-        x, y = thermo.pos.x, thermo.pos.y
+        x, y = point_xy(thermo.pos)
         draw.rectangle((x - 8, y - 8, x + 8, y + 8), outline=(255, 200, 50), width=2)
-        temp = read_entity_state(thermo.temperature_entity)
-        setpoint = read_entity_state(thermo.setpoint_entity)
-        label = f"{temp} / {setpoint}"
-        if thermo.climate_entity:
-            mode = read_entity_state(thermo.climate_entity)
-            label = f"{label} ({mode})"
-        draw.text((x + 10, y - 8), label, fill=(255, 200, 50), font=font)
+        if fp.render.show_labels:
+            temp = read_entity_state(thermo.temperature_entity)
+            setpoint = read_entity_state(thermo.setpoint_entity)
+            label = f"{temp} / {setpoint}"
+            if thermo.mode_entity:
+                mode = read_entity_state(thermo.mode_entity)
+                label = f"{label} ({mode})"
+            if thermo.device_label:
+                label = f"{thermo.device_label} {label}"
+            draw.text((x + 10, y - 8), label, fill=(255, 200, 50), font=font)
 
 
 
@@ -739,10 +810,10 @@ def draw_legend(draw: ImageDraw.ImageDraw, fp: FloorplanV1) -> None:
         r = int(255 * t)
         b = int(255 * (1 - t))
         g = int(128 * (1 - abs(t - 0.5) * 2))
-        draw.line([(i, y0), (i, y1)], fill=(r, g, b))
+    draw.line([(i, y0), (i, y1)], fill=(r, g, b))
     draw.rectangle((x0, y0, x1, y1), outline=(255, 255, 255), width=1)
-    draw.text((x0, y0 - 18), f"{fp.render.legend_min_f}F", fill=(255, 255, 255), font=font)
-    draw.text((x1 - 40, y0 - 18), f"{fp.render.legend_max_f}F", fill=(255, 255, 255), font=font)
+    draw.text((x0, y0 - 18), f"{fp.render.temp_range_f.min}F", fill=(255, 255, 255), font=font)
+    draw.text((x1 - 40, y0 - 18), f"{fp.render.temp_range_f.max}F", fill=(255, 255, 255), font=font)
 
 
 

@@ -1,6 +1,6 @@
 # TempMap Renderer
 
-A lightweight FastAPI service plus vanilla JS canvas editor for visualizing Home Assistant temperature maps
+A lightweight FastAPI service plus a vanilla JS canvas editor for building multi-floor temperature maps.
 
 ## Stack
 - **Backend:** FastAPI (Python)
@@ -18,7 +18,9 @@ pip install -r backend/requirements.txt
 uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-Place floorplans under `/data/floorplans/{floor_id}.json`.
+Open the editor at http://localhost:8000/editor.
+
+Floorplans are saved under `/data/floorplans/{floor_id}.json`.
 
 ## Docker
 
@@ -27,9 +29,20 @@ docker build -f docker/Dockerfile -t tempmap-renderer .
 docker run --rm -p 8000:8000 -v $(pwd)/data:/data tempmap-renderer
 ```
 
+Then visit http://localhost:8000/editor.
+
 ## Unraid template
 
 Import the template in Unraid via **Unraid > Docker > Add Container > Template** dropdown, then select the TempMap Renderer template from the list.
+
+## Floorplan builder usage
+
+1. Open `/editor` and select **Floor 1**.
+2. Choose **Wall** and click to add vertices. Double-click to finish.
+3. Choose **Sensor** or **Thermostat** and click to place markers.
+4. Use **Door** and click two points on a wall to add a door segment.
+5. Click **Save** to persist the floorplan.
+6. View rendered output at `/render/live/floor1.png` (or `/render/live/floor2.png`).
 
 ## Floorplan schema (version 1)
 
@@ -38,59 +51,78 @@ Stored at `/data/floorplans/{floor_id}.json`.
 ```json
 {
   "version": 1,
+  "floor_id": "floor1",
   "canvas": {"width": 1600, "height": 1000},
-  "scale": {"pixels_per_unit": 10, "unit": "ft"},
+  "scale": {
+    "mode": "calibrated",
+    "px_per_meter": 100,
+    "calibration": {"p1": [0, 0], "p2": [100, 0], "distance_m": 1}
+  },
   "walls": [
-    {"points": [{"x": 20, "y": 20}, {"x": 200, "y": 20}]}
+    {"id": "wall_1", "points": [[20, 20], [200, 20]]}
   ],
   "doors": [
     {
-      "segment": {"a": {"x": 200, "y": 20}, "b": {"x": 240, "y": 20}},
+      "id": "door_1",
+      "segment": [[200, 20], [240, 20]],
       "entity_id": "binary_sensor.front_door",
-      "mapping": {"open_states": ["on", "open"], "closed_states": ["off", "closed"]}
+      "mapping": {
+        "open_values": ["on", "open"],
+        "closed_values": ["off", "closed"],
+        "unknown_as": "closed"
+      },
+      "open": false,
+      "open_resistance": 2,
+      "closed_resistance": 500
     }
   ],
   "sensors": [
-    {"pos": {"x": 120, "y": 80}, "entity_id": "sensor.living_room_temperature"}
+    {
+      "id": "sensor_1",
+      "entity": "sensor.living_room_temperature",
+      "pos": [120, 80],
+      "label": "Living",
+      "weight": 1
+    }
   ],
   "thermostats": [
     {
-      "pos": {"x": 300, "y": 140},
+      "id": "thermo_1",
+      "pos": [300, 140],
       "temperature_entity": "sensor.living_room_temperature",
       "setpoint_entity": "input_number.living_setpoint",
-      "climate_entity": "climate.living_room"
+      "mode_entity": "climate.living_room",
+      "device_label": "Living Room"
     }
   ],
-  "stairwells": [
-    {
-      "polygon": [
-        {"x": 500, "y": 400},
-        {"x": 600, "y": 400},
-        {"x": 600, "y": 520},
-        {"x": 500, "y": 520}
-      ],
-      "target_floor_id": "upstairs"
-    }
-  ],
-  "solver": {
-    "grid_width": 400,
-    "grid_height": 250,
-    "iterations": 200,
-    "wall_resistance": 5000,
-    "door_open_resistance": 2,
-    "door_closed_resistance": 500,
-    "sensor_pull": 0.15,
+  "stairwell": {
+    "id": "stair_1",
+    "polygon": [[500, 400], [600, 400], [600, 520], [500, 520]],
+    "link_to_floor_id": "floor2",
     "coupling": 0.05
   },
   "render": {
-    "legend_min_f": 60,
-    "legend_max_f": 80
+    "temp_range_f": {"min": 60, "max": 80},
+    "overlay_alpha": 0.6,
+    "show_walls": true,
+    "show_labels": true,
+    "show_legend": true,
+    "show_timestamp": true
+  },
+  "solver": {
+    "grid_w": 400,
+    "grid_h": 250,
+    "iterations": 200,
+    "sensor_pull": 0.15,
+    "wall_resistance": 5000,
+    "default_passage_resistance": 2
   }
 }
 ```
 
 ### Endpoints
 
+- `GET /editor` (static frontend)
 - `GET /api/floorplans`
 - `GET /api/floorplans/{floor_id}`
 - `PUT /api/floorplans/{floor_id}`
@@ -107,8 +139,8 @@ Stored at `/data/floorplans/{floor_id}.json`.
 ```yaml
 type: picture-entity
 entity: sensor.living_room_temperature
-image: http://YOUR_HOST:8000/render/live/main_floor.png
-name: Main Floor Heatmap
+image: http://YOUR_HOST:8000/render/live/floor1.png
+name: Floor 1 Heatmap
 ```
 
 ### Markdown (PNG refresh)
@@ -116,7 +148,7 @@ name: Main Floor Heatmap
 ```yaml
 type: markdown
 content: >-
-  ![Heatmap](http://YOUR_HOST:8000/render/live/main_floor.png?ts={{ now().timestamp() }})
+  ![Heatmap](http://YOUR_HOST:8000/render/live/floor1.png?ts={{ now().timestamp() }})
 ```
 
 ### Timelapse
@@ -124,5 +156,5 @@ content: >-
 ```yaml
 type: markdown
 content: >-
-  ![Timelapse](http://YOUR_HOST:8000/render/timelapse.gif?floor=main_floor&window=86400&step=900&width=800)
+  ![Timelapse](http://YOUR_HOST:8000/render/timelapse.gif?floor=floor1&window=86400&step=900&width=800)
 ```
