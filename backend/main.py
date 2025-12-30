@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import heapq
+import io
 import json
 import os
 import threading
 import time
-import io
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -487,10 +488,8 @@ def render_floorplan(floor_id: str) -> Image.Image:
 
 def solve_all_floorplans(floorplans: Dict[str, Dict]) -> Tuple[Dict[str, np.ndarray], Dict[str, Dict]]:
     parsed = {}
-    sensor_minima = {}
     for floor_id, payload in floorplans.items():
         parsed[floor_id] = FloorplanV1.parse_obj(payload)
-        sensor_minima[floor_id] = get_sensor_minimum(parsed[floor_id])
     grids = {floor_id: initialize_grid(fp) for floor_id, fp in parsed.items()}
     metadata: Dict[str, Dict] = {floor_id: {} for floor_id in parsed}
     max_iterations = max((fp.solver.iterations for fp in parsed.values()), default=0)
@@ -498,9 +497,6 @@ def solve_all_floorplans(floorplans: Dict[str, Dict]) -> Tuple[Dict[str, np.ndar
         for floor_id, fp in parsed.items():
             grids[floor_id] = diffuse_grid(fp, grids[floor_id])
         apply_stairwell_coupling(parsed, grids)
-    for floor_id, min_temp in sensor_minima.items():
-        if min_temp is not None:
-            grids[floor_id] = np.maximum(grids[floor_id], min_temp)
     for floor_id, fp in parsed.items():
         metadata[floor_id] = {
             "grid_width": fp.solver.grid_w,
@@ -512,25 +508,42 @@ def solve_all_floorplans(floorplans: Dict[str, Dict]) -> Tuple[Dict[str, np.ndar
 
 
 def initialize_grid(fp: FloorplanV1) -> np.ndarray:
-    temps = []
-    with ha_lock:
-        for sensor in fp.sensors:
-            state = ha_states.get(sensor.entity) if sensor.entity else None
-            if state:
-                temps.append(parse_float(state.state))
-    default_temp = float(np.mean(temps)) if temps else 70.0
-    grid = np.full((fp.solver.grid_h, fp.solver.grid_w), default_temp, dtype=float)
-    return grid
-
-
-def get_sensor_minimum(fp: FloorplanV1) -> Optional[float]:
+    sensor_samples: List[Tuple[int, int, float, float]] = []
     temps: List[float] = []
     with ha_lock:
         for sensor in fp.sensors:
             state = ha_states.get(sensor.entity) if sensor.entity else None
-            if state:
-                temps.append(parse_float(state.state))
-    return min(temps) if temps else None
+            if not state:
+                continue
+            temp = parse_float(state.state)
+            sx, sy = point_xy(sensor.pos)
+            gx = int(sx / fp.canvas.width * fp.solver.grid_w)
+            gy = int(sy / fp.canvas.height * fp.solver.grid_h)
+            gx = min(max(gx, 0), fp.solver.grid_w - 1)
+            gy = min(max(gy, 0), fp.solver.grid_h - 1)
+            weight = max(sensor.weight, 0.01)
+            sensor_samples.append((gx, gy, temp, weight))
+            temps.append(temp)
+    default_temp = float(np.mean(temps)) if temps else 70.0
+    if not sensor_samples:
+        return np.full((fp.solver.grid_h, fp.solver.grid_w), default_temp, dtype=float)
+    h_edges, v_edges = build_edge_conductance(fp)
+    height, width = fp.solver.grid_h, fp.solver.grid_w
+    distance_scale = max(height, width) * 0.35
+    weighted_sum = np.zeros((height, width), dtype=float)
+    weight_sum = np.zeros((height, width), dtype=float)
+    for gx, gy, temp, weight in sensor_samples:
+        distances = dijkstra_distances(gx, gy, h_edges, v_edges)
+        sensor_weight = weight * np.exp(-distances / distance_scale)
+        weighted_sum += sensor_weight * temp
+        weight_sum += sensor_weight
+    grid = np.divide(
+        weighted_sum,
+        weight_sum,
+        out=np.full((height, width), default_temp, dtype=float),
+        where=weight_sum > 0,
+    )
+    return grid
 
 
 
@@ -544,28 +557,32 @@ def parse_float(value: str) -> float:
 
 def diffuse_grid(fp: FloorplanV1, grid: np.ndarray) -> np.ndarray:
     height, width = grid.shape
-    base_conductance = 1.0
-    h_edges = np.full((height, width - 1), base_conductance)
-    v_edges = np.full((height - 1, width), base_conductance)
-    rasterize_walls(fp, h_edges, v_edges)
-    rasterize_doors(fp, h_edges, v_edges)
+    h_edges, v_edges = build_edge_conductance(fp)
     new_grid = grid.copy()
     for y in range(height):
         for x in range(width):
             neighbors = []
             weights = []
             if x > 0:
-                weights.append(h_edges[y, x - 1])
-                neighbors.append(grid[y, x - 1])
+                conductance = h_edges[y, x - 1]
+                if conductance > 0:
+                    weights.append(conductance)
+                    neighbors.append(grid[y, x - 1])
             if x < width - 1:
-                weights.append(h_edges[y, x])
-                neighbors.append(grid[y, x + 1])
+                conductance = h_edges[y, x]
+                if conductance > 0:
+                    weights.append(conductance)
+                    neighbors.append(grid[y, x + 1])
             if y > 0:
-                weights.append(v_edges[y - 1, x])
-                neighbors.append(grid[y - 1, x])
+                conductance = v_edges[y - 1, x]
+                if conductance > 0:
+                    weights.append(conductance)
+                    neighbors.append(grid[y - 1, x])
             if y < height - 1:
-                weights.append(v_edges[y, x])
-                neighbors.append(grid[y + 1, x])
+                conductance = v_edges[y, x]
+                if conductance > 0:
+                    weights.append(conductance)
+                    neighbors.append(grid[y + 1, x])
             total_weight = sum(weights)
             if total_weight > 0:
                 new_grid[y, x] = float(np.dot(neighbors, weights) / total_weight)
@@ -573,10 +590,68 @@ def diffuse_grid(fp: FloorplanV1, grid: np.ndarray) -> np.ndarray:
     return new_grid
 
 
+def build_edge_conductance(fp: FloorplanV1) -> Tuple[np.ndarray, np.ndarray]:
+    height, width = fp.solver.grid_h, fp.solver.grid_w
+    base_conductance = 1.0
+    h_edges = np.full((height, width - 1), base_conductance)
+    v_edges = np.full((height - 1, width), base_conductance)
+    rasterize_walls(fp, h_edges, v_edges)
+    rasterize_doors(fp, h_edges, v_edges)
+    return h_edges, v_edges
+
+
+def dijkstra_distances(
+    start_x: int,
+    start_y: int,
+    h_edges: np.ndarray,
+    v_edges: np.ndarray,
+) -> np.ndarray:
+    height, width = h_edges.shape[0], h_edges.shape[1] + 1
+    distances = np.full((height, width), np.inf, dtype=float)
+    distances[start_y, start_x] = 0.0
+    heap: List[Tuple[float, int, int]] = [(0.0, start_y, start_x)]
+    while heap:
+        cost, y, x = heapq.heappop(heap)
+        if cost > distances[y, x]:
+            continue
+        if x > 0:
+            conductance = h_edges[y, x - 1]
+            if conductance > 0:
+                edge_cost = 1.0 / conductance
+                new_cost = cost + edge_cost
+                if new_cost < distances[y, x - 1]:
+                    distances[y, x - 1] = new_cost
+                    heapq.heappush(heap, (new_cost, y, x - 1))
+        if x < width - 1:
+            conductance = h_edges[y, x]
+            if conductance > 0:
+                edge_cost = 1.0 / conductance
+                new_cost = cost + edge_cost
+                if new_cost < distances[y, x + 1]:
+                    distances[y, x + 1] = new_cost
+                    heapq.heappush(heap, (new_cost, y, x + 1))
+        if y > 0:
+            conductance = v_edges[y - 1, x]
+            if conductance > 0:
+                edge_cost = 1.0 / conductance
+                new_cost = cost + edge_cost
+                if new_cost < distances[y - 1, x]:
+                    distances[y - 1, x] = new_cost
+                    heapq.heappush(heap, (new_cost, y - 1, x))
+        if y < height - 1:
+            conductance = v_edges[y, x]
+            if conductance > 0:
+                edge_cost = 1.0 / conductance
+                new_cost = cost + edge_cost
+                if new_cost < distances[y + 1, x]:
+                    distances[y + 1, x] = new_cost
+                    heapq.heappush(heap, (new_cost, y + 1, x))
+    return distances
+
+
 
 def rasterize_walls(fp: FloorplanV1, h_edges: np.ndarray, v_edges: np.ndarray) -> None:
-    resistance = fp.solver.wall_resistance
-    conductance = 1.0 / resistance
+    conductance = 0.0
     for wall in fp.walls:
         points = wall.points
         for idx in range(len(points) - 1):
@@ -587,7 +662,7 @@ def rasterize_walls(fp: FloorplanV1, h_edges: np.ndarray, v_edges: np.ndarray) -
 def rasterize_doors(fp: FloorplanV1, h_edges: np.ndarray, v_edges: np.ndarray) -> None:
     for door in fp.doors:
         resistance = door_resistance(fp, door)
-        conductance = 1.0 / resistance
+        conductance = 0.0 if resistance >= fp.solver.wall_resistance else 1.0 / resistance
         mark_segment(fp, door.segment[0], door.segment[1], h_edges, v_edges, conductance)
 
 
