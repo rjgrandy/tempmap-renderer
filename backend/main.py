@@ -529,11 +529,12 @@ def initialize_grid(fp: FloorplanV1) -> np.ndarray:
         return np.full((fp.solver.grid_h, fp.solver.grid_w), default_temp, dtype=float)
     h_edges, v_edges = build_edge_conductance(fp)
     height, width = fp.solver.grid_h, fp.solver.grid_w
+    distance_scale = max(height, width) * 0.35
     weighted_sum = np.zeros((height, width), dtype=float)
     weight_sum = np.zeros((height, width), dtype=float)
     for gx, gy, temp, weight in sensor_samples:
         distances = dijkstra_distances(gx, gy, h_edges, v_edges)
-        sensor_weight = weight / np.maximum(distances, 1e-3) ** 2
+        sensor_weight = weight * np.exp(-distances / distance_scale)
         weighted_sum += sensor_weight * temp
         weight_sum += sensor_weight
     grid = np.divide(
@@ -563,17 +564,25 @@ def diffuse_grid(fp: FloorplanV1, grid: np.ndarray) -> np.ndarray:
             neighbors = []
             weights = []
             if x > 0:
-                weights.append(h_edges[y, x - 1])
-                neighbors.append(grid[y, x - 1])
+                conductance = h_edges[y, x - 1]
+                if conductance > 0:
+                    weights.append(conductance)
+                    neighbors.append(grid[y, x - 1])
             if x < width - 1:
-                weights.append(h_edges[y, x])
-                neighbors.append(grid[y, x + 1])
+                conductance = h_edges[y, x]
+                if conductance > 0:
+                    weights.append(conductance)
+                    neighbors.append(grid[y, x + 1])
             if y > 0:
-                weights.append(v_edges[y - 1, x])
-                neighbors.append(grid[y - 1, x])
+                conductance = v_edges[y - 1, x]
+                if conductance > 0:
+                    weights.append(conductance)
+                    neighbors.append(grid[y - 1, x])
             if y < height - 1:
-                weights.append(v_edges[y, x])
-                neighbors.append(grid[y + 1, x])
+                conductance = v_edges[y, x]
+                if conductance > 0:
+                    weights.append(conductance)
+                    neighbors.append(grid[y + 1, x])
             total_weight = sum(weights)
             if total_weight > 0:
                 new_grid[y, x] = float(np.dot(neighbors, weights) / total_weight)
@@ -606,36 +615,43 @@ def dijkstra_distances(
         if cost > distances[y, x]:
             continue
         if x > 0:
-            edge_cost = 1.0 / h_edges[y, x - 1]
-            new_cost = cost + edge_cost
-            if new_cost < distances[y, x - 1]:
-                distances[y, x - 1] = new_cost
-                heapq.heappush(heap, (new_cost, y, x - 1))
+            conductance = h_edges[y, x - 1]
+            if conductance > 0:
+                edge_cost = 1.0 / conductance
+                new_cost = cost + edge_cost
+                if new_cost < distances[y, x - 1]:
+                    distances[y, x - 1] = new_cost
+                    heapq.heappush(heap, (new_cost, y, x - 1))
         if x < width - 1:
-            edge_cost = 1.0 / h_edges[y, x]
-            new_cost = cost + edge_cost
-            if new_cost < distances[y, x + 1]:
-                distances[y, x + 1] = new_cost
-                heapq.heappush(heap, (new_cost, y, x + 1))
+            conductance = h_edges[y, x]
+            if conductance > 0:
+                edge_cost = 1.0 / conductance
+                new_cost = cost + edge_cost
+                if new_cost < distances[y, x + 1]:
+                    distances[y, x + 1] = new_cost
+                    heapq.heappush(heap, (new_cost, y, x + 1))
         if y > 0:
-            edge_cost = 1.0 / v_edges[y - 1, x]
-            new_cost = cost + edge_cost
-            if new_cost < distances[y - 1, x]:
-                distances[y - 1, x] = new_cost
-                heapq.heappush(heap, (new_cost, y - 1, x))
+            conductance = v_edges[y - 1, x]
+            if conductance > 0:
+                edge_cost = 1.0 / conductance
+                new_cost = cost + edge_cost
+                if new_cost < distances[y - 1, x]:
+                    distances[y - 1, x] = new_cost
+                    heapq.heappush(heap, (new_cost, y - 1, x))
         if y < height - 1:
-            edge_cost = 1.0 / v_edges[y, x]
-            new_cost = cost + edge_cost
-            if new_cost < distances[y + 1, x]:
-                distances[y + 1, x] = new_cost
-                heapq.heappush(heap, (new_cost, y + 1, x))
+            conductance = v_edges[y, x]
+            if conductance > 0:
+                edge_cost = 1.0 / conductance
+                new_cost = cost + edge_cost
+                if new_cost < distances[y + 1, x]:
+                    distances[y + 1, x] = new_cost
+                    heapq.heappush(heap, (new_cost, y + 1, x))
     return distances
 
 
 
 def rasterize_walls(fp: FloorplanV1, h_edges: np.ndarray, v_edges: np.ndarray) -> None:
-    resistance = fp.solver.wall_resistance
-    conductance = 1.0 / resistance
+    conductance = 0.0
     for wall in fp.walls:
         points = wall.points
         for idx in range(len(points) - 1):
@@ -646,7 +662,7 @@ def rasterize_walls(fp: FloorplanV1, h_edges: np.ndarray, v_edges: np.ndarray) -
 def rasterize_doors(fp: FloorplanV1, h_edges: np.ndarray, v_edges: np.ndarray) -> None:
     for door in fp.doors:
         resistance = door_resistance(fp, door)
-        conductance = 1.0 / resistance
+        conductance = 0.0 if resistance >= fp.solver.wall_resistance else 1.0 / resistance
         mark_segment(fp, door.segment[0], door.segment[1], h_edges, v_edges, conductance)
 
 
