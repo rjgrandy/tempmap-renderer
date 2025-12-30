@@ -1,14 +1,22 @@
 # TempMap Renderer
 
-A lightweight FastAPI service plus a vanilla JS canvas editor for building multi-floor temperature maps.
+A FastAPI service and lightweight canvas editor for building multi-floor temperature maps and rendering live heatmap PNGs for Home Assistant dashboards.
 
-## Stack
-- **Backend:** FastAPI (Python)
-- **Frontend:** Vanilla JS canvas editor (no framework)
-- **Container:** Unraid-friendly Dockerfile
-- **Data:** stored under `/data` (mounted volume)
+## Highlights
 
-## Quick start
+- **Live heatmap rendering** from Home Assistant sensor states.
+- **Floorplan editor** served at `/editor` (no frontend framework).
+- **Unraid-friendly Docker image** with `/data` volume persistence.
+- **Configurable scaling** (absolute vs. relative min/max) and **auto-cropping** to reduce blank space around the floorplan.
+
+## Repository layout
+
+- `backend/` — FastAPI app, rendering logic, configuration.
+- `frontend/` — Vanilla JS canvas editor.
+- `docker/` — Dockerfile for container builds.
+- `unraid/` — Unraid template.
+
+## Quick start (local)
 
 ```bash
 cp backend/config.example.yaml backend/config.yaml
@@ -20,7 +28,7 @@ uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
 
 Open the editor at http://localhost:8000/editor.
 
-Floorplans are saved under `/data/floorplans/{floor_id}.json`.
+Floorplans are stored under `/data/floorplans/{floor_id}.json`.
 
 ## Docker
 
@@ -33,20 +41,67 @@ Then visit http://localhost:8000/editor.
 
 ## Unraid template
 
-Import the template in Unraid via **Unraid > Docker > Add Container > Template** dropdown, then select the TempMap Renderer template from the list.
+Import the template in Unraid via **Unraid > Docker > Add Container > Template**.
 
-## Floorplan builder usage
+> **Note:** The container reads config from `/app/backend/config.yaml` at runtime. If you keep your config under Unraid appdata, bind-mount that file directly to `/app/backend/config.yaml`.
 
-1. Open `/editor` and select **Floor 1**.
-2. Choose **Wall** and click to add vertices. Double-click to finish.
-3. Choose **Sensor** or **Thermostat** and click to place markers.
-4. Use **Door** and click two points on a wall to add a door segment.
-5. Click **Save** to persist the floorplan.
-6. View rendered output at `/render/live/floor1.png` (or `/render/live/floor2.png`).
+---
 
-## Floorplan schema (version 1)
+# Configuration file (`backend/config.yaml`)
 
-Stored at `/data/floorplans/{floor_id}.json`.
+The backend reads its configuration once at startup from `backend/config.yaml` (in the container: `/app/backend/config.yaml`). Use `backend/config.example.yaml` as a starting point.
+
+```yaml
+server:
+  host: 0.0.0.0
+  port: 8000
+
+data:
+  path: /data
+
+home_assistant:
+  base_url: http://homeassistant.local:8123
+  token: YOUR_LONG_LIVED_TOKEN
+  refresh_seconds: 15
+
+render:
+  default_grid:
+    width: 400
+    height: 250
+  default_legend:
+    min_f: 60
+    max_f: 80
+```
+
+## `server`
+
+- **host**: informational only; the app is started via `uvicorn` (CLI).  
+- **port**: informational only; the app is started via `uvicorn` (CLI).
+
+## `data`
+
+- **path**: base directory for persisted data (floorplans, frames).  
+  - Default: `/data`
+  - Override with `TEMP_MAP_DATA_PATH` environment variable if needed.
+
+## `home_assistant`
+
+- **base_url**: Home Assistant base URL (e.g., `http://192.168.1.199:8123`).
+- **token**: long‑lived access token from Home Assistant.
+- **refresh_seconds**: polling interval for HA sensor states and frame caching.
+
+## `render`
+
+This section controls **defaults** used when creating new floorplans in the editor.
+
+- **default_grid**: default solver grid size used for new floorplans.
+- **default_legend**: default min/max values for the legend in new floorplans.
+
+---
+
+# Floorplan schema
+
+Floorplans live at `/data/floorplans/{floor_id}.json`.
 
 ```json
 {
@@ -104,6 +159,11 @@ Stored at `/data/floorplans/{floor_id}.json`.
   "render": {
     "temp_range_f": {"min": 60, "max": 80},
     "overlay_alpha": 0.6,
+    "scale_min_mode": "absolute",
+    "scale_max_mode": "absolute",
+    "auto_crop": true,
+    "crop_padding": 30,
+    "exterior_margin": 20,
     "show_walls": true,
     "show_labels": true,
     "show_legend": true,
@@ -120,7 +180,32 @@ Stored at `/data/floorplans/{floor_id}.json`.
 }
 ```
 
-### Endpoints
+### Render settings (`render`)
+
+- **temp_range_f.min / temp_range_f.max**: absolute temperature range (F).  
+- **scale_min_mode / scale_max_mode**:
+  - `absolute`: use the values from `temp_range_f`.
+  - `relative`: use the live grid’s min/max values.
+  - You can mix modes to clamp just one end of the scale.
+- **overlay_alpha**: transparency of the heatmap overlay (0–1).
+- **auto_crop**: trims extra blank space around the floorplan when rendering.
+- **crop_padding**: extra pixels to keep around the geometry when auto-cropping.
+- **exterior_margin**: padding outside the cropped floorplan used to draw the legend and timestamp.
+- **show_walls / show_labels / show_legend / show_timestamp**: toggles for overlay elements.
+
+> The heatmap is masked to the floorplan hull so areas outside the exterior walls are not colorized.
+> The solver clamps the final grid so values do not fall below the coldest sensor reading on the floor.
+
+### Solver settings (`solver`)
+
+- **grid_w / grid_h**: solver grid resolution. Lower values render faster.
+- **iterations**: diffusion iterations. Higher values look smoother but render slower.
+- **sensor_pull**: strength of sensor influence.
+- **wall_resistance / default_passage_resistance**: resistance values for walls and openings.
+
+---
+
+# API endpoints
 
 - `GET /editor` (static frontend)
 - `GET /api/floorplans`
@@ -132,7 +217,9 @@ Stored at `/data/floorplans/{floor_id}.json`.
 - `GET /render/live/{floor_id}.json`
 - `GET /render/timelapse.gif?floor=&window=&step=&width=`
 
-## Home Assistant card examples
+---
+
+# Home Assistant card examples
 
 ### Picture entity
 

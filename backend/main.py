@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from typing import Literal
 
 import numpy as np
 import requests
@@ -106,6 +107,11 @@ class TemperatureRange(BaseModel):
 class RenderParams(BaseModel):
     temp_range_f: TemperatureRange = Field(default_factory=TemperatureRange)
     overlay_alpha: float = 0.6
+    scale_min_mode: Literal["absolute", "relative"] = "absolute"
+    scale_max_mode: Literal["absolute", "relative"] = "absolute"
+    auto_crop: bool = True
+    crop_padding: int = 30
+    exterior_margin: int = 20
     show_walls: bool = True
     show_labels: bool = True
     show_legend: bool = True
@@ -481,8 +487,10 @@ def render_floorplan(floor_id: str) -> Image.Image:
 
 def solve_all_floorplans(floorplans: Dict[str, Dict]) -> Tuple[Dict[str, np.ndarray], Dict[str, Dict]]:
     parsed = {}
+    sensor_minima = {}
     for floor_id, payload in floorplans.items():
         parsed[floor_id] = FloorplanV1.parse_obj(payload)
+        sensor_minima[floor_id] = get_sensor_minimum(parsed[floor_id])
     grids = {floor_id: initialize_grid(fp) for floor_id, fp in parsed.items()}
     metadata: Dict[str, Dict] = {floor_id: {} for floor_id in parsed}
     max_iterations = max((fp.solver.iterations for fp in parsed.values()), default=0)
@@ -490,6 +498,9 @@ def solve_all_floorplans(floorplans: Dict[str, Dict]) -> Tuple[Dict[str, np.ndar
         for floor_id, fp in parsed.items():
             grids[floor_id] = diffuse_grid(fp, grids[floor_id])
         apply_stairwell_coupling(parsed, grids)
+    for floor_id, min_temp in sensor_minima.items():
+        if min_temp is not None:
+            grids[floor_id] = np.maximum(grids[floor_id], min_temp)
     for floor_id, fp in parsed.items():
         metadata[floor_id] = {
             "grid_width": fp.solver.grid_w,
@@ -510,6 +521,16 @@ def initialize_grid(fp: FloorplanV1) -> np.ndarray:
     default_temp = float(np.mean(temps)) if temps else 70.0
     grid = np.full((fp.solver.grid_h, fp.solver.grid_w), default_temp, dtype=float)
     return grid
+
+
+def get_sensor_minimum(fp: FloorplanV1) -> Optional[float]:
+    temps: List[float] = []
+    with ha_lock:
+        for sensor in fp.sensors:
+            state = ha_states.get(sensor.entity) if sensor.entity else None
+            if state:
+                temps.append(parse_float(state.state))
+    return min(temps) if temps else None
 
 
 
@@ -716,12 +737,15 @@ def render_floorplan_image(
 ) -> Image.Image:
     fp = FloorplanV1.parse_obj(payload)
     canvas = Image.new("RGBA", (fp.canvas.width, fp.canvas.height), (20, 20, 20, 255))
+    scale_min_f, scale_max_f = resolve_temperature_range(fp, grid)
+    heatmap_mask = build_floorplan_mask(fp, grid.shape)
     heatmap = render_heatmap(
         grid,
-        fp.render.temp_range_f.min,
-        fp.render.temp_range_f.max,
+        scale_min_f,
+        scale_max_f,
         fp.render.overlay_alpha,
         canvas.size,
+        heatmap_mask,
     )
     canvas = Image.alpha_composite(canvas, heatmap)
     draw = ImageDraw.Draw(canvas)
@@ -729,10 +753,23 @@ def render_floorplan_image(
         draw_walls(draw, fp)
     draw_sensors(draw, fp)
     draw_thermostats(draw, fp)
+    if fp.render.auto_crop:
+        crop_box = compute_floorplan_crop(fp, canvas.size, fp.render.crop_padding)
+        if crop_box is not None:
+            canvas = canvas.crop(crop_box)
+            draw = ImageDraw.Draw(canvas)
+    if fp.render.show_legend or fp.render.show_timestamp:
+        canvas = add_exterior_margin(
+            canvas,
+            fp.render.exterior_margin,
+            fp.render.show_timestamp,
+            fp.render.show_legend,
+        )
+        draw = ImageDraw.Draw(canvas)
     if fp.render.show_legend:
-        draw_legend(draw, fp)
+        draw_legend(draw, fp, scale_min_f, scale_max_f, canvas.size)
     if fp.render.show_timestamp:
-        draw_timestamp(draw)
+        draw_timestamp(draw, fp.render.exterior_margin)
     return canvas.convert("RGB")
 
 
@@ -743,15 +780,139 @@ def render_heatmap(
     max_f: float,
     overlay_alpha: float,
     size: Tuple[int, int],
+    mask: Optional[np.ndarray] = None,
 ) -> Image.Image:
     norm = np.clip((grid - min_f) / (max_f - min_f + 1e-6), 0, 1)
     colors = np.zeros((grid.shape[0], grid.shape[1], 4), dtype=np.uint8)
-    colors[..., 0] = (255 * norm).astype(np.uint8)
-    colors[..., 2] = (255 * (1 - norm)).astype(np.uint8)
-    colors[..., 1] = (128 * (1 - np.abs(norm - 0.5) * 2)).astype(np.uint8)
-    colors[..., 3] = int(255 * min(max(overlay_alpha, 0.0), 1.0))
+    colors[..., 0], colors[..., 1], colors[..., 2] = gradient_rgb(norm)
+    alpha_value = int(255 * min(max(overlay_alpha, 0.0), 1.0))
+    colors[..., 3] = alpha_value
+    if mask is not None:
+        colors[..., 3] = np.where(mask, colors[..., 3], 0)
     image = Image.fromarray(colors, mode="RGBA")
     return image.resize(size, resample=Image.Resampling.BILINEAR)
+
+
+def gradient_rgb(norm: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    stops = np.array([0.0, 0.25, 0.5, 0.75, 1.0])
+    colors = np.array(
+        [
+            [0, 0, 255],    # blue
+            [0, 255, 255],  # cyan
+            [0, 255, 0],    # green
+            [255, 255, 0],  # yellow
+            [255, 0, 0],    # red
+        ],
+        dtype=float,
+    )
+    norm = np.clip(norm, 0.0, 1.0)
+    idx = np.searchsorted(stops, norm, side="right") - 1
+    idx = np.clip(idx, 0, len(stops) - 2)
+    t = (norm - stops[idx]) / (stops[idx + 1] - stops[idx])
+    c0 = colors[idx]
+    c1 = colors[idx + 1]
+    blended = c0 + (c1 - c0) * t[..., None]
+    return blended[..., 0].astype(np.uint8), blended[..., 1].astype(np.uint8), blended[..., 2].astype(np.uint8)
+
+
+def resolve_temperature_range(fp: FloorplanV1, grid: np.ndarray) -> Tuple[float, float]:
+    grid_min = float(np.min(grid))
+    grid_max = float(np.max(grid))
+    min_f = fp.render.temp_range_f.min if fp.render.scale_min_mode == "absolute" else grid_min
+    max_f = fp.render.temp_range_f.max if fp.render.scale_max_mode == "absolute" else grid_max
+    if min_f >= max_f:
+        max_f = min_f + 0.1
+    return min_f, max_f
+
+
+def build_floorplan_mask(fp: FloorplanV1, grid_shape: Tuple[int, int]) -> Optional[np.ndarray]:
+    points = gather_floorplan_points(fp)
+    if len(points) < 3:
+        return None
+    hull = convex_hull(points)
+    if len(hull) < 3:
+        return None
+    width, height = grid_shape[1], grid_shape[0]
+    scale_x = width / fp.canvas.width
+    scale_y = height / fp.canvas.height
+    polygon = [(p[0] * scale_x, p[1] * scale_y) for p in hull]
+    mask = Image.new("L", (width, height), 0)
+    mask_draw = ImageDraw.Draw(mask)
+    mask_draw.polygon(polygon, fill=255)
+    return np.array(mask) > 0
+
+
+def gather_floorplan_points(fp: FloorplanV1) -> List[Tuple[float, float]]:
+    points: List[Tuple[float, float]] = []
+    for wall in fp.walls:
+        points.extend([point_xy(p) for p in wall.points])
+    for door in fp.doors:
+        points.append(point_xy(door.segment[0]))
+        points.append(point_xy(door.segment[1]))
+    for sensor in fp.sensors:
+        points.append(point_xy(sensor.pos))
+    for thermo in fp.thermostats:
+        points.append(point_xy(thermo.pos))
+    if fp.stairwell:
+        points.extend([point_xy(p) for p in fp.stairwell.polygon])
+    return points
+
+
+def convex_hull(points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    points = sorted(set(points))
+    if len(points) <= 1:
+        return points
+
+    def cross(o: Tuple[float, float], a: Tuple[float, float], b: Tuple[float, float]) -> float:
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower: List[Tuple[float, float]] = []
+    for p in points:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+
+    upper: List[Tuple[float, float]] = []
+    for p in reversed(points):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+
+    return lower[:-1] + upper[:-1]
+
+
+def add_exterior_margin(
+    image: Image.Image,
+    margin: int,
+    show_timestamp: bool,
+    show_legend: bool,
+) -> Image.Image:
+    top = margin if show_timestamp else margin // 2
+    bottom = margin + 60 if show_legend else margin // 2
+    new_width = image.width + margin * 2
+    new_height = image.height + top + bottom
+    canvas = Image.new("RGBA", (new_width, new_height), (20, 20, 20, 255))
+    canvas.paste(image, (margin, top))
+    return canvas
+
+
+def compute_floorplan_crop(
+    fp: FloorplanV1,
+    canvas_size: Tuple[int, int],
+    padding: int,
+) -> Optional[Tuple[int, int, int, int]]:
+    points = gather_floorplan_points(fp)
+    if not points:
+        return None
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    min_x = max(int(min(xs) - padding), 0)
+    min_y = max(int(min(ys) - padding), 0)
+    max_x = min(int(max(xs) + padding), canvas_size[0])
+    max_y = min(int(max(ys) + padding), canvas_size[1])
+    if max_x <= min_x or max_y <= min_y:
+        return None
+    return min_x, min_y, max_x, max_y
 
 
 
@@ -772,6 +933,9 @@ def draw_sensors(draw: ImageDraw.ImageDraw, fp: FloorplanV1) -> None:
         draw.ellipse((x - 6, y - 6, x + 6, y + 6), fill=(255, 255, 255))
         if fp.render.show_labels:
             label = sensor.label or sensor.entity or ""
+            temperature = format_entity_temperature(sensor.entity)
+            if temperature:
+                label = f"{label} {temperature}" if label else temperature
             draw.text((x + 8, y - 8), label, fill=(255, 255, 255), font=font)
 
 
@@ -800,27 +964,44 @@ def read_entity_state(entity_id: str) -> str:
     return state.state if state else "n/a"
 
 
+def format_entity_temperature(entity_id: Optional[str]) -> str:
+    if not entity_id:
+        return ""
+    state = read_entity_state(entity_id)
+    if state == "n/a":
+        return ""
+    try:
+        value = float(state)
+    except ValueError:
+        return ""
+    return f"{value:.1f}F"
 
-def draw_legend(draw: ImageDraw.ImageDraw, fp: FloorplanV1) -> None:
+
+
+def draw_legend(
+    draw: ImageDraw.ImageDraw,
+    fp: FloorplanV1,
+    min_f: float,
+    max_f: float,
+    canvas_size: Tuple[int, int],
+) -> None:
     font = ImageFont.load_default()
-    x0, y0 = 20, fp.canvas.height - 80
-    x1, y1 = 220, fp.canvas.height - 40
+    x0, y0 = fp.render.exterior_margin, canvas_size[1] - 80
+    x1, y1 = x0 + 200, canvas_size[1] - 40
     for i in range(x0, x1):
         t = (i - x0) / (x1 - x0)
-        r = int(255 * t)
-        b = int(255 * (1 - t))
-        g = int(128 * (1 - abs(t - 0.5) * 2))
-    draw.line([(i, y0), (i, y1)], fill=(r, g, b))
+        r, g, b = gradient_rgb(np.array([t]))
+        draw.line([(i, y0), (i, y1)], fill=(int(r[0]), int(g[0]), int(b[0])))
     draw.rectangle((x0, y0, x1, y1), outline=(255, 255, 255), width=1)
-    draw.text((x0, y0 - 18), f"{fp.render.temp_range_f.min}F", fill=(255, 255, 255), font=font)
-    draw.text((x1 - 40, y0 - 18), f"{fp.render.temp_range_f.max}F", fill=(255, 255, 255), font=font)
+    draw.text((x0, y0 - 18), f"{min_f:.1f}F", fill=(255, 255, 255), font=font)
+    draw.text((x1 - 48, y0 - 18), f"{max_f:.1f}F", fill=(255, 255, 255), font=font)
 
 
 
-def draw_timestamp(draw: ImageDraw.ImageDraw) -> None:
+def draw_timestamp(draw: ImageDraw.ImageDraw, margin: int) -> None:
     font = ImageFont.load_default()
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    draw.text((20, 20), timestamp, fill=(255, 255, 255), font=font)
+    draw.text((margin, margin), timestamp, fill=(255, 255, 255), font=font)
 
 
 
