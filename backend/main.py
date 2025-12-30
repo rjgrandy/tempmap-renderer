@@ -772,6 +772,9 @@ def draw_sensors(draw: ImageDraw.ImageDraw, fp: FloorplanV1) -> None:
         draw.ellipse((x - 6, y - 6, x + 6, y + 6), fill=(255, 255, 255))
         if fp.render.show_labels:
             label = sensor.label or sensor.entity or ""
+            temperature = format_entity_temperature(sensor.entity)
+            if temperature:
+                label = f"{label} {temperature}" if label else temperature
             draw.text((x + 8, y - 8), label, fill=(255, 255, 255), font=font)
 
 
@@ -800,6 +803,19 @@ def read_entity_state(entity_id: str) -> str:
     return state.state if state else "n/a"
 
 
+def format_entity_temperature(entity_id: Optional[str]) -> str:
+    if not entity_id:
+        return ""
+    state = read_entity_state(entity_id)
+    if state == "n/a":
+        return ""
+    try:
+        value = float(state)
+    except ValueError:
+        return ""
+    return f"{value:.1f}F"
+
+
 
 def draw_legend(draw: ImageDraw.ImageDraw, fp: FloorplanV1) -> None:
     font = ImageFont.load_default()
@@ -810,7 +826,7 @@ def draw_legend(draw: ImageDraw.ImageDraw, fp: FloorplanV1) -> None:
         r = int(255 * t)
         b = int(255 * (1 - t))
         g = int(128 * (1 - abs(t - 0.5) * 2))
-    draw.line([(i, y0), (i, y1)], fill=(r, g, b))
+        draw.line([(i, y0), (i, y1)], fill=(r, g, b))
     draw.rectangle((x0, y0, x1, y1), outline=(255, 255, 255), width=1)
     draw.text((x0, y0 - 18), f"{fp.render.temp_range_f.min}F", fill=(255, 255, 255), font=font)
     draw.text((x1 - 40, y0 - 18), f"{fp.render.temp_range_f.max}F", fill=(255, 255, 255), font=font)
