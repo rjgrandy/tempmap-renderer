@@ -496,10 +496,62 @@ def solve_all_floorplans(floorplans: Dict[str, Dict]) -> Tuple[Dict[str, np.ndar
         }
     return grids, metadata
 
+def flood_fill_with_walls(
+    start_x: int,
+    start_y: int, 
+    h_edges: np.ndarray,
+    v_edges: np.ndarray,
+    width: int,
+    height: int
+) -> np.ndarray:
+    """Flood fill to find distances, respecting wall barriers (0 conductance)."""
+    distances = np.full((height, width), np.inf, dtype=float)
+    distances[start_y, start_x] = 0.0
+    
+    heap: List[Tuple[float, int, int]] = [(0.0, start_y, start_x)]
+    
+    while heap:
+        dist, y, x = heapq.heappop(heap)
+        
+        if dist > distances[y, x]:
+            continue
+        
+        # Check all 4 neighbors
+        # Left
+        if x > 0 and h_edges[y, x - 1] > 0:  # Only traverse if edge is open
+            new_dist = dist + 1.0
+            if new_dist < distances[y, x - 1]:
+                distances[y, x - 1] = new_dist
+                heapq.heappush(heap, (new_dist, y, x - 1))
+        
+        # Right
+        if x < width - 1 and h_edges[y, x] > 0:
+            new_dist = dist + 1.0
+            if new_dist < distances[y, x + 1]:
+                distances[y, x + 1] = new_dist
+                heapq.heappush(heap, (new_dist, y, x + 1))
+        
+        # Up
+        if y > 0 and v_edges[y - 1, x] > 0:
+            new_dist = dist + 1.0
+            if new_dist < distances[y - 1, x]:
+                distances[y - 1, x] = new_dist
+                heapq.heappush(heap, (new_dist, y - 1, x))
+        
+        # Down
+        if y < height - 1 and v_edges[y, x] > 0:
+            new_dist = dist + 1.0
+            if new_dist < distances[y + 1, x]:
+                distances[y + 1, x] = new_dist
+                heapq.heappush(heap, (new_dist, y + 1, x))
+    
+    return distances
 
 def initialize_grid(fp: FloorplanV1) -> np.ndarray:
+    """Initialize grid with proper wall isolation from the start."""
     sensor_samples: List[Tuple[int, int, float, float]] = []
     temps: List[float] = []
+    
     with ha_lock:
         for sensor in fp.sensors:
             state = ha_states.get(sensor.entity) if sensor.entity else None
@@ -520,18 +572,26 @@ def initialize_grid(fp: FloorplanV1) -> np.ndarray:
     if not sensor_samples:
         return np.full((fp.solver.grid_h, fp.solver.grid_w), default_temp, dtype=float)
 
+    # Build wall barriers FIRST
     h_edges, v_edges = build_edge_conductance(fp)
     height, width = fp.solver.grid_h, fp.solver.grid_w
     
+    # Create connectivity mask - which cells can reach which sensors
+    grid = np.full((height, width), default_temp, dtype=float)
+    
+    # For each sensor, do a flood fill respecting walls
+    influence_maps = []
+    for gx, gy, temp, weight in sensor_samples:
+        influence = flood_fill_with_walls(gx, gy, h_edges, v_edges, width, height)
+        influence_maps.append((influence, temp, weight))
+    
+    # Blend sensor influences with IDW
     weighted_sum = np.zeros((height, width), dtype=float)
     weight_sum = np.zeros((height, width), dtype=float)
     
-    for gx, gy, temp, weight in sensor_samples:
-        distances = dijkstra_distances(gx, gy, h_edges, v_edges)
-        
-        # IDW with Distance^4 to create sharp zones (when walls effectively block paths)
-        sensor_weight = weight * (1.0 / (distances**4 + 1.0))
-        
+    for influence, temp, weight in influence_maps:
+        # Use distance^2 for smoother gradients
+        sensor_weight = weight * (1.0 / (influence**2 + 1.0))
         weighted_sum += sensor_weight * temp
         weight_sum += sensor_weight
     
@@ -541,6 +601,7 @@ def initialize_grid(fp: FloorplanV1) -> np.ndarray:
         out=np.full((height, width), default_temp, dtype=float),
         where=weight_sum > 0,
     )
+    
     return grid
 
 
@@ -552,27 +613,35 @@ def parse_float(value: str) -> float:
 
 
 def diffuse_grid(fp: FloorplanV1, grid: np.ndarray) -> np.ndarray:
+    """Diffuse with proper wall handling - isolated regions stay isolated."""
     height, width = grid.shape
     h_edges, v_edges = build_edge_conductance(fp)
 
+    # Pad edges for neighbor access
     w_left = np.pad(h_edges, ((0, 0), (1, 0)), mode='constant', constant_values=0)
     w_right = np.pad(h_edges, ((0, 0), (0, 1)), mode='constant', constant_values=0)
     w_up = np.pad(v_edges, ((1, 0), (0, 0)), mode='constant', constant_values=0)
     w_down = np.pad(v_edges, ((0, 1), (0, 0)), mode='constant', constant_values=0)
     
+    # Get neighbor values
     n_left = np.roll(grid, 1, axis=1)
     n_right = np.roll(grid, -1, axis=1)
     n_up = np.roll(grid, 1, axis=0)
     n_down = np.roll(grid, -1, axis=0)
     
+    # Compute weighted average
     numerator = (n_left * w_left) + (n_right * w_right) + (n_up * w_up) + (n_down * w_down)
     denominator = w_left + w_right + w_up + w_down
     
-    mask = denominator > 0
+    # Only update cells that have at least one open connection
+    # Cells with denominator=0 are completely walled off and should keep their value
     new_grid = grid.copy()
+    mask = denominator > 0
     new_grid[mask] = numerator[mask] / denominator[mask]
-
+    
+    # Apply sensor pull to anchor temperatures
     apply_sensor_pull(fp, new_grid)
+    
     return new_grid
 
 
@@ -675,6 +744,7 @@ def mark_segment(
     v_edges: np.ndarray,
     conductance: float,
 ) -> None:
+    """Rasterize wall segment with proper diagonal handling."""
     grid_w = fp.solver.grid_w
     grid_h = fp.solver.grid_h
     ax, ay = point_xy(a)
@@ -683,26 +753,47 @@ def mark_segment(
     y0 = int(ay / fp.canvas.height * grid_h)
     x1 = int(bx / fp.canvas.width * grid_w)
     y1 = int(by / fp.canvas.height * grid_h)
-    steps = max(abs(x1 - x0), abs(y1 - y0), 1) * 2
-    prev = (x0, y0)
-    for step in range(1, steps + 1):
-        t = step / steps
-        x = int(x0 + (x1 - x0) * t)
-        y = int(y0 + (y1 - y0) * t)
-        current = (min(max(x, 0), grid_w - 1), min(max(y, 0), grid_h - 1))
+    
+    # Use Bresenham-style line drawing for better coverage
+    dx = abs(x1 - x0)
+    dy = abs(y1 - y0)
+    sx = 1 if x0 < x1 else -1
+    sy = 1 if y0 < y1 else -1
+    err = dx - dy
+    
+    x, y = x0, y0
+    prev_x, prev_y = x, y
+    
+    while True:
+        # Clamp to grid bounds
+        x_clamped = min(max(x, 0), grid_w - 1)
+        y_clamped = min(max(y, 0), grid_h - 1)
         
-        if current != prev:
-            # FIX: Check if we moved diagonally (both x and y changed)
-            if current[0] != prev[0] and current[1] != prev[1]:
-                # Block the "L" shape path to prevent diagonal leakage
-                intermediate = (current[0], prev[1])
-                mark_edge(prev, intermediate, h_edges, v_edges, conductance)
-                mark_edge(intermediate, current, h_edges, v_edges, conductance)
-            else:
-                # Standard orthogonal move
-                mark_edge(prev, current, h_edges, v_edges, conductance)
+        # Mark edge from previous position to current
+        if (x_clamped, y_clamped) != (prev_x, prev_y):
+            # Block the edge between previous and current cell
+            mark_edge((prev_x, prev_y), (x_clamped, y_clamped), h_edges, v_edges, conductance)
             
-            prev = current
+            # For diagonal moves, also block the perpendicular edges to prevent corner leakage
+            if abs(x_clamped - prev_x) == 1 and abs(y_clamped - prev_y) == 1:
+                # Block both L-shaped paths through the diagonal
+                mark_edge((prev_x, prev_y), (x_clamped, prev_y), h_edges, v_edges, conductance)
+                mark_edge((x_clamped, prev_y), (x_clamped, y_clamped), h_edges, v_edges, conductance)
+                mark_edge((prev_x, prev_y), (prev_x, y_clamped), h_edges, v_edges, conductance)
+                mark_edge((prev_x, y_clamped), (x_clamped, y_clamped), h_edges, v_edges, conductance)
+        
+        prev_x, prev_y = x_clamped, y_clamped
+        
+        if x == x1 and y == y1:
+            break
+        
+        e2 = 2 * err
+        if e2 > -dy:
+            err -= dy
+            x += sx
+        if e2 < dx:
+            err += dx
+            y += sy
 
 
 def mark_edge(
