@@ -693,9 +693,8 @@ def mark_segment(
         
         if current != prev:
             # FIX: Check if we moved diagonally (both x and y changed)
-            # If so, we must block the corner to prevent leakage through the "diagonal gap"
             if current[0] != prev[0] and current[1] != prev[1]:
-                # Block the "L" shape path
+                # Block the "L" shape path to prevent diagonal leakage
                 intermediate = (current[0], prev[1])
                 mark_edge(prev, intermediate, h_edges, v_edges, conductance)
                 mark_edge(intermediate, current, h_edges, v_edges, conductance)
