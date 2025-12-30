@@ -2,48 +2,42 @@
 <Container version="2">
   <Name>TempMap Renderer</Name>
   <Repository>ghcr.io/rjgrandy/tempmap-renderer:main</Repository>
+  <Registry>https://ghcr.io/</Registry>
+
   <Network>bridge</Network>
-  <MyIP/>
   <Shell>bash</Shell>
   <Privileged>false</Privileged>
-  <Support/>
-  <Project/>
-  <Overview/>
-  <Category/>
+
+  <Support>https://github.com/rjgrandy/tempmap-renderer</Support>
+  <Project>https://github.com/rjgrandy/tempmap-renderer</Project>
+  <Overview>
+    Renders temperature heatmaps/overlays and serves them via HTTP (port 8000).
+    Stores output/cache under /data and reads config from /config/config.yaml.
+  </Overview>
+  <Category>Tools:Utilities</Category>
+
   <WebUI>http://[IP]:[PORT:8000]/</WebUI>
-  <TemplateURL/>
-  <Icon/>
+  <Icon>https://raw.githubusercontent.com/rjgrandy/tempmap-renderer/main/docs/icon.png</Icon>
+
   <ExtraParams/>
   <PostArgs/>
-  <Port>
-    <HostPort>8000</HostPort>
-    <ContainerPort>8000</ContainerPort>
-    <Protocol>tcp</Protocol>
-  </Port>
-  <Volume>
-    <HostDir>/mnt/user/appdata/tempmap-renderer</HostDir>
-    <ContainerDir>/data</ContainerDir>
-    <Mode>rw</Mode>
-  </Volume>
-  <Volume>
-    <HostDir>/mnt/user/appdata/tempmap-renderer/config.yaml</HostDir>
-    <ContainerDir>/app/backend/config.yaml</ContainerDir>
-    <Mode>rw</Mode>
-  </Volume>
-  <Environment>
-    <Name>TEMP_MAP_DATA_PATH</Name>
-    <Value>/data</Value>
-  </Environment>
-  <Environment>
-    <Name>TZ</Name>
-    <Value>UTC</Value>
-  </Environment>
-  <Environment>
-    <Name>PUID</Name>
-    <Value>99</Value>
-  </Environment>
-  <Environment>
-    <Name>PGID</Name>
-    <Value>100</Value>
-  </Environment>
+
+  <!-- PORT -->
+  <Config Name="Web Port" Target="8000" Default="8000" Mode="tcp" Description="HTTP port for the TempMap Renderer UI/API" Type="Port" Display="always" Required="true" Mask="false"/>
+
+  <!-- PATHS -->
+  <Config Name="App Data" Target="/data" Default="/mnt/user/appdata/tempmap-renderer/data" Mode="rw" Description="Persistent data/output/cache directory" Type="Path" Display="always" Required="true" Mask="false"/>
+
+  <Config Name="Config Folder" Target="/config" Default="/mnt/user/appdata/tempmap-renderer/config" Mode="rw" Description="Folder containing config.yaml and related assets" Type="Path" Display="always" Required="true" Mask="false"/>
+
+  <!-- ENV -->
+  <Config Name="TEMP_MAP_DATA_PATH" Target="TEMP_MAP_DATA_PATH" Default="/data" Mode="" Description="Where the app stores/reads generated data" Type="Variable" Display="advanced" Required="false" Mask="false"/>
+
+  <Config Name="CONFIG_PATH" Target="CONFIG_PATH" Default="/config/config.yaml" Mode="" Description="Path to the app configuration file (if supported by the image)" Type="Variable" Display="advanced" Required="false" Mask="false"/>
+
+  <Config Name="TZ" Target="TZ" Default="America/Chicago" Mode="" Description="Container timezone" Type="Variable" Display="advanced" Required="false" Mask="false"/>
+
+  <Config Name="PUID" Target="PUID" Default="99" Mode="" Description="User ID for file permissions" Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="PGID" Target="PGID" Default="100" Mode="" Description="Group ID for file permissions" Type="Variable" Display="advanced" Required="false" Mask="false"/>
+
 </Container>
