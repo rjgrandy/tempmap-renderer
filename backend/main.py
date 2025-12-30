@@ -96,8 +96,7 @@ class SolverParams(BaseModel):
     grid_h: int = 250
     iterations: int = 500
     sensor_pull: float = 1.0
-    # DRASTICALLY INCREASED WALL RESISTANCE
-    # This ensures paths through doors are mathematically preferred by orders of magnitude.
+    # High resistance ensures walls are preferred barriers
     wall_resistance: float = 500000.0
     default_passage_resistance: float = 2.0
 
@@ -530,9 +529,7 @@ def initialize_grid(fp: FloorplanV1) -> np.ndarray:
     for gx, gy, temp, weight in sensor_samples:
         distances = dijkstra_distances(gx, gy, h_edges, v_edges)
         
-        # KEY CHANGE 2: Sharper falloff (power 4 instead of 2).
-        # This keeps the sensor's influence "tight" to its room/zone 
-        # when combined with the huge wall resistance.
+        # IDW with Distance^4 to create sharp zones (when walls effectively block paths)
         sensor_weight = weight * (1.0 / (distances**4 + 1.0))
         
         weighted_sum += sensor_weight * temp
@@ -693,8 +690,19 @@ def mark_segment(
         x = int(x0 + (x1 - x0) * t)
         y = int(y0 + (y1 - y0) * t)
         current = (min(max(x, 0), grid_w - 1), min(max(y, 0), grid_h - 1))
+        
         if current != prev:
-            mark_edge(prev, current, h_edges, v_edges, conductance)
+            # FIX: Check if we moved diagonally (both x and y changed)
+            # If so, we must block the corner to prevent leakage through the "diagonal gap"
+            if current[0] != prev[0] and current[1] != prev[1]:
+                # Block the "L" shape path
+                intermediate = (current[0], prev[1])
+                mark_edge(prev, intermediate, h_edges, v_edges, conductance)
+                mark_edge(intermediate, current, h_edges, v_edges, conductance)
+            else:
+                # Standard orthogonal move
+                mark_edge(prev, current, h_edges, v_edges, conductance)
+            
             prev = current
 
 
@@ -863,12 +871,9 @@ def gradient_rgb(norm: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     idx = np.searchsorted(stops, norm, side="right") - 1
     idx = np.clip(idx, 0, len(stops) - 2)
     
-    # Calculate linear progress between stops
     t = (norm - stops[idx]) / (stops[idx + 1] - stops[idx])
     
-    # KEY CHANGE 3: Smoothstep Interpolation
-    # Instead of linear t, use t * t * (3 - 2 * t) to ease the transition
-    # This makes the "middle" colors of the transition wider and less sharp
+    # Smoothstep interpolation for nicer bands
     t = t * t * (3.0 - 2.0 * t)
     
     c0 = colors[idx]
