@@ -94,11 +94,11 @@ class Stairwell(BaseModel):
 class SolverParams(BaseModel):
     grid_w: int = 400
     grid_h: int = 250
-    # High iteration count for smooth gradients
     iterations: int = 500
-    # Strong pull to anchor sensor values
     sensor_pull: float = 1.0
-    wall_resistance: float = 5000.0
+    # DRASTICALLY INCREASED WALL RESISTANCE
+    # This ensures paths through doors are mathematically preferred by orders of magnitude.
+    wall_resistance: float = 500000.0
     default_passage_resistance: float = 2.0
 
 
@@ -516,7 +516,6 @@ def initialize_grid(fp: FloorplanV1) -> np.ndarray:
             sensor_samples.append((gx, gy, temp, weight))
             temps.append(temp)
     
-    # Calculate a default temp as a fallback, but we primarily use IDW now
     default_temp = float(np.mean(temps)) if temps else 70.0
     
     if not sensor_samples:
@@ -525,23 +524,20 @@ def initialize_grid(fp: FloorplanV1) -> np.ndarray:
     h_edges, v_edges = build_edge_conductance(fp)
     height, width = fp.solver.grid_h, fp.solver.grid_w
     
-    # Initialize accumulators for Inverse Distance Weighting (IDW)
     weighted_sum = np.zeros((height, width), dtype=float)
     weight_sum = np.zeros((height, width), dtype=float)
     
     for gx, gy, temp, weight in sensor_samples:
         distances = dijkstra_distances(gx, gy, h_edges, v_edges)
         
-        # KEY CHANGE: Inverse Distance Weighting (1 / distance^2)
-        # This ensures the sensor's influence extends infinitely (filling the room)
-        # unless blocked by a wall (where distance becomes infinite).
-        # We add +1.0 to avoid division by zero at the sensor's own pixel.
-        sensor_weight = weight * (1.0 / (distances**2 + 1.0))
+        # KEY CHANGE 2: Sharper falloff (power 4 instead of 2).
+        # This keeps the sensor's influence "tight" to its room/zone 
+        # when combined with the huge wall resistance.
+        sensor_weight = weight * (1.0 / (distances**4 + 1.0))
         
         weighted_sum += sensor_weight * temp
         weight_sum += sensor_weight
     
-    # Normalize
     grid = np.divide(
         weighted_sum,
         weight_sum,
@@ -562,15 +558,11 @@ def diffuse_grid(fp: FloorplanV1, grid: np.ndarray) -> np.ndarray:
     height, width = grid.shape
     h_edges, v_edges = build_edge_conductance(fp)
 
-    # Vectorized diffusion using numpy shifting
-    
-    # Pad edges to align with grid
     w_left = np.pad(h_edges, ((0, 0), (1, 0)), mode='constant', constant_values=0)
     w_right = np.pad(h_edges, ((0, 0), (0, 1)), mode='constant', constant_values=0)
     w_up = np.pad(v_edges, ((1, 0), (0, 0)), mode='constant', constant_values=0)
     w_down = np.pad(v_edges, ((0, 1), (0, 0)), mode='constant', constant_values=0)
     
-    # Neighbors
     n_left = np.roll(grid, 1, axis=1)
     n_right = np.roll(grid, -1, axis=1)
     n_up = np.roll(grid, 1, axis=0)
@@ -870,7 +862,15 @@ def gradient_rgb(norm: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     norm = np.clip(norm, 0.0, 1.0)
     idx = np.searchsorted(stops, norm, side="right") - 1
     idx = np.clip(idx, 0, len(stops) - 2)
+    
+    # Calculate linear progress between stops
     t = (norm - stops[idx]) / (stops[idx + 1] - stops[idx])
+    
+    # KEY CHANGE 3: Smoothstep Interpolation
+    # Instead of linear t, use t * t * (3 - 2 * t) to ease the transition
+    # This makes the "middle" colors of the transition wider and less sharp
+    t = t * t * (3.0 - 2.0 * t)
+    
     c0 = colors[idx]
     c1 = colors[idx + 1]
     blended = c0 + (c1 - c0) * t[..., None]
