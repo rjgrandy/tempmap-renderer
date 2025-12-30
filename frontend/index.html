@@ -3,43 +3,219 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>TempMap Renderer</title>
+    <title>Floorplan Builder</title>
     <style>
+      :root {
+        color-scheme: dark;
+        --bg: #0f1115;
+        --panel: #191c24;
+        --panel-2: #141722;
+        --accent: #4ea1ff;
+        --text: #e6e9ef;
+        --muted: #9aa3b2;
+        --danger: #ff6b6b;
+        --grid: rgba(255, 255, 255, 0.05);
+      }
+      * {
+        box-sizing: border-box;
+      }
       body {
         margin: 0;
-        background: #101010;
-        color: #f0f0f0;
-        font-family: Arial, sans-serif;
+        font-family: "Segoe UI", sans-serif;
+        background: var(--bg);
+        color: var(--text);
+        height: 100vh;
+        overflow: hidden;
       }
-      header {
-        padding: 12px 20px;
-        background: #1b1b1b;
+      #app {
+        display: flex;
+        flex-direction: column;
+        height: 100vh;
+      }
+      .topbar {
         display: flex;
         align-items: center;
-        gap: 12px;
+        justify-content: space-between;
+        padding: 10px 16px;
+        background: var(--panel);
+        border-bottom: 1px solid #262a36;
+        gap: 16px;
       }
-      #canvas {
-        display: block;
-        width: 100%;
-        height: calc(100vh - 64px);
-        background: #151515;
+      .tabs {
+        display: flex;
+        gap: 8px;
       }
-      select, button {
-        background: #2a2a2a;
-        color: #fff;
-        border: 1px solid #444;
+      .tab {
+        background: transparent;
+        border: 1px solid #30364a;
+        color: var(--text);
+        padding: 6px 14px;
+        border-radius: 6px;
+        cursor: pointer;
+      }
+      .tab.active {
+        background: var(--accent);
+        color: #0b1020;
+        border-color: transparent;
+      }
+      .top-actions {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+      .top-actions select,
+      .top-actions button {
+        background: var(--panel-2);
+        color: var(--text);
+        border: 1px solid #32384d;
+        border-radius: 6px;
         padding: 6px 10px;
+      }
+      .top-actions button.primary {
+        background: var(--accent);
+        color: #0b1020;
+        border: none;
+      }
+      .main {
+        flex: 1;
+        display: grid;
+        grid-template-columns: 80px 1fr 280px;
+        overflow: hidden;
+      }
+      .toolbar {
+        background: var(--panel);
+        border-right: 1px solid #262a36;
+        padding: 10px 8px;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        overflow-y: auto;
+      }
+      .tool-button {
+        background: transparent;
+        border: 1px solid #30364a;
+        color: var(--text);
+        padding: 8px;
+        border-radius: 6px;
+        font-size: 11px;
+        cursor: pointer;
+        text-align: center;
+      }
+      .tool-button.active {
+        background: var(--accent);
+        color: #0b1020;
+        border-color: transparent;
+      }
+      .toolbar label {
+        font-size: 11px;
+        color: var(--muted);
+        display: flex;
+        gap: 6px;
+        align-items: center;
+      }
+      .canvas-wrap {
+        position: relative;
+        background: #10131c;
+      }
+      canvas {
+        width: 100%;
+        height: 100%;
+        display: block;
+      }
+      .properties {
+        background: var(--panel);
+        border-left: 1px solid #262a36;
+        padding: 12px;
+        overflow-y: auto;
+      }
+      .properties h3 {
+        margin-top: 0;
+        font-size: 14px;
+        color: var(--text);
+      }
+      .properties .field {
+        margin-bottom: 10px;
+      }
+      .properties label {
+        font-size: 12px;
+        color: var(--muted);
+        display: block;
+        margin-bottom: 4px;
+      }
+      .properties input,
+      .properties select,
+      .properties textarea {
+        width: 100%;
+        background: var(--panel-2);
+        color: var(--text);
+        border: 1px solid #32384d;
+        border-radius: 6px;
+        padding: 6px 8px;
+        font-size: 12px;
+      }
+      .statusbar {
+        padding: 6px 12px;
+        background: var(--panel);
+        border-top: 1px solid #262a36;
+        font-size: 12px;
+        color: var(--muted);
+        display: flex;
+        justify-content: space-between;
+      }
+      .status-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .danger {
+        color: var(--danger);
       }
     </style>
   </head>
   <body>
-    <header>
-      <strong>TempMap Renderer</strong>
-      <label for="floorSelect">Floorplan</label>
-      <select id="floorSelect"></select>
-      <button id="reload">Reload</button>
-    </header>
-    <canvas id="canvas" width="1600" height="1000"></canvas>
+    <div id="app">
+      <header class="topbar">
+        <div class="tabs">
+          <button class="tab" data-floor="floor1">Floor 1</button>
+          <button class="tab" data-floor="floor2">Floor 2</button>
+        </div>
+        <div class="top-actions">
+          <label for="loadSelect">Load</label>
+          <select id="loadSelect"></select>
+          <button id="loadBtn">Load</button>
+          <button id="newBtn">New Floorplan</button>
+          <button id="saveBtn" class="primary">Save</button>
+          <button id="undoBtn">Undo</button>
+          <button id="redoBtn">Redo</button>
+        </div>
+      </header>
+      <div class="main">
+        <aside class="toolbar">
+          <button class="tool-button" data-tool="select">Select</button>
+          <button class="tool-button" data-tool="wall">Wall</button>
+          <button class="tool-button" data-tool="door">Door</button>
+          <button class="tool-button" data-tool="sensor">Sensor</button>
+          <button class="tool-button" data-tool="thermostat">Thermostat</button>
+          <button class="tool-button" data-tool="stairwell">Stairwell</button>
+          <button class="tool-button" data-tool="scale">Scale</button>
+          <button class="tool-button" data-tool="erase">Erase</button>
+          <hr />
+          <label><input type="checkbox" id="snapToggle" checked /> Snap</label>
+          <label><input type="checkbox" id="orthoToggle" checked /> Ortho</label>
+        </aside>
+        <section class="canvas-wrap">
+          <canvas id="canvas"></canvas>
+        </section>
+        <aside class="properties">
+          <div id="properties"></div>
+        </aside>
+      </div>
+      <footer class="statusbar">
+        <div class="status-pill" id="statusText">Ready</div>
+        <div class="status-pill">Space + Drag to Pan • Mouse Wheel to Zoom</div>
+      </footer>
+    </div>
     <script src="app.js"></script>
   </body>
 </html>
