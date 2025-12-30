@@ -172,9 +172,6 @@ def startup() -> None:
     thread.start()
 
 
-app.mount("/", StaticFiles(directory=Path(__file__).parents[1] / "frontend", html=True), name="frontend")
-
-
 @app.get("/api/floorplans")
 def list_floorplans() -> Dict[str, List[str]]:
     floor_dir = Path(config.data_path) / "floorplans"
@@ -217,6 +214,9 @@ def render_live_png(floor_id: str) -> Response:
     image = render_floorplan(floor_id)
     image_bytes = image_to_png_bytes(image)
     return Response(content=image_bytes, media_type="image/png", headers={"Cache-Control": "no-store"})
+
+
+app.mount("/", StaticFiles(directory=Path(__file__).parents[1] / "frontend", html=True), name="frontend")
 
 
 @app.get("/render/live/{floor_id}.json")
