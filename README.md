@@ -163,6 +163,7 @@ Floorplans live at `/data/floorplans/{floor_id}.json`.
     "scale_max_mode": "absolute",
     "auto_crop": true,
     "crop_padding": 30,
+    "exterior_margin": 20,
     "show_walls": true,
     "show_labels": true,
     "show_legend": true,
@@ -189,7 +190,11 @@ Floorplans live at `/data/floorplans/{floor_id}.json`.
 - **overlay_alpha**: transparency of the heatmap overlay (0–1).
 - **auto_crop**: trims extra blank space around the floorplan when rendering.
 - **crop_padding**: extra pixels to keep around the geometry when auto-cropping.
+- **exterior_margin**: padding outside the cropped floorplan used to draw the legend and timestamp.
 - **show_walls / show_labels / show_legend / show_timestamp**: toggles for overlay elements.
+
+> The heatmap is masked to the floorplan hull so areas outside the exterior walls are not colorized.
+> The solver clamps the final grid so values do not fall below the coldest sensor reading on the floor.
 
 ### Solver settings (`solver`)
 
