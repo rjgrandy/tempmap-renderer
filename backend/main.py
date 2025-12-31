@@ -700,13 +700,25 @@ def build_floorplan_mask_floodfill(fp: FloorplanV1) -> np.ndarray:
         pts = [(p[0]/4, p[1]/4) for p in wall.points]
         draw.line(pts, fill=255, width=2)
 
+    # --- FIX START: Draw Doors as blockers too, to seal the hull! ---
+    # Without this, the 'outside' flood fill leaks through door gaps 
+    # and marks the interior as outside.
+    for door in fp.doors:
+        pts = [
+            (door.segment[0][0] / 4, door.segment[0][1] / 4),
+            (door.segment[1][0] / 4, door.segment[1][1] / 4),
+        ]
+        draw.line(pts, fill=255, width=2)
+    # --- FIX END ---
+
     # 2. Convert to numpy
     arr = np.array(mask)
     # Walls are 255, empty is 0. We want to fill 0s starting from sensors.
 
     # Identify exterior space (outside the walls) so we can clamp the final mask to the interior.
     outside = np.zeros_like(arr, dtype=bool)
-    h, w = arr.shape
+    # ... (rest of the function logic remains exactly the same) ...
+    h_arr, w_arr = arr.shape
     wall_block = arr > 0
     padded = np.pad(wall_block, 1, mode="constant", constant_values=False)
     wall_block = (
@@ -715,16 +727,16 @@ def build_floorplan_mask_floodfill(fp: FloorplanV1) -> np.ndarray:
         padded[2:, 0:-2] | padded[2:, 1:-1] | padded[2:, 2:]
     )
     stack = []
-    for x in range(w):
+    for x in range(w_arr):
         if not wall_block[0, x]:
             stack.append((x, 0))
-        if not wall_block[h - 1, x]:
-            stack.append((x, h - 1))
-    for y in range(h):
+        if not wall_block[h_arr - 1, x]:
+            stack.append((x, h_arr - 1))
+    for y in range(h_arr):
         if not wall_block[y, 0]:
             stack.append((0, y))
-        if not wall_block[y, w - 1]:
-            stack.append((w - 1, y))
+        if not wall_block[y, w_arr - 1]:
+            stack.append((w_arr - 1, y))
     while stack:
         cx, cy = stack.pop()
         if outside[cy, cx]:
@@ -732,11 +744,12 @@ def build_floorplan_mask_floodfill(fp: FloorplanV1) -> np.ndarray:
         outside[cy, cx] = True
         for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
             nx, ny = cx + dx, cy + dy
-            if 0 <= nx < w and 0 <= ny < h and not wall_block[ny, nx] and not outside[ny, nx]:
+            if 0 <= nx < w_arr and 0 <= ny < h_arr and not wall_block[ny, nx] and not outside[ny, nx]:
                 stack.append((nx, ny))
     interior = ~outside
 
     # 2b. Erase open doors so flood fill can pass through (interior is enforced later)
+    # We redraw on the PIL image to clear the lines we just added in Step 1
     for door in fp.doors:
         if not is_door_open(fp, door):
             continue
@@ -744,7 +757,7 @@ def build_floorplan_mask_floodfill(fp: FloorplanV1) -> np.ndarray:
             (door.segment[0][0] / 4, door.segment[0][1] / 4),
             (door.segment[1][0] / 4, door.segment[1][1] / 4),
         ]
-        draw.line(pts, fill=0, width=3)
+        draw.line(pts, fill=0, width=3) # Erase to 0
 
     arr = np.array(mask)
     
