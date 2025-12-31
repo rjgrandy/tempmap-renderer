@@ -342,10 +342,13 @@ function renderSensors(fp) {
     ctx.fill();
     if (fp.render.show_labels) {
       const label = sensor.label || sensor.entity || '';
-      // Visual preview only
+      
       const offX = (sensor.label_offset_x || 10) / state.view.scale;
       const offY = (sensor.label_offset_y || -8) / state.view.scale;
+      
       ctx.fillText(label, sensor.pos[0] + offX, sensor.pos[1] + offY);
+      // Mockup of second line (visual only, real rendering is in backend)
+      ctx.fillText("72.0F", sensor.pos[0] + offX, sensor.pos[1] + offY + (14/state.view.scale));
     }
   });
 }
@@ -361,7 +364,9 @@ function renderThermostats(fp) {
       ctx.fillStyle = '#f5c542';
       const offX = (thermo.label_offset_x || 12) / state.view.scale;
       const offY = (thermo.label_offset_y || -8) / state.view.scale;
+      
       ctx.fillText(label, thermo.pos[0] + offX, thermo.pos[1] + offY);
+      ctx.fillText("72.0 / 74.0", thermo.pos[0] + offX, thermo.pos[1] + offY + (14/state.view.scale));
     }
   });
 }
@@ -592,7 +597,12 @@ function renderProperties() {
       pushHistory();
       item.weight = parseFloat(val) || 1.0;
     }));
-    // NEW: Label Customization
+    
+    // NEW: Font Size & Position
+    propertiesPanel.appendChild(renderField('Font Size', item.font_size || 12, (val) => {
+        pushHistory();
+        item.font_size = parseInt(val) || 12;
+    }));
     propertiesPanel.appendChild(renderField('Label Offset X', item.label_offset_x || 10, (val) => {
         pushHistory();
         item.label_offset_x = parseInt(val) || 0;
@@ -623,7 +633,12 @@ function renderProperties() {
       pushHistory();
       item.mode_entity = val;
     }));
-    // NEW: Label Customization
+    
+    // NEW: Font Size & Position
+    propertiesPanel.appendChild(renderField('Font Size', item.font_size || 12, (val) => {
+        pushHistory();
+        item.font_size = parseInt(val) || 12;
+    }));
     propertiesPanel.appendChild(renderField('Label Offset X', item.label_offset_x || 12, (val) => {
         pushHistory();
         item.label_offset_x = parseInt(val) || 0;
@@ -676,396 +691,6 @@ function renderField(labelText, value, onChange, options = null) {
   wrapper.appendChild(input);
   return wrapper;
 }
-
-async function fetchFloorplanList() {
-  try {
-    const response = await fetch('/api/floorplans');
-    if (!response.ok) {
-       console.error("API Error:", response.status);
-       return;
-    }
-    const data = await response.json();
-    
-    if (!data.floorplans) {
-       console.warn("No floorplans returned from API");
-       return;
-    }
-
-    const floors = ['floor1', 'floor2'];
-    data.floorplans.forEach((id) => {
-      if (!floors.includes(id)) {
-        floors.push(id);
-      }
-    });
-    loadSelect.innerHTML = '';
-    floors.forEach((floorId) => {
-      const option = document.createElement('option');
-      option.value = floorId;
-      option.textContent = floorId;
-      loadSelect.appendChild(option);
-    });
-    loadSelect.value = state.floorId;
-  } catch (e) {
-    console.error("Failed to fetch floorplans", e);
-  }
-}
-
-async function loadFloorplan(floorId) {
-  try {
-    const response = await fetch(`/api/floorplans/${floorId}`);
-    if (!response.ok) {
-      throw new Error(`Missing floorplan ${floorId}`);
-    }
-    const fp = await response.json();
-    state.floorId = floorId;
-    updateFloorTabs();
-    setFloorplan(fp);
-    setStatus(`Loaded ${floorId}`);
-  } catch (error) {
-    setStatus(error.message, true);
-  }
-}
-
-async function saveFloorplan() {
-  const fp = currentFloorplan();
-  fp.floor_id = state.floorId;
-  try {
-    const response = await fetch(`/api/floorplans/${state.floorId}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(fp),
-    });
-    if (!response.ok) {
-      const detail = await response.text();
-      throw new Error(detail || 'Save failed');
-    }
-    setStatus(`Saved ${state.floorId}`);
-    fetchFloorplanList();
-  } catch (error) {
-    setStatus(error.message, true);
-  }
-}
-
-function setTool(tool) {
-  state.tool = tool;
-  state.drawing = null;
-  updateToolButtons();
-  setStatus(`${tool} tool active`);
-}
-
-function startDrawing(point) {
-  if (state.tool === 'wall' || state.tool === 'stairwell') {
-    if (!state.drawing) {
-      state.drawing = { type: state.tool, points: [point], previewPoint: null };
-    } else {
-      state.drawing.points.push(point);
-    }
-  } else if (state.tool === 'door') {
-    if (!state.drawing) {
-      state.drawing = { type: 'door', start: point, previewPoint: null };
-    } else if (state.drawing.start) {
-      const fp = currentFloorplan();
-      const distance = findNearestWallDistance(fp, point, state.drawing.start);
-      if (distance > 20) {
-        setStatus('Doors must be placed near a wall.', true);
-        state.drawing = null;
-        return;
-      }
-      pushHistory();
-      if (!fp.doors) fp.doors = [];
-      fp.doors.push({
-        id: ensureId('door'),
-        segment: [state.drawing.start, point],
-        entity_id: '',
-        mapping: { open_values: ['on', 'open'], closed_values: ['off', 'closed'], unknown_as: 'closed' },
-        open: false,
-        open_resistance: null,
-        closed_resistance: null,
-      });
-      state.drawing = null;
-      render();
-    }
-  }
-}
-
-function finishDrawing() {
-  const fp = currentFloorplan();
-  if (!state.drawing) return;
-  if (state.drawing.type === 'wall' && state.drawing.points.length > 1) {
-    pushHistory();
-    if (!fp.walls) fp.walls = [];
-    fp.walls.push({ id: ensureId('wall'), points: state.drawing.points });
-  }
-  if (state.drawing.type === 'stairwell' && state.drawing.points.length > 2) {
-    pushHistory();
-    fp.stairwell = {
-      id: ensureId('stairwell'),
-      polygon: state.drawing.points,
-      link_to_floor_id: state.floorId === 'floor1' ? 'floor2' : 'floor1',
-      coupling: 0.05,
-    };
-  }
-  state.drawing = null;
-  render();
-}
-
-function findNearestWallDistance(fp, pointA, pointB) {
-  let min = Infinity;
-  (fp.walls || []).forEach((wall) => {
-    for (let i = 0; i < wall.points.length - 1; i += 1) {
-      const d1 = distanceToSegment(pointA, wall.points[i], wall.points[i + 1]);
-      const d2 = distanceToSegment(pointB, wall.points[i], wall.points[i + 1]);
-      min = Math.min(min, d1, d2);
-    }
-  });
-  return min;
-}
-
-function handleCanvasClick(event) {
-  const rect = canvas.getBoundingClientRect();
-  const [worldX, worldY] = screenToWorld(event.clientX - rect.left, event.clientY - rect.top);
-  const reference = state.drawing && state.drawing.points ? state.drawing.points[state.drawing.points.length - 1] : null;
-  const point = snapPoint([worldX, worldY], reference);
-
-  if (state.tool === 'sensor') {
-    pushHistory();
-    const fp = currentFloorplan();
-    if (!fp.sensors) fp.sensors = [];
-    fp.sensors.push({
-      id: ensureId('sensor'),
-      entity: '',
-      pos: point,
-      label: '',
-      weight: 1,
-    });
-    render();
-    return;
-  }
-  if (state.tool === 'thermostat') {
-    pushHistory();
-    const fp = currentFloorplan();
-    if (!fp.thermostats) fp.thermostats = [];
-    fp.thermostats.push({
-      id: ensureId('thermo'),
-      pos: point,
-      temperature_entity: '',
-      setpoint_entity: '',
-      mode_entity: '',
-      device_label: '',
-    });
-    render();
-    return;
-  }
-  if (state.tool === 'scale') {
-    if (!state.drawing) {
-      state.drawing = { type: 'scale', start: point };
-      setStatus('Select second calibration point.');
-    } else if (state.drawing.start) {
-      const p1 = state.drawing.start;
-      const p2 = point;
-      const distancePx = Math.hypot(p2[0] - p1[0], p2[1] - p1[1]);
-      const distanceInput = window.prompt('Enter distance in meters:', '1');
-      const distance = parseFloat(distanceInput);
-      if (!Number.isNaN(distance) && distance > 0) {
-        pushHistory();
-        const fp = currentFloorplan();
-        fp.scale.px_per_meter = distancePx / distance;
-        fp.scale.calibration = { p1, p2, distance_m: distance };
-        setStatus('Scale calibrated.');
-      }
-      state.drawing = null;
-      render();
-    }
-    return;
-  }
-  if (state.tool === 'wall' || state.tool === 'stairwell' || state.tool === 'door') {
-    startDrawing(point);
-    render();
-    return;
-  }
-}
-
-function handlePointerDown(event) {
-  const rect = canvas.getBoundingClientRect();
-  const [worldX, worldY] = screenToWorld(event.clientX - rect.left, event.clientY - rect.top);
-  const point = [worldX, worldY];
-
-  if (state.spacePressed) {
-    state.dragging = { type: 'pan', start: [event.clientX, event.clientY], view: { ...state.view } };
-    return;
-  }
-
-  if (state.tool === 'select') {
-    const hit = hitTest(point);
-    state.selected = hit;
-    renderProperties();
-    if (hit) {
-      pushHistory();
-      state.dragging = { type: 'move', start: point, item: deepCopy(findById(hit.type, hit.id)) };
-    }
-    render();
-    return;
-  }
-
-  if (state.tool === 'erase') {
-    const hit = hitTest(point);
-    if (hit) {
-      state.selected = hit;
-      removeSelected();
-    }
-    return;
-  }
-}
-
-function handlePointerMove(event) {
-  const rect = canvas.getBoundingClientRect();
-  const [worldX, worldY] = screenToWorld(event.clientX - rect.left, event.clientY - rect.top);
-  if (state.drawing && (state.drawing.type === 'wall' || state.drawing.type === 'stairwell')) {
-    const reference = state.drawing.points[state.drawing.points.length - 1];
-    state.drawing.previewPoint = snapPoint([worldX, worldY], reference);
-    render();
-  } else if (state.drawing && state.drawing.type === 'door') {
-    state.drawing.previewPoint = snapPoint([worldX, worldY], state.drawing.start);
-    render();
-  }
-
-  if (!state.dragging) {
-    return;
-  }
-  if (state.dragging.type === 'pan') {
-    const dx = event.clientX - state.dragging.start[0];
-    const dy = event.clientY - state.dragging.start[1];
-    state.view.x = state.dragging.view.x + dx;
-    state.view.y = state.dragging.view.y + dy;
-    render();
-  }
-  if (state.dragging.type === 'move' && state.selected) {
-    const item = findById(state.selected.type, state.selected.id);
-    if (!item) return;
-    const dx = worldX - state.dragging.start[0];
-    const dy = worldY - state.dragging.start[1];
-    if (state.selected.type === 'sensor' || state.selected.type === 'thermostat') {
-      item.pos = snapPoint([state.dragging.item.pos[0] + dx, state.dragging.item.pos[1] + dy]);
-    } else if (state.selected.type === 'door') {
-      item.segment = [
-        snapPoint([state.dragging.item.segment[0][0] + dx, state.dragging.item.segment[0][1] + dy]),
-        snapPoint([state.dragging.item.segment[1][0] + dx, state.dragging.item.segment[1][1] + dy]),
-      ];
-    } else if (state.selected.type === 'wall') {
-      item.points = state.dragging.item.points.map((pt) => snapPoint([pt[0] + dx, pt[1] + dy]));
-    } else if (state.selected.type === 'stairwell') {
-      item.polygon = state.dragging.item.polygon.map((pt) => snapPoint([pt[0] + dx, pt[1] + dy]));
-    }
-    render();
-  }
-}
-
-function handlePointerUp() {
-  state.dragging = null;
-}
-
-function handleWheel(event) {
-  const zoomIntensity = 0.0015;
-  const delta = -event.deltaY * zoomIntensity;
-  const nextScale = Math.min(Math.max(0.4, state.view.scale * (1 + delta)), 3);
-  const rect = canvas.getBoundingClientRect();
-  const mouseX = event.clientX - rect.left;
-  const mouseY = event.clientY - rect.top;
-  const [worldX, worldY] = screenToWorld(mouseX, mouseY);
-  state.view.scale = nextScale;
-  state.view.x = mouseX - worldX * state.view.scale;
-  state.view.y = mouseY - worldY * state.view.scale;
-  render();
-}
-
-canvas.addEventListener('click', (event) => {
-  if (state.tool !== 'select' && state.tool !== 'erase') {
-    handleCanvasClick(event);
-  }
-});
-canvas.addEventListener('dblclick', (event) => {
-  if (state.tool === 'wall' || state.tool === 'stairwell') {
-    event.preventDefault();
-    finishDrawing();
-  }
-});
-canvas.addEventListener('pointerdown', handlePointerDown);
-canvas.addEventListener('pointermove', handlePointerMove);
-canvas.addEventListener('pointerup', handlePointerUp);
-canvas.addEventListener('wheel', handleWheel, { passive: true });
-
-window.addEventListener('resize', resizeCanvas);
-
-window.addEventListener('keydown', (event) => {
-  if (event.key === ' ') {
-    state.spacePressed = true;
-  }
-  if (event.key === 'Delete') {
-    removeSelected();
-  }
-});
-
-window.addEventListener('keyup', (event) => {
-  if (event.key === ' ') {
-    state.spacePressed = false;
-  }
-});
-
-window.addEventListener('pointerup', handlePointerUp);
-
-toolButtons.forEach((btn) => {
-  btn.addEventListener('click', () => setTool(btn.dataset.tool));
-});
-
-floorTabs.forEach((tab) => {
-  tab.addEventListener('click', () => {
-    state.floorId = tab.dataset.floor;
-    updateFloorTabs();
-    loadSelect.value = state.floorId;
-    if (!currentFloorplan()) {
-      state.floorplans[state.floorId] = createDefaultFloorplan(state.floorId);
-    }
-    renderProperties();
-    render();
-  });
-});
-
-loadSelect.addEventListener('change', () => {
-  loadFloorplan(loadSelect.value);
-});
-
-document.getElementById('loadBtn').addEventListener('click', () => {
-  loadFloorplan(loadSelect.value);
-});
-
-document.getElementById('newBtn').addEventListener('click', () => {
-  pushHistory();
-  setFloorplan(createDefaultFloorplan(state.floorId));
-  setStatus(`New ${state.floorId} floorplan created.`);
-});
-
-document.getElementById('saveBtn').addEventListener('click', saveFloorplan);
-
-document.getElementById('undoBtn').addEventListener('click', () => {
-  undo();
-  renderProperties();
-});
-
-document.getElementById('redoBtn').addEventListener('click', () => {
-  redo();
-  renderProperties();
-});
-
-const snapToggle = document.getElementById('snapToggle');
-const orthoToggle = document.getElementById('orthoToggle');
-
-snapToggle.addEventListener('change', () => {
-  state.snapToGrid = snapToggle.checked;
-});
-
-orthoToggle.addEventListener('change', () => {
-  state.orthogonalSnap = orthoToggle.checked;
-});
 
 // Background Upload Handlers
 const bgUploadBtn = document.getElementById('bgUploadBtn');
