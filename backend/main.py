@@ -691,89 +691,46 @@ def render_floorplan_image(floor_id: str, payload: Dict, grid: np.ndarray, metad
 
 def build_floorplan_mask_floodfill(fp: FloorplanV1) -> np.ndarray:
     """Creates a mask of the 'inside' of the floorplan using flood fill from sensors."""
-    w, h = fp.canvas.width // 4, fp.canvas.height // 4 # Low-res mask for speed
-    mask = Image.new("L", (w, h), 0)
-    
-    # 1. Draw Walls (Blockers)
-    draw = ImageDraw.Draw(mask)
+    # 1. Setup low-res mask
+    w, h = fp.canvas.width // 4, fp.canvas.height // 4
+    mask_img = Image.new("L", (w, h), 0)
+    draw = ImageDraw.Draw(mask_img)
+
+    # 2. Draw Barriers (Walls + Closed Doors)
+    # We DRAW walls as white (255) to act as boundaries.
     for wall in fp.walls:
         pts = [(p[0]/4, p[1]/4) for p in wall.points]
         draw.line(pts, fill=255, width=2)
-
-    # --- FIX START: Draw Doors as blockers too, to seal the hull! ---
-    # Without this, the 'outside' flood fill leaks through door gaps 
-    # and marks the interior as outside.
-    for door in fp.doors:
-        pts = [
-            (door.segment[0][0] / 4, door.segment[0][1] / 4),
-            (door.segment[1][0] / 4, door.segment[1][1] / 4),
-        ]
-        draw.line(pts, fill=255, width=2)
-    # --- FIX END ---
-
-    # 2. Convert to numpy
-    arr = np.array(mask)
-    # Walls are 255, empty is 0. We want to fill 0s starting from sensors.
-
-    # Identify exterior space (outside the walls) so we can clamp the final mask to the interior.
-    outside = np.zeros_like(arr, dtype=bool)
-    # ... (rest of the function logic remains exactly the same) ...
-    h_arr, w_arr = arr.shape
-    wall_block = arr > 0
-    padded = np.pad(wall_block, 1, mode="constant", constant_values=False)
-    wall_block = (
-        padded[0:-2, 0:-2] | padded[0:-2, 1:-1] | padded[0:-2, 2:] |
-        padded[1:-1, 0:-2] | padded[1:-1, 1:-1] | padded[1:-1, 2:] |
-        padded[2:, 0:-2] | padded[2:, 1:-1] | padded[2:, 2:]
-    )
-    stack = []
-    for x in range(w_arr):
-        if not wall_block[0, x]:
-            stack.append((x, 0))
-        if not wall_block[h_arr - 1, x]:
-            stack.append((x, h_arr - 1))
-    for y in range(h_arr):
-        if not wall_block[y, 0]:
-            stack.append((0, y))
-        if not wall_block[y, w_arr - 1]:
-            stack.append((w_arr - 1, y))
-    while stack:
-        cx, cy = stack.pop()
-        if outside[cy, cx]:
-            continue
-        outside[cy, cx] = True
-        for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-            nx, ny = cx + dx, cy + dy
-            if 0 <= nx < w_arr and 0 <= ny < h_arr and not wall_block[ny, nx] and not outside[ny, nx]:
-                stack.append((nx, ny))
-    interior = ~outside
-
-    # 2b. Erase open doors so flood fill can pass through (interior is enforced later)
-    # We redraw on the PIL image to clear the lines we just added in Step 1
-    for door in fp.doors:
-        if not is_door_open(fp, door):
-            continue
-        pts = [
-            (door.segment[0][0] / 4, door.segment[0][1] / 4),
-            (door.segment[1][0] / 4, door.segment[1][1] / 4),
-        ]
-        draw.line(pts, fill=0, width=3) # Erase to 0
-
-    arr = np.array(mask)
     
+    for door in fp.doors:
+        # If door is CLOSED, it is a barrier (draw white).
+        # If OPEN, we leave it empty so flood fill passes through.
+        if not is_door_open(fp, door):
+            pts = [
+                (door.segment[0][0] / 4, door.segment[0][1] / 4),
+                (door.segment[1][0] / 4, door.segment[1][1] / 4),
+            ]
+            draw.line(pts, fill=255, width=2)
+
+    # 3. Flood Fill from Sensors (The "Inside")
+    arr = np.array(mask_img) # Barriers are 255, Empty is 0
+    filled = np.zeros_like(arr, dtype=bool)
+    
+    # Collect seeds (sensors + thermostats)
     seeds = []
     for s in fp.sensors:
-        sx, sy = int(s.pos[0]/4), int(s.pos[1]/4)
-        if 0 <= sx < w and 0 <= sy < h: seeds.append((sx, sy))
+        seeds.append((int(s.pos[0]/4), int(s.pos[1]/4)))
     for t in fp.thermostats:
-        sx, sy = int(t.pos[0]/4), int(t.pos[1]/4)
-        if 0 <= sx < w and 0 <= sy < h: seeds.append((sx, sy))
-        
-    # Flood Fill
-    filled = np.zeros_like(arr, dtype=bool)
-    stack = [seed for seed in seeds if interior[seed[1], seed[0]]]
+        seeds.append((int(t.pos[0]/4), int(t.pos[1]/4)))
+
+    stack = []
+    # Only accept seeds that are within bounds and not ON a wall
+    for (sx, sy) in seeds:
+        if 0 <= sx < w and 0 <= sy < h and arr[sy, sx] == 0:
+            stack.append((sx, sy))
+            
+    # Standard Stack-based Flood Fill
     visited = set(stack)
-    
     while stack:
         cx, cy = stack.pop()
         filled[cy, cx] = True
@@ -781,17 +738,16 @@ def build_floorplan_mask_floodfill(fp: FloorplanV1) -> np.ndarray:
         for dx, dy in [(-1,0), (1,0), (0,-1), (0,1)]:
             nx, ny = cx + dx, cy + dy
             if 0 <= nx < w and 0 <= ny < h:
-                if not visited.__contains__((nx, ny)) and arr[ny, nx] == 0 and interior[ny, nx]:
+                # If not visited AND not a barrier (arr[ny,nx] == 0)
+                if (nx, ny) not in visited and arr[ny, nx] == 0:
                     visited.add((nx, ny))
                     stack.append((nx, ny))
-                    
-    if not np.any(filled):
-        if np.any(interior):
-            filled = interior
-        else:
-            filled = np.ones_like(arr, dtype=bool)
 
-    # Resize back up
+    # 4. Fallback: If no sensors found (or all in walls), fill everything to prevent pitch black.
+    if not np.any(filled):
+         filled = np.ones_like(arr, dtype=bool)
+
+    # 5. Resize to full resolution
     full_mask = Image.fromarray(filled).resize((fp.canvas.width, fp.canvas.height), Image.Resampling.NEAREST)
     return np.array(full_mask)
 
