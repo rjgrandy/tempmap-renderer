@@ -71,6 +71,19 @@ render:
   default_legend:
     min_f: 60
     max_f: 80
+
+timelapse:
+  frame_retention_hours: 48
+  window_hours: 48
+  sampling_seconds: 120
+  target_duration_seconds: 60
+  fps: 10
+  output_path: /data/timelapses
+  rolling_enabled: true
+  rolling_interval_seconds: 900
+  stitch_multi_floor: true
+  border_px: 12
+  label_font_size: 18
 ```
 
 ## `server`
@@ -96,6 +109,37 @@ This section controls **defaults** used when creating new floorplans in the edit
 
 - **default_grid**: default solver grid size used for new floorplans.
 - **default_legend**: default min/max values for the legend in new floorplans.
+
+## `timelapse`
+
+Configure rolling timelapse generation and on-demand timelapses. The backend caches frames under
+`/data/frames/{floor_id}` and writes MP4s to `output_path`.
+
+- **frame_retention_hours**: how long to keep cached PNG frames.
+- **window_hours**: rolling timelapse window length used by background generation.
+- **sampling_seconds**: base sampling cadence for frames before adaptive downsampling.
+- **target_duration_seconds**: target output duration; long sequences are downsampled to fit.
+- **fps**: frames per second for the generated MP4 (H.264).
+- **output_path**: directory to store rendered MP4s.
+- **rolling_enabled**: enable periodic rolling generation.
+- **rolling_interval_seconds**: how often to regenerate rolling timelapses.
+- **stitch_multi_floor**: build a stitched `all/rolling.mp4` when multiple floors exist.
+- **border_px**: border size between stitched floors.
+- **label_font_size**: font size for floor labels in stitched timelapses.
+
+### Timelapse API
+
+Generate a timelapse on demand:
+
+```
+GET /api/timelapse/{floor_id}?window=48h&sampling_seconds=120&target_duration_seconds=60&fps=10&stitch=true
+```
+
+- **window**: duration string (`30m`, `12h`, `2d`) or hours as a number.
+- **sampling_seconds**: base sampling interval in seconds.
+- **target_duration_seconds**: target length of the output video.
+- **fps**: frames per second.
+- **stitch**: set `true` to stitch all floors when `floor_id=all`.
 
 ---
 
