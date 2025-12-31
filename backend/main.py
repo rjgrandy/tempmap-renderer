@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -565,7 +566,7 @@ def generate_timelapse_for_request(
     stitch = config.timelapse_stitch_multi_floor if stitch is None else stitch
     output_dir = Path(config.timelapse_output_path) / floor_id
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / f"timelapse_{int(time.time())}.mp4"
+    output_path = output_dir / f"timelapse_{int(time.time())}_{uuid.uuid4().hex}.mp4"
     build_timelapse_video(
         floor_id=floor_id,
         output_path=output_path,
@@ -708,22 +709,49 @@ def generate_stitched_frames(
     frames_by_floor: Dict[str, List[Tuple[int, Path]]],
     floor_ids: List[str],
 ) -> None:
-    idx = 0
-    for sample_time in sample_times:
-        images = []
-        for floor_id in floor_ids:
-            frames = frames_by_floor.get(floor_id, [])
-            frame_path = resolve_frame_for_time(frames, sample_time)
-            if frame_path is None:
-                continue
-            images.append((floor_id, Image.open(frame_path)))
-        if not images:
+    base_size = None
+    for floor_id in floor_ids:
+        frames = frames_by_floor.get(floor_id, [])
+        if not frames:
             continue
-        stitched = stitch_images_horizontally(images, config.timelapse_border_px, config.timelapse_label_font_size)
-        target = temp_dir / f"frame_{idx:05d}.png"
-        stitched.save(target)
-        idx += 1
-        for _, image in images:
+        with Image.open(frames[0][1]) as image:
+            base_size = image.size
+            break
+    if base_size is None:
+        return
+    fallback_images = {}
+    for floor_id in floor_ids:
+        frames = frames_by_floor.get(floor_id, [])
+        if frames:
+            fallback_images[floor_id] = Image.open(frames[0][1])
+        else:
+            fallback_images[floor_id] = Image.new("RGBA", base_size, (0, 0, 0, 255))
+    idx = 0
+    try:
+        for sample_time in sample_times:
+            images = []
+            opened_images = []
+            for floor_id in floor_ids:
+                frames = frames_by_floor.get(floor_id, [])
+                frame_path = resolve_frame_for_time(frames, sample_time)
+                if frame_path is None:
+                    images.append((floor_id, fallback_images[floor_id]))
+                    continue
+                image = Image.open(frame_path)
+                images.append((floor_id, image))
+                opened_images.append(image)
+            stitched = stitch_images_horizontally(
+                images,
+                config.timelapse_border_px,
+                config.timelapse_label_font_size,
+            )
+            target = temp_dir / f"frame_{idx:05d}.png"
+            stitched.save(target)
+            idx += 1
+            for image in opened_images:
+                image.close()
+    finally:
+        for image in fallback_images.values():
             image.close()
 
 
