@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import bisect
 import heapq
 import io
 import json
 import os
+import shutil
+import subprocess
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -167,6 +171,17 @@ class AppConfig(BaseModel):
     refresh_seconds: int
     default_grid: Tuple[int, int]
     default_legend: Tuple[float, float]
+    timelapse_frame_retention_hours: int
+    timelapse_window_hours: float
+    timelapse_sampling_seconds: int
+    timelapse_target_duration_seconds: int
+    timelapse_fps: int
+    timelapse_output_path: str
+    timelapse_rolling_enabled: bool
+    timelapse_rolling_interval_seconds: int
+    timelapse_stitch_multi_floor: bool
+    timelapse_border_px: int
+    timelapse_label_font_size: int
 
 
 @dataclass
@@ -191,6 +206,9 @@ ha_states: Dict[str, EntityState] = {}
 ha_missing: Dict[str, str] = {}
 ha_unavailable: Dict[str, str] = {}
 ha_last_poll: Optional[str] = None
+timelapse_lock = threading.Lock()
+timelapse_last_roll: Optional[float] = None
+timelapse_is_running = False
 
 
 def load_config() -> AppConfig:
@@ -202,8 +220,11 @@ def load_config() -> AppConfig:
     data_path = os.getenv(DATA_ENV, data_path)
     ha_config = config_data.get("home_assistant", {})
     render_config = config_data.get("render", {})
+    timelapse_config = config_data.get("timelapse", {})
+    data_path = Path(data_path)
+    timelapse_output_path = timelapse_config.get("output_path", str(data_path / "timelapses"))
     return AppConfig(
-        data_path=data_path,
+        data_path=str(data_path),
         ha_base_url=ha_config.get("base_url", ""),
         ha_token=ha_config.get("token", ""),
         refresh_seconds=int(ha_config.get("refresh_seconds", 15)),
@@ -215,6 +236,17 @@ def load_config() -> AppConfig:
             float(render_config.get("default_legend", {}).get("min_f", 60)),
             float(render_config.get("default_legend", {}).get("max_f", 80)),
         ),
+        timelapse_frame_retention_hours=int(timelapse_config.get("frame_retention_hours", 48)),
+        timelapse_window_hours=float(timelapse_config.get("window_hours", 48)),
+        timelapse_sampling_seconds=int(timelapse_config.get("sampling_seconds", 120)),
+        timelapse_target_duration_seconds=int(timelapse_config.get("target_duration_seconds", 60)),
+        timelapse_fps=int(timelapse_config.get("fps", 10)),
+        timelapse_output_path=timelapse_output_path,
+        timelapse_rolling_enabled=bool(timelapse_config.get("rolling_enabled", True)),
+        timelapse_rolling_interval_seconds=int(timelapse_config.get("rolling_interval_seconds", 900)),
+        timelapse_stitch_multi_floor=bool(timelapse_config.get("stitch_multi_floor", True)),
+        timelapse_border_px=int(timelapse_config.get("border_px", 12)),
+        timelapse_label_font_size=int(timelapse_config.get("label_font_size", 18)),
     )
 
 
@@ -226,6 +258,7 @@ def startup() -> None:
     data_dir = Path(config.data_path)
     (data_dir / "floorplans").mkdir(parents=True, exist_ok=True)
     (data_dir / "frames").mkdir(parents=True, exist_ok=True)
+    Path(config.timelapse_output_path).mkdir(parents=True, exist_ok=True)
     thread = threading.Thread(target=ha_poll_loop, daemon=True)
     thread.start()
 
@@ -289,6 +322,26 @@ def render_live_png(floor_id: str) -> Response:
     return Response(content=image_bytes, media_type="image/png", headers={"Cache-Control": "no-store"})
 
 
+@app.get("/api/timelapse/{floor_id}")
+def render_timelapse(
+    floor_id: str,
+    window: Optional[str] = None,
+    sampling_seconds: Optional[int] = None,
+    target_duration_seconds: Optional[int] = None,
+    fps: Optional[int] = None,
+    stitch: Optional[bool] = None,
+) -> Response:
+    timelapse_path = generate_timelapse_for_request(
+        floor_id=floor_id,
+        window=window,
+        sampling_seconds=sampling_seconds,
+        target_duration_seconds=target_duration_seconds,
+        fps=fps,
+        stitch=stitch,
+    )
+    return FileResponse(timelapse_path, media_type="video/mp4", filename=Path(timelapse_path).name)
+
+
 app.mount("/editor", StaticFiles(directory=Path(__file__).parents[1] / "frontend", html=True), name="frontend")
 
 
@@ -331,6 +384,7 @@ def ha_poll_loop() -> None:
             if config.ha_base_url and config.ha_token and entities:
                 poll_home_assistant(entities)
             render_frames_for_floorplans(floorplans)
+            maybe_render_rolling_timelapses(floorplans)
         except Exception:
             pass
         ha_last_poll = now_iso()
@@ -420,7 +474,7 @@ def save_frame(floor_id: str, image: Image.Image) -> None:
 
 
 def cleanup_frames() -> None:
-    cutoff = time.time() - (8 * 24 * 60 * 60)
+    cutoff = time.time() - (config.timelapse_frame_retention_hours * 60 * 60)
     frames_root = Path(config.data_path) / "frames"
     for floor_dir in frames_root.glob("*"):
         for path in floor_dir.glob("*.png"):
@@ -441,6 +495,307 @@ def render_floorplan(floor_id: str) -> Image.Image:
     if grid is None:
         raise HTTPException(status_code=404, detail="Floorplan not found")
     return render_floorplan_image(floor_id, floorplans[floor_id], grid, metadata.get(floor_id, {}))
+
+
+def maybe_render_rolling_timelapses(floorplans: Dict[str, Dict]) -> None:
+    global timelapse_last_roll
+    if not config.timelapse_rolling_enabled:
+        return
+    now = time.time()
+    if timelapse_last_roll and (now - timelapse_last_roll) < config.timelapse_rolling_interval_seconds:
+        return
+    if not check_ffmpeg_available():
+        return
+    if timelapse_lock.locked():
+        return
+    timelapse_last_roll = now
+    thread = threading.Thread(target=render_rolling_timelapses, args=(floorplans,), daemon=True)
+    thread.start()
+
+
+def render_rolling_timelapses(floorplans: Dict[str, Dict]) -> None:
+    global timelapse_is_running
+    with timelapse_lock:
+        if timelapse_is_running:
+            return
+        timelapse_is_running = True
+        try:
+            for floor_id in sorted(floorplans.keys()):
+                output_path = Path(config.timelapse_output_path) / floor_id / "rolling.mp4"
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                build_timelapse_video(
+                    floor_id=floor_id,
+                    output_path=output_path,
+                    window_seconds=int(config.timelapse_window_hours * 60 * 60),
+                    sampling_seconds=config.timelapse_sampling_seconds,
+                    target_duration_seconds=config.timelapse_target_duration_seconds,
+                    fps=config.timelapse_fps,
+                    stitch=False,
+                )
+            if config.timelapse_stitch_multi_floor and len(floorplans) > 1:
+                output_path = Path(config.timelapse_output_path) / "all" / "rolling.mp4"
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                build_timelapse_video(
+                    floor_id="all",
+                    output_path=output_path,
+                    window_seconds=int(config.timelapse_window_hours * 60 * 60),
+                    sampling_seconds=config.timelapse_sampling_seconds,
+                    target_duration_seconds=config.timelapse_target_duration_seconds,
+                    fps=config.timelapse_fps,
+                    stitch=True,
+                )
+        finally:
+            timelapse_is_running = False
+
+
+def generate_timelapse_for_request(
+    floor_id: str,
+    window: Optional[str],
+    sampling_seconds: Optional[int],
+    target_duration_seconds: Optional[int],
+    fps: Optional[int],
+    stitch: Optional[bool],
+) -> str:
+    if not check_ffmpeg_available():
+        raise HTTPException(status_code=500, detail="ffmpeg is required but not available")
+    window_seconds = parse_window_seconds(window) if window else int(config.timelapse_window_hours * 60 * 60)
+    sampling_seconds = sampling_seconds or config.timelapse_sampling_seconds
+    target_duration_seconds = target_duration_seconds or config.timelapse_target_duration_seconds
+    fps = fps or config.timelapse_fps
+    stitch = config.timelapse_stitch_multi_floor if stitch is None else stitch
+    output_dir = Path(config.timelapse_output_path) / floor_id
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"timelapse_{int(time.time())}.mp4"
+    build_timelapse_video(
+        floor_id=floor_id,
+        output_path=output_path,
+        window_seconds=window_seconds,
+        sampling_seconds=sampling_seconds,
+        target_duration_seconds=target_duration_seconds,
+        fps=fps,
+        stitch=stitch,
+    )
+    return str(output_path)
+
+
+def parse_window_seconds(window: str) -> int:
+    window = window.strip().lower()
+    if not window:
+        raise HTTPException(status_code=400, detail="window parameter cannot be empty")
+    suffixes = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    if window[-1] in suffixes:
+        try:
+            value = float(window[:-1])
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail="invalid window format") from error
+        return int(value * suffixes[window[-1]])
+    try:
+        return int(float(window) * 3600)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail="invalid window format") from error
+
+
+def check_ffmpeg_available() -> bool:
+    return shutil.which("ffmpeg") is not None
+
+
+def build_timelapse_video(
+    floor_id: str,
+    output_path: Path,
+    window_seconds: int,
+    sampling_seconds: int,
+    target_duration_seconds: int,
+    fps: int,
+    stitch: bool,
+) -> None:
+    floorplans = load_all_floorplans()
+    if floor_id != "all" and floor_id not in floorplans:
+        raise HTTPException(status_code=404, detail="Floorplan not found")
+    now = time.time()
+    start_ts = now - window_seconds
+    available_floor_ids = sorted(floorplans.keys())
+    if floor_id != "all":
+        available_floor_ids = [floor_id]
+    elif not stitch:
+        stitch = True
+    frames_by_floor = {
+        fid: load_frame_index(fid, start_ts)
+        for fid in available_floor_ids
+    }
+    sample_times = build_sample_times(start_ts, now, sampling_seconds)
+    if not sample_times:
+        raise HTTPException(status_code=404, detail="No frames found in requested window")
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        temp_dir = Path(tmp_dir)
+        if stitch and len(available_floor_ids) > 1:
+            generate_stitched_frames(
+                temp_dir=temp_dir,
+                sample_times=sample_times,
+                frames_by_floor=frames_by_floor,
+                floor_ids=available_floor_ids,
+            )
+        else:
+            generate_single_floor_frames(
+                temp_dir=temp_dir,
+                sample_times=sample_times,
+                frames_by_floor=frames_by_floor,
+                floor_id=available_floor_ids[0],
+            )
+        frame_paths = sorted(temp_dir.glob("frame_*.png"))
+        if not frame_paths:
+            raise HTTPException(status_code=404, detail="No frames available to build timelapse")
+        max_frames = max(1, int(target_duration_seconds * fps))
+        frames_dir = temp_dir
+        if len(frame_paths) > max_frames:
+            frame_paths = downsample_frames(frame_paths, max_frames)
+            frames_dir = temp_dir / "downsampled"
+            frames_dir.mkdir(exist_ok=True)
+            for idx, path in enumerate(frame_paths):
+                new_path = frames_dir / f"frame_{idx:05d}.png"
+                new_path.write_bytes(path.read_bytes())
+        run_ffmpeg_encode(frames_dir, fps, output_path)
+
+
+def load_frame_index(floor_id: str, start_ts: float) -> List[Tuple[int, Path]]:
+    frames_dir = Path(config.data_path) / "frames" / floor_id
+    if not frames_dir.exists():
+        return []
+    frames = []
+    for path in frames_dir.glob("*.png"):
+        try:
+            ts = int(path.stem)
+        except ValueError:
+            continue
+        if ts >= start_ts:
+            frames.append((ts, path))
+    return sorted(frames, key=lambda item: item[0])
+
+
+def build_sample_times(start_ts: float, end_ts: float, sampling_seconds: int) -> List[int]:
+    if sampling_seconds <= 0:
+        raise HTTPException(status_code=400, detail="sampling_seconds must be positive")
+    sample_times = []
+    cursor = int(start_ts)
+    end_ts = int(end_ts)
+    while cursor <= end_ts:
+        sample_times.append(cursor)
+        cursor += sampling_seconds
+    return sample_times
+
+
+def generate_single_floor_frames(
+    temp_dir: Path,
+    sample_times: List[int],
+    frames_by_floor: Dict[str, List[Tuple[int, Path]]],
+    floor_id: str,
+) -> None:
+    frames = frames_by_floor.get(floor_id, [])
+    if not frames:
+        return
+    idx = 0
+    for sample_time in sample_times:
+        frame_path = resolve_frame_for_time(frames, sample_time)
+        if frame_path is None:
+            continue
+        target = temp_dir / f"frame_{idx:05d}.png"
+        target.write_bytes(frame_path.read_bytes())
+        idx += 1
+
+
+def generate_stitched_frames(
+    temp_dir: Path,
+    sample_times: List[int],
+    frames_by_floor: Dict[str, List[Tuple[int, Path]]],
+    floor_ids: List[str],
+) -> None:
+    idx = 0
+    for sample_time in sample_times:
+        images = []
+        for floor_id in floor_ids:
+            frames = frames_by_floor.get(floor_id, [])
+            frame_path = resolve_frame_for_time(frames, sample_time)
+            if frame_path is None:
+                continue
+            images.append((floor_id, Image.open(frame_path)))
+        if not images:
+            continue
+        stitched = stitch_images_horizontally(images, config.timelapse_border_px, config.timelapse_label_font_size)
+        target = temp_dir / f"frame_{idx:05d}.png"
+        stitched.save(target)
+        idx += 1
+        for _, image in images:
+            image.close()
+
+
+def resolve_frame_for_time(frames: List[Tuple[int, Path]], sample_time: int) -> Optional[Path]:
+    if not frames:
+        return None
+    timestamps = [frame[0] for frame in frames]
+    index = bisect.bisect_right(timestamps, sample_time) - 1
+    if index < 0:
+        return None
+    return frames[index][1]
+
+
+def stitch_images_horizontally(
+    images: List[Tuple[str, Image.Image]],
+    border_px: int,
+    label_font_size: int,
+) -> Image.Image:
+    font = get_font(label_font_size)
+    widths = []
+    heights = []
+    label_heights = []
+    for floor_id, image in images:
+        widths.append(image.width)
+        heights.append(image.height)
+        label_text = floor_id
+        text_width, text_height = font.getsize(label_text)
+        label_heights.append(text_height)
+    max_height = max(heights)
+    label_height = max(label_heights) if label_heights else 0
+    total_width = sum(widths) + border_px * (len(images) - 1)
+    stitched_height = max_height + border_px + label_height
+    stitched = Image.new("RGBA", (total_width, stitched_height), (0, 0, 0, 255))
+    draw = ImageDraw.Draw(stitched)
+    x_cursor = 0
+    for (floor_id, image), image_height in zip(images, heights):
+        y_offset = label_height + border_px
+        stitched.paste(image, (x_cursor, y_offset))
+        label_text = floor_id
+        text_width, text_height = font.getsize(label_text)
+        text_x = x_cursor + max(0, (image.width - text_width) // 2)
+        draw.text((text_x, 0), label_text, font=font, fill=(255, 255, 255, 255))
+        x_cursor += image.width + border_px
+    return stitched.convert("RGB")
+
+
+def downsample_frames(frame_paths: List[Path], max_frames: int) -> List[Path]:
+    if max_frames <= 0:
+        return []
+    if len(frame_paths) <= max_frames:
+        return frame_paths
+    stride = len(frame_paths) / max_frames
+    return [frame_paths[int(i * stride)] for i in range(max_frames)]
+
+
+def run_ffmpeg_encode(temp_dir: Path, fps: int, output_path: Path) -> None:
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-framerate",
+        str(fps),
+        "-i",
+        str(temp_dir / "frame_%05d.png"),
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        str(output_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise HTTPException(status_code=500, detail=f"ffmpeg failed: {result.stderr.strip()}")
 
 
 def solve_all_floorplans(floorplans: Dict[str, Dict]) -> Tuple[Dict[str, np.ndarray], Dict[str, Dict]]:
