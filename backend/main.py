@@ -772,6 +772,12 @@ def build_floorplan_mask_floodfill(fp: FloorplanV1) -> np.ndarray:
                     visited.add((nx, ny))
                     stack.append((nx, ny))
                     
+    if not np.any(filled):
+        if np.any(interior):
+            filled = interior
+        else:
+            filled = np.ones_like(arr, dtype=bool)
+
     # Resize back up
     full_mask = Image.fromarray(filled).resize((fp.canvas.width, fp.canvas.height), Image.Resampling.NEAREST)
     return np.array(full_mask)
