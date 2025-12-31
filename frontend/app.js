@@ -23,6 +23,10 @@ const state = {
   dragging: null,
   history: { past: [], future: [] },
   spacePressed: false,
+
+  // NEW: Background Image State
+  backgroundImage: null,
+  background: { x: 0, y: 0, scale: 1.0, opacity: 0.5 },
 };
 
 const defaultRender = () => ({
@@ -454,6 +458,19 @@ function render() {
   const worldBottom = (canvas.height - state.view.y) / state.view.scale;
 
   ctx.setTransform(state.view.scale, 0, 0, state.view.scale, state.view.x, state.view.y);
+
+  // --- NEW: Render Background Image ---
+  if (state.backgroundImage) {
+    ctx.save();
+    ctx.globalAlpha = state.background.opacity;
+    // Move to the background's specific coordinates and scale
+    ctx.translate(state.background.x, state.background.y);
+    ctx.scale(state.background.scale, state.background.scale);
+    ctx.drawImage(state.backgroundImage, 0, 0);
+    ctx.restore();
+  }
+  // ------------------------------------
+
   renderGrid([worldLeft, worldTop, worldRight, worldBottom]);
   const fp = currentFloorplan();
   if (fp.render.show_walls) {
@@ -483,6 +500,32 @@ function renderProperties() {
       fp.scale.px_per_meter = parseFloat(val) || fp.scale.px_per_meter;
       render();
     }));
+
+    // --- NEW: Background Controls ---
+    if (state.backgroundImage) {
+      const bgTitle = document.createElement('h3');
+      bgTitle.textContent = 'Tracing Background';
+      bgTitle.style.marginTop = '20px';
+      propertiesPanel.appendChild(bgTitle);
+
+      propertiesPanel.appendChild(renderField('Opacity', state.background.opacity, (val) => {
+        state.background.opacity = parseFloat(val);
+        render();
+      }));
+      propertiesPanel.appendChild(renderField('Scale', state.background.scale, (val) => {
+        state.background.scale = parseFloat(val);
+        render();
+      }));
+      propertiesPanel.appendChild(renderField('X Position', state.background.x, (val) => {
+        state.background.x = parseFloat(val);
+        render();
+      }));
+      propertiesPanel.appendChild(renderField('Y Position', state.background.y, (val) => {
+        state.background.y = parseFloat(val);
+        render();
+      }));
+    }
+    // --------------------------------
     return;
   }
   const item = findById(state.selected.type, state.selected.id);
@@ -982,6 +1025,34 @@ snapToggle.addEventListener('change', () => {
 
 orthoToggle.addEventListener('change', () => {
   state.orthogonalSnap = orthoToggle.checked;
+});
+
+// NEW: Background Upload Handlers
+const bgUploadBtn = document.getElementById('bgUploadBtn');
+const bgUploadInput = document.getElementById('bgUpload');
+
+bgUploadBtn.addEventListener('click', () => {
+  bgUploadInput.click();
+});
+
+bgUploadInput.addEventListener('change', (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  
+  const reader = new FileReader();
+  reader.onload = (event) => {
+    const img = new Image();
+    img.onload = () => {
+      state.backgroundImage = img;
+      // Reset defaults when loading new image
+      state.background = { x: 0, y: 0, scale: 1.0, opacity: 0.5 };
+      renderProperties();
+      render();
+      setStatus('Background image loaded. Adjust settings in panel.');
+    };
+    img.src = event.target.result;
+  };
+  reader.readAsDataURL(file);
 });
 
 initialize();
