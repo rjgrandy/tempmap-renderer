@@ -3,6 +3,13 @@ const ctx = canvas.getContext('2d');
 const propertiesPanel = document.getElementById('properties');
 const statusText = document.getElementById('statusText');
 const loadSelect = document.getElementById('loadSelect');
+const loadBtn = document.getElementById('loadBtn');
+const newBtn = document.getElementById('newBtn');
+const saveBtn = document.getElementById('saveBtn');
+const undoBtn = document.getElementById('undoBtn');
+const redoBtn = document.getElementById('redoBtn');
+const snapToggle = document.getElementById('snapToggle');
+const orthoToggle = document.getElementById('orthoToggle');
 
 const toolButtons = Array.from(document.querySelectorAll('.tool-button'));
 const floorTabs = Array.from(document.querySelectorAll('.tab'));
@@ -121,10 +128,80 @@ function initialize() {
   pushHistory();
   updateToolButtons();
   updateFloorTabs();
+  snapToggle.checked = state.snapToGrid;
+  orthoToggle.checked = state.orthogonalSnap;
   resizeCanvas();
   fetchFloorplanList();
   renderProperties();
   render();
+}
+
+async function fetchFloorplanList() {
+  try {
+    setStatus('Loading floorplan list...');
+    const response = await fetch('/api/floorplans');
+    if (!response.ok) {
+      throw new Error(`Failed to load floorplans (${response.status})`);
+    }
+    const payload = await response.json();
+    const ids = payload.floorplans || [];
+    loadSelect.innerHTML = '';
+    ids.forEach((id) => {
+      const option = document.createElement('option');
+      option.value = id;
+      option.textContent = id;
+      loadSelect.appendChild(option);
+    });
+    if (!ids.includes(state.floorId)) {
+      const fallback = document.createElement('option');
+      fallback.value = state.floorId;
+      fallback.textContent = state.floorId;
+      loadSelect.appendChild(fallback);
+    }
+    loadSelect.value = state.floorId;
+    setStatus('Floorplan list loaded.');
+  } catch (error) {
+    setStatus(error.message || 'Unable to load floorplans.', true);
+  }
+}
+
+async function loadFloorplan(floorId) {
+  try {
+    setStatus(`Loading ${floorId}...`);
+    const response = await fetch(`/api/floorplans/${floorId}`);
+    if (!response.ok) {
+      throw new Error(`Failed to load ${floorId} (${response.status})`);
+    }
+    const payload = await response.json();
+    state.floorId = floorId;
+    setFloorplan(payload);
+    updateFloorTabs();
+    loadSelect.value = floorId;
+    setStatus(`Loaded ${floorId}.`);
+  } catch (error) {
+    setStatus(error.message || `Unable to load ${floorId}.`, true);
+  }
+}
+
+async function saveFloorplan() {
+  try {
+    const fp = currentFloorplan();
+    setStatus(`Saving ${fp.floor_id}...`);
+    const response = await fetch(`/api/floorplans/${fp.floor_id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(fp),
+    });
+    if (!response.ok) {
+      const message = await response.text();
+      throw new Error(message || `Failed to save ${fp.floor_id}`);
+    }
+    await response.json();
+    setStatus(`Saved ${fp.floor_id}.`);
+    fetchFloorplanList();
+  } catch (error) {
+    setStatus(error.message || 'Unable to save floorplan.', true);
+  }
 }
 
 function updateToolButtons() {
@@ -691,6 +768,395 @@ function renderField(labelText, value, onChange, options = null) {
   wrapper.appendChild(input);
   return wrapper;
 }
+
+function setTool(tool) {
+  state.tool = tool;
+  state.drawing = null;
+  updateToolButtons();
+  render();
+}
+
+function commitWall(points) {
+  if (points.length < 2) {
+    state.drawing = null;
+    return;
+  }
+  const fp = currentFloorplan();
+  pushHistory();
+  fp.walls.push({ id: ensureId('wall'), points });
+  state.drawing = null;
+  render();
+}
+
+function commitStairwell(points) {
+  if (points.length < 3) {
+    state.drawing = null;
+    return;
+  }
+  const fp = currentFloorplan();
+  pushHistory();
+  fp.stairwell = { id: ensureId('stairwell'), polygon: points, link_to_floor_id: null, coupling: 0.05 };
+  state.drawing = null;
+  render();
+}
+
+function startDoor(point) {
+  state.drawing = { type: 'door', start: point };
+}
+
+function commitDoor(start, end) {
+  const fp = currentFloorplan();
+  pushHistory();
+  fp.doors.push({
+    id: ensureId('door'),
+    segment: [start, end],
+    entity_id: '',
+    mapping: { open_values: ['on', 'open'], closed_values: ['off', 'closed'], unknown_as: 'closed' },
+    open: false,
+    open_resistance: null,
+    closed_resistance: null,
+  });
+  state.drawing = null;
+  render();
+}
+
+function createSensor(point) {
+  const fp = currentFloorplan();
+  pushHistory();
+  const sensor = {
+    id: ensureId('sensor'),
+    entity: '',
+    pos: point,
+    label: '',
+    weight: 1.0,
+    label_offset_x: 10,
+    label_offset_y: -8,
+    font_size: 12,
+  };
+  fp.sensors.push(sensor);
+  state.selected = { type: 'sensor', id: sensor.id };
+  renderProperties();
+  render();
+}
+
+function createThermostat(point) {
+  const fp = currentFloorplan();
+  pushHistory();
+  const thermo = {
+    id: ensureId('thermostat'),
+    pos: point,
+    temperature_entity: '',
+    setpoint_entity: '',
+    mode_entity: '',
+    device_label: '',
+    label_offset_x: 12,
+    label_offset_y: -8,
+    font_size: 12,
+  };
+  fp.thermostats.push(thermo);
+  state.selected = { type: 'thermostat', id: thermo.id };
+  renderProperties();
+  render();
+}
+
+function applyScaleCalibration(p1, p2) {
+  const fp = currentFloorplan();
+  const distancePx = Math.hypot(p2[0] - p1[0], p2[1] - p1[1]);
+  const input = window.prompt('Enter the distance in meters between the points:', '1');
+  const distanceM = parseFloat(input);
+  if (!distanceM || distanceM <= 0) {
+    setStatus('Scale calibration canceled.', true);
+    state.drawing = null;
+    return;
+  }
+  pushHistory();
+  fp.scale.mode = 'calibrated';
+  fp.scale.calibration = { p1, p2, distance_m: distanceM };
+  fp.scale.px_per_meter = distancePx / distanceM;
+  state.drawing = null;
+  renderProperties();
+  render();
+  setStatus(`Scale set to ${fp.scale.px_per_meter.toFixed(2)} px/m.`);
+}
+
+function beginMoveDrag(hit, startWorld) {
+  const item = findById(hit.type, hit.id);
+  if (!item) return;
+  const dragState = { type: 'move', itemType: hit.type, id: hit.id, start: startWorld };
+  if (hit.type === 'sensor' || hit.type === 'thermostat') {
+    dragState.original = { pos: [...item.pos] };
+  } else if (hit.type === 'door') {
+    dragState.original = { segment: item.segment.map((pt) => [...pt]) };
+  } else if (hit.type === 'wall') {
+    dragState.original = { points: item.points.map((pt) => [...pt]) };
+  } else if (hit.type === 'stairwell') {
+    dragState.original = { polygon: item.polygon.map((pt) => [...pt]) };
+  }
+  state.dragging = dragState;
+}
+
+function updateMoveDrag(world) {
+  if (!state.dragging || state.dragging.type !== 'move') return;
+  const delta = [world[0] - state.dragging.start[0], world[1] - state.dragging.start[1]];
+  const item = findById(state.dragging.itemType, state.dragging.id);
+  if (!item) return;
+  if (state.dragging.itemType === 'sensor' || state.dragging.itemType === 'thermostat') {
+    item.pos = [state.dragging.original.pos[0] + delta[0], state.dragging.original.pos[1] + delta[1]];
+  } else if (state.dragging.itemType === 'door') {
+    item.segment = state.dragging.original.segment.map((pt) => [pt[0] + delta[0], pt[1] + delta[1]]);
+  } else if (state.dragging.itemType === 'wall') {
+    item.points = state.dragging.original.points.map((pt) => [pt[0] + delta[0], pt[1] + delta[1]]);
+  } else if (state.dragging.itemType === 'stairwell') {
+    item.polygon = state.dragging.original.polygon.map((pt) => [pt[0] + delta[0], pt[1] + delta[1]]);
+  }
+  render();
+}
+
+toolButtons.forEach((btn) => {
+  btn.addEventListener('click', () => {
+    setTool(btn.dataset.tool);
+  });
+});
+
+floorTabs.forEach((tab) => {
+  tab.addEventListener('click', () => {
+    state.floorId = tab.dataset.floor;
+    state.selected = null;
+    state.drawing = null;
+    updateFloorTabs();
+    renderProperties();
+    render();
+  });
+});
+
+loadBtn.addEventListener('click', () => {
+  if (!loadSelect.value) return;
+  loadFloorplan(loadSelect.value);
+});
+
+newBtn.addEventListener('click', () => {
+  pushHistory();
+  setFloorplan(createDefaultFloorplan(state.floorId));
+  setStatus(`Created new ${state.floorId}.`);
+});
+
+saveBtn.addEventListener('click', () => {
+  saveFloorplan();
+});
+
+undoBtn.addEventListener('click', () => {
+  undo();
+});
+
+redoBtn.addEventListener('click', () => {
+  redo();
+});
+
+snapToggle.addEventListener('change', (event) => {
+  state.snapToGrid = event.target.checked;
+  render();
+});
+
+orthoToggle.addEventListener('change', (event) => {
+  state.orthogonalSnap = event.target.checked;
+});
+
+canvas.addEventListener('mousedown', (event) => {
+  const rect = canvas.getBoundingClientRect();
+  const world = screenToWorld(event.clientX - rect.left, event.clientY - rect.top);
+  const snapped = snapPoint(world, state.drawing?.points?.slice(-1)[0] || state.drawing?.start);
+
+  if (state.spacePressed || event.button === 1) {
+    state.dragging = {
+      type: 'pan',
+      start: [event.clientX, event.clientY],
+      origin: { x: state.view.x, y: state.view.y },
+    };
+    return;
+  }
+
+  if (event.button !== 0) return;
+
+  if (state.tool === 'select') {
+    const hit = hitTest(world);
+    if (hit) {
+      state.selected = hit;
+      renderProperties();
+      beginMoveDrag(hit, world);
+    } else {
+      state.selected = null;
+      renderProperties();
+    }
+    render();
+    return;
+  }
+
+  if (state.tool === 'erase') {
+    const hit = hitTest(world);
+    if (hit) {
+      state.selected = hit;
+      removeSelected();
+      renderProperties();
+    }
+    return;
+  }
+
+  if (state.tool === 'wall') {
+    if (!state.drawing || state.drawing.type !== 'wall') {
+      state.drawing = { type: 'wall', points: [snapped] };
+    } else {
+      state.drawing.points.push(snapped);
+    }
+    render();
+    return;
+  }
+
+  if (state.tool === 'stairwell') {
+    if (!state.drawing || state.drawing.type !== 'stairwell') {
+      state.drawing = { type: 'stairwell', points: [snapped] };
+    } else {
+      state.drawing.points.push(snapped);
+    }
+    render();
+    return;
+  }
+
+  if (state.tool === 'door') {
+    startDoor(snapped);
+    render();
+    return;
+  }
+
+  if (state.tool === 'sensor') {
+    createSensor(snapped);
+    return;
+  }
+
+  if (state.tool === 'thermostat') {
+    createThermostat(snapped);
+    return;
+  }
+
+  if (state.tool === 'scale') {
+    if (!state.drawing || state.drawing.type !== 'scale') {
+      state.drawing = { type: 'scale', start: snapped };
+      setStatus('Click the second point for scale calibration.');
+    } else {
+      applyScaleCalibration(state.drawing.start, snapped);
+    }
+    return;
+  }
+});
+
+canvas.addEventListener('mousemove', (event) => {
+  const rect = canvas.getBoundingClientRect();
+  const world = screenToWorld(event.clientX - rect.left, event.clientY - rect.top);
+
+  if (state.dragging?.type === 'pan') {
+    state.view.x = state.dragging.origin.x + (event.clientX - state.dragging.start[0]);
+    state.view.y = state.dragging.origin.y + (event.clientY - state.dragging.start[1]);
+    render();
+    return;
+  }
+
+  if (state.dragging?.type === 'move') {
+    updateMoveDrag(world);
+    return;
+  }
+
+  if (state.drawing?.type === 'wall' || state.drawing?.type === 'stairwell') {
+    const reference = state.drawing.points[state.drawing.points.length - 1];
+    state.drawing.previewPoint = snapPoint(world, reference);
+    render();
+  } else if (state.drawing?.type === 'door') {
+    state.drawing.previewPoint = snapPoint(world, state.drawing.start);
+    render();
+  } else if (state.drawing?.type === 'scale') {
+    state.drawing.previewPoint = world;
+    render();
+  }
+});
+
+canvas.addEventListener('mouseup', (event) => {
+  const rect = canvas.getBoundingClientRect();
+  const world = screenToWorld(event.clientX - rect.left, event.clientY - rect.top);
+  if (state.dragging?.type === 'pan') {
+    state.dragging = null;
+    return;
+  }
+  if (state.dragging?.type === 'move') {
+    pushHistory();
+    state.dragging = null;
+    renderProperties();
+    return;
+  }
+  if (state.tool === 'door' && state.drawing?.type === 'door' && state.drawing.start) {
+    const snapped = snapPoint(world, state.drawing.start);
+    commitDoor(state.drawing.start, snapped);
+  }
+});
+
+canvas.addEventListener('mouseleave', () => {
+  if (state.dragging?.type === 'pan') {
+    state.dragging = null;
+  }
+  if (state.dragging?.type === 'move') {
+    pushHistory();
+    state.dragging = null;
+  }
+});
+
+canvas.addEventListener('dblclick', () => {
+  if (state.drawing?.type === 'wall') {
+    commitWall(state.drawing.points);
+  } else if (state.drawing?.type === 'stairwell') {
+    commitStairwell(state.drawing.points);
+  }
+});
+
+canvas.addEventListener('wheel', (event) => {
+  event.preventDefault();
+  const rect = canvas.getBoundingClientRect();
+  const mouse = [event.clientX - rect.left, event.clientY - rect.top];
+  const world = screenToWorld(mouse[0], mouse[1]);
+  const zoomFactor = event.deltaY < 0 ? 1.1 : 0.9;
+  const newScale = Math.min(4, Math.max(0.25, state.view.scale * zoomFactor));
+  state.view.x = mouse[0] - world[0] * newScale;
+  state.view.y = mouse[1] - world[1] * newScale;
+  state.view.scale = newScale;
+  render();
+}, { passive: false });
+
+window.addEventListener('resize', resizeCanvas);
+
+window.addEventListener('keydown', (event) => {
+  if (event.code === 'Space') {
+    state.spacePressed = true;
+  }
+  if (event.key === 'Escape') {
+    state.drawing = null;
+    render();
+  }
+  if ((event.key === 'Delete' || event.key === 'Backspace') && state.selected) {
+    removeSelected();
+  }
+  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'z') {
+    if (event.shiftKey) {
+      redo();
+    } else {
+      undo();
+    }
+  }
+  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'y') {
+    redo();
+  }
+});
+
+window.addEventListener('keyup', (event) => {
+  if (event.code === 'Space') {
+    state.spacePressed = false;
+  }
+});
 
 // Background Upload Handlers
 const bgUploadBtn = document.getElementById('bgUploadBtn');
