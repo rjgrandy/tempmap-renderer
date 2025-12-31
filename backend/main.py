@@ -707,16 +707,23 @@ def build_floorplan_mask_floodfill(fp: FloorplanV1) -> np.ndarray:
     # Identify exterior space (outside the walls) so we do not open doors to the outside.
     outside = np.zeros_like(arr, dtype=bool)
     h, w = arr.shape
+    wall_block = arr > 0
+    padded = np.pad(wall_block, 1, mode="constant", constant_values=False)
+    wall_block = (
+        padded[0:-2, 0:-2] | padded[0:-2, 1:-1] | padded[0:-2, 2:] |
+        padded[1:-1, 0:-2] | padded[1:-1, 1:-1] | padded[1:-1, 2:] |
+        padded[2:, 0:-2] | padded[2:, 1:-1] | padded[2:, 2:]
+    )
     stack = []
     for x in range(w):
-        if arr[0, x] == 0:
+        if not wall_block[0, x]:
             stack.append((x, 0))
-        if arr[h - 1, x] == 0:
+        if not wall_block[h - 1, x]:
             stack.append((x, h - 1))
     for y in range(h):
-        if arr[y, 0] == 0:
+        if not wall_block[y, 0]:
             stack.append((0, y))
-        if arr[y, w - 1] == 0:
+        if not wall_block[y, w - 1]:
             stack.append((w - 1, y))
     while stack:
         cx, cy = stack.pop()
@@ -725,7 +732,7 @@ def build_floorplan_mask_floodfill(fp: FloorplanV1) -> np.ndarray:
         outside[cy, cx] = True
         for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
             nx, ny = cx + dx, cy + dy
-            if 0 <= nx < w and 0 <= ny < h and arr[ny, nx] == 0 and not outside[ny, nx]:
+            if 0 <= nx < w and 0 <= ny < h and not wall_block[ny, nx] and not outside[ny, nx]:
                 stack.append((nx, ny))
 
     # 2b. Erase open doors so flood fill can pass through (unless they open to outside)
