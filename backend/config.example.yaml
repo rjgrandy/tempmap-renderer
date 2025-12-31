@@ -17,3 +17,16 @@ render:
   default_legend:
     min_f: 60
     max_f: 80
+
+timelapse:
+  frame_retention_hours: 48
+  window_hours: 48
+  sampling_seconds: 120
+  target_duration_seconds: 60
+  fps: 10
+  output_path: /data/timelapses
+  rolling_enabled: true
+  rolling_interval_seconds: 900
+  stitch_multi_floor: true
+  border_px: 12
+  label_font_size: 18
