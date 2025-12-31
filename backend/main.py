@@ -704,7 +704,7 @@ def build_floorplan_mask_floodfill(fp: FloorplanV1) -> np.ndarray:
     arr = np.array(mask)
     # Walls are 255, empty is 0. We want to fill 0s starting from sensors.
 
-    # Identify exterior space (outside the walls) so we do not open doors to the outside.
+    # Identify exterior space (outside the walls) so we can clamp the final mask to the interior.
     outside = np.zeros_like(arr, dtype=bool)
     h, w = arr.shape
     wall_block = arr > 0
@@ -734,30 +734,16 @@ def build_floorplan_mask_floodfill(fp: FloorplanV1) -> np.ndarray:
             nx, ny = cx + dx, cy + dy
             if 0 <= nx < w and 0 <= ny < h and not wall_block[ny, nx] and not outside[ny, nx]:
                 stack.append((nx, ny))
+    interior = ~outside
 
-    # 2b. Erase open doors so flood fill can pass through (unless they open to outside)
+    # 2b. Erase open doors so flood fill can pass through (interior is enforced later)
     for door in fp.doors:
         if not is_door_open(fp, door):
             continue
-        ax, ay = door.segment[0][0] / 4, door.segment[0][1] / 4
-        bx, by = door.segment[1][0] / 4, door.segment[1][1] / 4
-        dx, dy = bx - ax, by - ay
-        length = (dx * dx + dy * dy) ** 0.5
-        if length == 0:
-            continue
-        nx, ny = -dy / length, dx / length
-        mx, my = (ax + bx) / 2, (ay + by) / 2
-        offset = 2.0
-        side_a = (int(round(mx + nx * offset)), int(round(my + ny * offset)))
-        side_b = (int(round(mx - nx * offset)), int(round(my - ny * offset)))
-        def is_outside(pt):
-            x, y = pt
-            if 0 <= x < w and 0 <= y < h:
-                return outside[y, x]
-            return True
-        if is_outside(side_a) or is_outside(side_b):
-            continue
-        pts = [(ax, ay), (bx, by)]
+        pts = [
+            (door.segment[0][0] / 4, door.segment[0][1] / 4),
+            (door.segment[1][0] / 4, door.segment[1][1] / 4),
+        ]
         draw.line(pts, fill=0, width=3)
 
     arr = np.array(mask)
@@ -772,8 +758,8 @@ def build_floorplan_mask_floodfill(fp: FloorplanV1) -> np.ndarray:
         
     # Flood Fill
     filled = np.zeros_like(arr, dtype=bool)
-    stack = seeds
-    visited = set(seeds)
+    stack = [seed for seed in seeds if interior[seed[1], seed[0]]]
+    visited = set(stack)
     
     while stack:
         cx, cy = stack.pop()
@@ -782,7 +768,7 @@ def build_floorplan_mask_floodfill(fp: FloorplanV1) -> np.ndarray:
         for dx, dy in [(-1,0), (1,0), (0,-1), (0,1)]:
             nx, ny = cx + dx, cy + dy
             if 0 <= nx < w and 0 <= ny < h:
-                if not visited.__contains__((nx, ny)) and arr[ny, nx] == 0:
+                if not visited.__contains__((nx, ny)) and arr[ny, nx] == 0 and interior[ny, nx]:
                     visited.add((nx, ny))
                     stack.append((nx, ny))
                     
