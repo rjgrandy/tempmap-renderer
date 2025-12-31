@@ -699,6 +699,13 @@ def build_floorplan_mask_floodfill(fp: FloorplanV1) -> np.ndarray:
     for wall in fp.walls:
         pts = [(p[0]/4, p[1]/4) for p in wall.points]
         draw.line(pts, fill=255, width=2)
+
+    # 1b. Erase open doors so flood fill can pass through
+    for door in fp.doors:
+        if not is_door_open(fp, door):
+            continue
+        pts = [(door.segment[0][0]/4, door.segment[0][1]/4), (door.segment[1][0]/4, door.segment[1][1]/4)]
+        draw.line(pts, fill=0, width=3)
     
     # 2. Convert to numpy
     arr = np.array(mask)
