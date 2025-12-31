@@ -207,22 +207,24 @@ function pointInPolygon(point, polygon) {
 function hitTest(point) {
   const fp = currentFloorplan();
   const threshold = 10 / state.view.scale;
-  for (const sensor of fp.sensors) {
+  
+  // Robust checks: ensure arrays exist
+  for (const sensor of (fp.sensors || [])) {
     if (Math.hypot(point[0] - sensor.pos[0], point[1] - sensor.pos[1]) <= threshold) {
       return { type: 'sensor', id: sensor.id };
     }
   }
-  for (const thermo of fp.thermostats) {
+  for (const thermo of (fp.thermostats || [])) {
     if (Math.hypot(point[0] - thermo.pos[0], point[1] - thermo.pos[1]) <= threshold) {
       return { type: 'thermostat', id: thermo.id };
     }
   }
-  for (const door of fp.doors) {
+  for (const door of (fp.doors || [])) {
     if (distanceToSegment(point, door.segment[0], door.segment[1]) <= threshold) {
       return { type: 'door', id: door.id };
     }
   }
-  for (const wall of fp.walls) {
+  for (const wall of (fp.walls || [])) {
     for (let i = 0; i < wall.points.length - 1; i += 1) {
       if (distanceToSegment(point, wall.points[i], wall.points[i + 1]) <= threshold) {
         return { type: 'wall', id: wall.id };
@@ -238,16 +240,16 @@ function hitTest(point) {
 function findById(type, id) {
   const fp = currentFloorplan();
   if (type === 'wall') {
-    return fp.walls.find((wall) => wall.id === id);
+    return (fp.walls || []).find((wall) => wall.id === id);
   }
   if (type === 'door') {
-    return fp.doors.find((door) => door.id === id);
+    return (fp.doors || []).find((door) => door.id === id);
   }
   if (type === 'sensor') {
-    return fp.sensors.find((sensor) => sensor.id === id);
+    return (fp.sensors || []).find((sensor) => sensor.id === id);
   }
   if (type === 'thermostat') {
-    return fp.thermostats.find((thermo) => thermo.id === id);
+    return (fp.thermostats || []).find((thermo) => thermo.id === id);
   }
   if (type === 'stairwell') {
     return fp.stairwell;
@@ -263,13 +265,13 @@ function removeSelected() {
   pushHistory();
   const { type, id } = state.selected;
   if (type === 'wall') {
-    fp.walls = fp.walls.filter((wall) => wall.id !== id);
+    fp.walls = (fp.walls || []).filter((wall) => wall.id !== id);
   } else if (type === 'door') {
-    fp.doors = fp.doors.filter((door) => door.id !== id);
+    fp.doors = (fp.doors || []).filter((door) => door.id !== id);
   } else if (type === 'sensor') {
-    fp.sensors = fp.sensors.filter((sensor) => sensor.id !== id);
+    fp.sensors = (fp.sensors || []).filter((sensor) => sensor.id !== id);
   } else if (type === 'thermostat') {
-    fp.thermostats = fp.thermostats.filter((thermo) => thermo.id !== id);
+    fp.thermostats = (fp.thermostats || []).filter((thermo) => thermo.id !== id);
   } else if (type === 'stairwell') {
     fp.stairwell = null;
   }
@@ -307,7 +309,8 @@ function renderGrid(worldBounds) {
 function renderWalls(fp) {
   ctx.strokeStyle = '#f0f0f0';
   ctx.lineWidth = 4 / state.view.scale;
-  fp.walls.forEach((wall) => {
+  // Safety Check: (fp.walls || [])
+  (fp.walls || []).forEach((wall) => {
     if (wall.points.length < 2) return;
     ctx.beginPath();
     wall.points.forEach((pt, idx) => {
@@ -324,7 +327,8 @@ function renderWalls(fp) {
 function renderDoors(fp) {
   ctx.strokeStyle = '#4ea1ff';
   ctx.lineWidth = 5 / state.view.scale;
-  fp.doors.forEach((door) => {
+  // Safety Check: (fp.doors || [])
+  (fp.doors || []).forEach((door) => {
     ctx.beginPath();
     ctx.moveTo(door.segment[0][0], door.segment[0][1]);
     ctx.lineTo(door.segment[1][0], door.segment[1][1]);
@@ -335,7 +339,8 @@ function renderDoors(fp) {
 function renderSensors(fp) {
   ctx.fillStyle = '#ffffff';
   ctx.font = `${12 / state.view.scale}px sans-serif`;
-  fp.sensors.forEach((sensor) => {
+  // Safety Check
+  (fp.sensors || []).forEach((sensor) => {
     ctx.beginPath();
     ctx.arc(sensor.pos[0], sensor.pos[1], 6 / state.view.scale, 0, Math.PI * 2);
     ctx.fill();
@@ -350,7 +355,8 @@ function renderThermostats(fp) {
   ctx.strokeStyle = '#f5c542';
   ctx.lineWidth = 2 / state.view.scale;
   ctx.font = `${12 / state.view.scale}px sans-serif`;
-  fp.thermostats.forEach((thermo) => {
+  // Safety Check
+  (fp.thermostats || []).forEach((thermo) => {
     ctx.strokeRect(thermo.pos[0] - 7 / state.view.scale, thermo.pos[1] - 7 / state.view.scale, 14 / state.view.scale, 14 / state.view.scale);
     if (fp.render.show_labels) {
       const label = thermo.device_label || 'Thermostat';
@@ -473,6 +479,8 @@ function render() {
 
   renderGrid([worldLeft, worldTop, worldRight, worldBottom]);
   const fp = currentFloorplan();
+  
+  // Render steps with safety inside the functions
   if (fp.render.show_walls) {
     renderWalls(fp);
   }
@@ -657,23 +665,39 @@ function renderField(labelText, value, onChange, options = null) {
   return wrapper;
 }
 
+// ROBUST FETCH: Handles missing floorplan data gracefully
 async function fetchFloorplanList() {
-  const response = await fetch('/api/floorplans');
-  const data = await response.json();
-  const floors = ['floor1', 'floor2'];
-  data.floorplans.forEach((id) => {
-    if (!floors.includes(id)) {
-      floors.push(id);
+  try {
+    const response = await fetch('/api/floorplans');
+    if (!response.ok) {
+       console.error("API Error:", response.status);
+       return;
     }
-  });
-  loadSelect.innerHTML = '';
-  floors.forEach((floorId) => {
-    const option = document.createElement('option');
-    option.value = floorId;
-    option.textContent = floorId;
-    loadSelect.appendChild(option);
-  });
-  loadSelect.value = state.floorId;
+    const data = await response.json();
+    
+    // Safety check: ensure floorplans array exists
+    if (!data.floorplans) {
+       console.warn("No floorplans returned from API");
+       return;
+    }
+
+    const floors = ['floor1', 'floor2'];
+    data.floorplans.forEach((id) => {
+      if (!floors.includes(id)) {
+        floors.push(id);
+      }
+    });
+    loadSelect.innerHTML = '';
+    floors.forEach((floorId) => {
+      const option = document.createElement('option');
+      option.value = floorId;
+      option.textContent = floorId;
+      loadSelect.appendChild(option);
+    });
+    loadSelect.value = state.floorId;
+  } catch (e) {
+    console.error("Failed to fetch floorplans", e);
+  }
 }
 
 async function loadFloorplan(floorId) {
@@ -738,6 +762,7 @@ function startDrawing(point) {
         return;
       }
       pushHistory();
+      if (!fp.doors) fp.doors = []; // Init if missing
       fp.doors.push({
         id: ensureId('door'),
         segment: [state.drawing.start, point],
@@ -758,6 +783,7 @@ function finishDrawing() {
   if (!state.drawing) return;
   if (state.drawing.type === 'wall' && state.drawing.points.length > 1) {
     pushHistory();
+    if (!fp.walls) fp.walls = []; // Init if missing
     fp.walls.push({ id: ensureId('wall'), points: state.drawing.points });
   }
   if (state.drawing.type === 'stairwell' && state.drawing.points.length > 2) {
@@ -775,7 +801,7 @@ function finishDrawing() {
 
 function findNearestWallDistance(fp, pointA, pointB) {
   let min = Infinity;
-  fp.walls.forEach((wall) => {
+  (fp.walls || []).forEach((wall) => {
     for (let i = 0; i < wall.points.length - 1; i += 1) {
       const d1 = distanceToSegment(pointA, wall.points[i], wall.points[i + 1]);
       const d2 = distanceToSegment(pointB, wall.points[i], wall.points[i + 1]);
@@ -793,7 +819,9 @@ function handleCanvasClick(event) {
 
   if (state.tool === 'sensor') {
     pushHistory();
-    currentFloorplan().sensors.push({
+    const fp = currentFloorplan();
+    if (!fp.sensors) fp.sensors = [];
+    fp.sensors.push({
       id: ensureId('sensor'),
       entity: '',
       pos: point,
@@ -805,7 +833,9 @@ function handleCanvasClick(event) {
   }
   if (state.tool === 'thermostat') {
     pushHistory();
-    currentFloorplan().thermostats.push({
+    const fp = currentFloorplan();
+    if (!fp.thermostats) fp.thermostats = [];
+    fp.thermostats.push({
       id: ensureId('thermo'),
       pos: point,
       temperature_entity: '',
