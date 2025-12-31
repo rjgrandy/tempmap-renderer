@@ -84,6 +84,8 @@ class Thermostat(BaseModel):
     pos: Point
     temperature_entity: str
     setpoint_entity: str
+    setpoint_low_entity: Optional[str] = None
+    setpoint_high_entity: Optional[str] = None
     mode_entity: Optional[str] = None
     device_label: str = ""
     # Customization
@@ -125,6 +127,19 @@ class RenderParams(BaseModel):
     show_labels: bool = True
     show_legend: bool = True
     show_timestamp: bool = True
+    show_outside_temp: bool = True
+    outside_temp_label: str = "Outside"
+    outside_temp_entity: Optional[str] = None
+    outside_temp_f: Optional[float] = None
+
+
+class RoomLabel(BaseModel):
+    id: str
+    pos: Point
+    label: str = ""
+    font_size: int = 16
+    label_offset_x: int = 0
+    label_offset_y: int = 0
 
 
 class FloorplanV1(BaseModel):
@@ -136,6 +151,7 @@ class FloorplanV1(BaseModel):
     doors: List[Door] = Field(default_factory=list)
     sensors: List[Sensor] = Field(default_factory=list)
     thermostats: List[Thermostat] = Field(default_factory=list)
+    room_labels: List[RoomLabel] = Field(default_factory=list)
     stairwell: Optional[Stairwell] = None
     solver: SolverParams = Field(default_factory=SolverParams)
     render: RenderParams = Field(default_factory=RenderParams)
@@ -673,6 +689,7 @@ def render_floorplan_image(floor_id: str, payload: Dict, grid: np.ndarray, metad
     if fp.render.show_walls: draw_walls(draw, fp)
     draw_sensors(draw, fp)
     draw_thermostats(draw, fp)
+    draw_room_labels(draw, fp)
     if fp.render.auto_crop:
         crop_box = compute_floorplan_crop(fp, canvas.size, fp.render.crop_padding)
         if crop_box: 
@@ -685,6 +702,8 @@ def render_floorplan_image(floor_id: str, payload: Dict, grid: np.ndarray, metad
         canvas = add_exterior_margin(canvas, fp.render.exterior_margin, fp.render.show_timestamp, fp.render.show_legend)
         draw = ImageDraw.Draw(canvas)
     
+    if fp.render.show_outside_temp:
+        draw_outside_temperature(draw, fp, canvas.size)
     if fp.render.show_legend: draw_legend(draw, min_f, max_f, canvas.size, fp.render.exterior_margin)
     if fp.render.show_timestamp: draw_timestamp(draw, fp.render.exterior_margin)
     return canvas.convert("RGB")
@@ -858,18 +877,41 @@ def draw_thermostats(draw: ImageDraw.ImageDraw, fp: FloorplanV1) -> None:
         x, y = point_xy(thermo.pos)
         draw.rectangle((x - 8, y - 8, x + 8, y + 8), outline=(255, 200, 50), width=2)
         if fp.render.show_labels:
-            temp = read_entity_state(thermo.temperature_entity)
-            setpoint = read_entity_state(thermo.setpoint_entity)
-            temp_line = f"{temp} / {setpoint}"
-            
             name_line = thermo.device_label or "Thermostat"
-            if thermo.mode_entity:
-                mode = read_entity_state(thermo.mode_entity)
-                temp_line = f"{temp_line} ({mode})"
+            temp_val = format_entity_temperature(thermo.temperature_entity)
+            setpoint_val = format_entity_temperature(thermo.setpoint_entity)
+            setpoint_low = format_entity_temperature(thermo.setpoint_low_entity)
+            setpoint_high = format_entity_temperature(thermo.setpoint_high_entity)
+            mode = read_entity_state(thermo.mode_entity) if thermo.mode_entity else ""
+            mode_lower = mode.lower() if mode else ""
+
+            setpoint_line = ""
+            if mode_lower in {"heat_cool", "auto"}:
+                if setpoint_low and setpoint_high:
+                    setpoint_line = f"{setpoint_low} / {setpoint_high}"
+                else:
+                    setpoint_line = setpoint_low or setpoint_high or setpoint_val
+            elif mode_lower == "heat":
+                setpoint_line = setpoint_val or setpoint_low
+            elif mode_lower == "cool":
+                setpoint_line = setpoint_val or setpoint_high
+            else:
+                setpoint_line = setpoint_val or setpoint_low or setpoint_high
+
+            detail_parts = []
+            if temp_val:
+                detail_parts.append(temp_val)
+            if setpoint_line:
+                detail_parts.append(setpoint_line)
+            temp_line = " / ".join(detail_parts)
+            if mode:
+                temp_line = f"{temp_line} ({mode})" if temp_line else mode
             
             font = get_font(thermo.font_size)
-            
-            lines = [name_line, temp_line]
+
+            lines = [name_line]
+            if temp_line:
+                lines.append(temp_line)
             
             off_x = thermo.label_offset_x
             current_y = y + thermo.label_offset_y
@@ -877,6 +919,29 @@ def draw_thermostats(draw: ImageDraw.ImageDraw, fp: FloorplanV1) -> None:
             for line in lines:
                 draw.text((x + off_x, current_y), line, fill=(255, 200, 50), font=font)
                 current_y += (thermo.font_size + 2)
+
+def draw_room_labels(draw: ImageDraw.ImageDraw, fp: FloorplanV1) -> None:
+    for label in fp.room_labels:
+        if not label.label:
+            continue
+        x, y = point_xy(label.pos)
+        font = get_font(label.font_size)
+        draw.text((x + label.label_offset_x, y + label.label_offset_y), label.label, fill=(255, 255, 255), font=font)
+
+def draw_outside_temperature(draw: ImageDraw.ImageDraw, fp: FloorplanV1, size: Tuple[int, int]) -> None:
+    if fp.render.outside_temp_entity:
+        outside_temp = format_entity_temperature(fp.render.outside_temp_entity)
+    elif fp.render.outside_temp_f is not None:
+        outside_temp = f"{fp.render.outside_temp_f:.1f}F"
+    else:
+        outside_temp = ""
+    if not outside_temp:
+        return
+    font = ImageFont.load_default()
+    label = fp.render.outside_temp_label.strip() or "Outside"
+    text = f"{label}: {outside_temp}"
+    margin = fp.render.exterior_margin
+    draw.text((margin, margin + 16), text, fill=(255, 255, 255), font=font)
 
 def get_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     """Tries to load a scalable font. Falls back to default if unavailable."""
