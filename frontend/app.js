@@ -580,7 +580,17 @@ function renderProperties() {
     title.textContent = 'Floorplan Settings';
     propertiesPanel.appendChild(title);
     propertiesPanel.appendChild(renderField('Floor ID', fp.floor_id, () => {}));
-    propertiesPanel.appendChild(renderField('Canvas', `${fp.canvas.width} x ${fp.canvas.height}`, () => {}));
+    // NEW: Editable Canvas Dimensions
+    propertiesPanel.appendChild(renderField('Canvas Width', fp.canvas.width, (val) => {
+      pushHistory();
+      fp.canvas.width = parseInt(val) || 1600;
+      // Note: Changing canvas size changes the grid density relative to geometry
+      // but preserves the geometry coordinates.
+    }));
+    propertiesPanel.appendChild(renderField('Canvas Height', fp.canvas.height, (val) => {
+      pushHistory();
+      fp.canvas.height = parseInt(val) || 1000;
+    }));
     propertiesPanel.appendChild(renderField('Scale (px/m)', fp.scale.px_per_meter.toFixed(2), (val) => {
       pushHistory();
       fp.scale.px_per_meter = parseFloat(val) || fp.scale.px_per_meter;
