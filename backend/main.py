@@ -699,10 +699,68 @@ def build_floorplan_mask_floodfill(fp: FloorplanV1) -> np.ndarray:
     for wall in fp.walls:
         pts = [(p[0]/4, p[1]/4) for p in wall.points]
         draw.line(pts, fill=255, width=2)
-    
+
     # 2. Convert to numpy
     arr = np.array(mask)
     # Walls are 255, empty is 0. We want to fill 0s starting from sensors.
+
+    # Identify exterior space (outside the walls) so we do not open doors to the outside.
+    outside = np.zeros_like(arr, dtype=bool)
+    h, w = arr.shape
+    wall_block = arr > 0
+    padded = np.pad(wall_block, 1, mode="constant", constant_values=False)
+    wall_block = (
+        padded[0:-2, 0:-2] | padded[0:-2, 1:-1] | padded[0:-2, 2:] |
+        padded[1:-1, 0:-2] | padded[1:-1, 1:-1] | padded[1:-1, 2:] |
+        padded[2:, 0:-2] | padded[2:, 1:-1] | padded[2:, 2:]
+    )
+    stack = []
+    for x in range(w):
+        if not wall_block[0, x]:
+            stack.append((x, 0))
+        if not wall_block[h - 1, x]:
+            stack.append((x, h - 1))
+    for y in range(h):
+        if not wall_block[y, 0]:
+            stack.append((0, y))
+        if not wall_block[y, w - 1]:
+            stack.append((w - 1, y))
+    while stack:
+        cx, cy = stack.pop()
+        if outside[cy, cx]:
+            continue
+        outside[cy, cx] = True
+        for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            nx, ny = cx + dx, cy + dy
+            if 0 <= nx < w and 0 <= ny < h and not wall_block[ny, nx] and not outside[ny, nx]:
+                stack.append((nx, ny))
+
+    # 2b. Erase open doors so flood fill can pass through (unless they open to outside)
+    for door in fp.doors:
+        if not is_door_open(fp, door):
+            continue
+        ax, ay = door.segment[0][0] / 4, door.segment[0][1] / 4
+        bx, by = door.segment[1][0] / 4, door.segment[1][1] / 4
+        dx, dy = bx - ax, by - ay
+        length = (dx * dx + dy * dy) ** 0.5
+        if length == 0:
+            continue
+        nx, ny = -dy / length, dx / length
+        mx, my = (ax + bx) / 2, (ay + by) / 2
+        offset = 2.0
+        side_a = (int(round(mx + nx * offset)), int(round(my + ny * offset)))
+        side_b = (int(round(mx - nx * offset)), int(round(my - ny * offset)))
+        def is_outside(pt):
+            x, y = pt
+            if 0 <= x < w and 0 <= y < h:
+                return outside[y, x]
+            return True
+        if is_outside(side_a) or is_outside(side_b):
+            continue
+        pts = [(ax, ay), (bx, by)]
+        draw.line(pts, fill=0, width=3)
+
+    arr = np.array(mask)
     
     seeds = []
     for s in fp.sensors:
