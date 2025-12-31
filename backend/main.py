@@ -696,27 +696,31 @@ def build_floorplan_mask_floodfill(fp: FloorplanV1) -> np.ndarray:
     mask_img = Image.new("L", (w, h), 0)
     draw = ImageDraw.Draw(mask_img)
 
-    # 2. Draw Barriers (Walls + Closed Doors)
-    # We DRAW walls as white (255) to act as boundaries.
+    # 2. Draw ALL Walls as Barriers (White/255)
     for wall in fp.walls:
         pts = [(p[0]/4, p[1]/4) for p in wall.points]
         draw.line(pts, fill=255, width=2)
     
+    # 3. Handle Doors
     for door in fp.doors:
-        # If door is CLOSED, it is a barrier (draw white).
-        # If OPEN, we leave it empty so flood fill passes through.
-        if not is_door_open(fp, door):
-            pts = [
-                (door.segment[0][0] / 4, door.segment[0][1] / 4),
-                (door.segment[1][0] / 4, door.segment[1][1] / 4),
-            ]
+        # Scale door coordinates
+        pts = [
+            (door.segment[0][0] / 4, door.segment[0][1] / 4),
+            (door.segment[1][0] / 4, door.segment[1][1] / 4),
+        ]
+        
+        if is_door_open(fp, door):
+            # FIX: If door is OPEN, draw BLACK (0) to cut a hole in the wall
+            # This allows the flood fill to pass through the doorway.
+            draw.line(pts, fill=0, width=3)
+        else:
+            # If door is CLOSED, draw WHITE (255) to seal it
             draw.line(pts, fill=255, width=2)
 
-    # 3. Flood Fill from Sensors (The "Inside")
-    arr = np.array(mask_img) # Barriers are 255, Empty is 0
+    # 4. Flood Fill from Sensors
+    arr = np.array(mask_img) # Barriers=255, Empty=0
     filled = np.zeros_like(arr, dtype=bool)
     
-    # Collect seeds (sensors + thermostats)
     seeds = []
     for s in fp.sensors:
         seeds.append((int(s.pos[0]/4), int(s.pos[1]/4)))
@@ -724,12 +728,10 @@ def build_floorplan_mask_floodfill(fp: FloorplanV1) -> np.ndarray:
         seeds.append((int(t.pos[0]/4), int(t.pos[1]/4)))
 
     stack = []
-    # Only accept seeds that are within bounds and not ON a wall
     for (sx, sy) in seeds:
         if 0 <= sx < w and 0 <= sy < h and arr[sy, sx] == 0:
             stack.append((sx, sy))
             
-    # Standard Stack-based Flood Fill
     visited = set(stack)
     while stack:
         cx, cy = stack.pop()
@@ -738,16 +740,16 @@ def build_floorplan_mask_floodfill(fp: FloorplanV1) -> np.ndarray:
         for dx, dy in [(-1,0), (1,0), (0,-1), (0,1)]:
             nx, ny = cx + dx, cy + dy
             if 0 <= nx < w and 0 <= ny < h:
-                # If not visited AND not a barrier (arr[ny,nx] == 0)
+                # Pass if not visited AND not a barrier (0)
                 if (nx, ny) not in visited and arr[ny, nx] == 0:
                     visited.add((nx, ny))
                     stack.append((nx, ny))
 
-    # 4. Fallback: If no sensors found (or all in walls), fill everything to prevent pitch black.
+    # 5. Fallback: If map is empty (no valid sensors), show everything
     if not np.any(filled):
          filled = np.ones_like(arr, dtype=bool)
 
-    # 5. Resize to full resolution
+    # 6. Resize to full resolution
     full_mask = Image.fromarray(filled).resize((fp.canvas.width, fp.canvas.height), Image.Resampling.NEAREST)
     return np.array(full_mask)
 
