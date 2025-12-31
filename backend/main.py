@@ -73,6 +73,10 @@ class Sensor(BaseModel):
     pos: Point
     label: str = ""
     weight: float = 1.0
+    # NEW: Label customization
+    label_offset_x: int = 10
+    label_offset_y: int = -8
+    font_size: int = 12
 
 
 class Thermostat(BaseModel):
@@ -82,23 +86,24 @@ class Thermostat(BaseModel):
     setpoint_entity: str
     mode_entity: Optional[str] = None
     device_label: str = ""
+    # NEW: Label customization
+    label_offset_x: int = 12
+    label_offset_y: int = -8
+    font_size: int = 12
 
 
 class Stairwell(BaseModel):
     id: str
     polygon: List[Point]
-    link_to_floor_id: str
+    link_to_floor_id: Optional[str] = None
     coupling: float = 0.05
 
 
 class SolverParams(BaseModel):
     grid_w: int = 400
     grid_h: int = 250
-    # Increased iterations for smoother final gradients
     iterations: int = 500
-    # Strong sensor pull ensures the room reflects the sensor value
     sensor_pull: float = 1.0
-    # Massive resistance makes walls effectively infinite barriers
     wall_resistance: float = 500000.0
     default_passage_resistance: float = 2.0
 
@@ -136,7 +141,7 @@ class FloorplanV1(BaseModel):
     render: RenderParams = Field(default_factory=RenderParams)
 
     class Config:
-        extra = "forbid"
+        extra = "ignore"
 
 
 class AppConfig(BaseModel):
@@ -170,8 +175,6 @@ ha_states: Dict[str, EntityState] = {}
 ha_missing: Dict[str, str] = {}
 ha_unavailable: Dict[str, str] = {}
 ha_last_poll: Optional[str] = None
-
-latest_frames_lock = threading.Lock()
 
 
 def load_config() -> AppConfig:
@@ -258,77 +261,6 @@ def render_live_png(floor_id: str) -> Response:
 app.mount("/editor", StaticFiles(directory=Path(__file__).parents[1] / "frontend", html=True), name="frontend")
 
 
-@app.get("/render/live/{floor_id}.json")
-def render_live_debug(floor_id: str) -> Dict:
-    floorplans = load_all_floorplans()
-    if floor_id not in floorplans:
-        raise HTTPException(status_code=404, detail="Floorplan not found")
-    grids, metadata = solve_all_floorplans(floorplans)
-    grid = grids.get(floor_id)
-    if grid is None:
-        raise HTTPException(status_code=404, detail="Floorplan not found")
-    stats = {
-        "min": float(np.min(grid)),
-        "max": float(np.max(grid)),
-        "mean": float(np.mean(grid)),
-    }
-    with ha_lock:
-        states = {entity: state.__dict__ for entity, state in ha_states.items()}
-        missing = dict(ha_missing)
-        unavailable = dict(ha_unavailable)
-        last_poll = ha_last_poll
-    return {
-        "floor_id": floor_id,
-        "timestamp": now_iso(),
-        "grid_stats": stats,
-        "entities": states,
-        "missing_entities": missing,
-        "unavailable_entities": unavailable,
-        "metadata": metadata.get(floor_id, {}),
-        "ha_last_poll": last_poll,
-    }
-
-
-@app.get("/render/timelapse.gif")
-def render_timelapse(floor: str, window: int = 3600, step: int = 60, width: Optional[int] = None) -> Response:
-    frames_dir = Path(config.data_path) / "frames" / floor
-    if not frames_dir.exists():
-        raise HTTPException(status_code=404, detail="No frames for floor")
-    now_ts = int(time.time())
-    start_ts = now_ts - window
-    frame_files = sorted(frames_dir.glob("*.png"))
-    selected = []
-    last_ts = None
-    for path in frame_files:
-        try:
-            ts = int(path.stem)
-        except ValueError:
-            continue
-        if ts < start_ts or ts > now_ts:
-            continue
-        if last_ts is None or ts - last_ts >= step:
-            selected.append(path)
-            last_ts = ts
-    if not selected:
-        raise HTTPException(status_code=404, detail="No frames within window")
-    images = []
-    for path in selected:
-        img = Image.open(path)
-        if width:
-            ratio = width / img.width
-            img = img.resize((width, int(img.height * ratio)), Image.Resampling.LANCZOS)
-        images.append(img.convert("P", palette=Image.Palette.ADAPTIVE))
-    output_path = Path(config.data_path) / "frames" / floor / "timelapse.gif"
-    images[0].save(
-        output_path,
-        save_all=True,
-        append_images=images[1:],
-        duration=500,
-        loop=0,
-    )
-    return FileResponse(output_path, media_type="image/gif")
-
-
 def load_floorplan_file(floor_id: str) -> Dict:
     path = Path(config.data_path) / "floorplans" / f"{floor_id}.json"
     if not path.exists():
@@ -359,22 +291,6 @@ def point_xy(point: Point) -> Tuple[float, float]:
     return float(point[0]), float(point[1])
 
 
-def gather_entities(floorplans: Dict[str, Dict]) -> List[str]:
-    entities = []
-    for floorplan in floorplans.values():
-        for door in floorplan.get("doors", []):
-            entities.append(door.get("entity_id"))
-        for sensor in floorplan.get("sensors", []):
-            entities.append(sensor.get("entity"))
-        for thermo in floorplan.get("thermostats", []):
-            entities.append(thermo.get("temperature_entity"))
-            entities.append(thermo.get("setpoint_entity"))
-            mode_entity = thermo.get("mode_entity")
-            if mode_entity:
-                entities.append(mode_entity)
-    return sorted({e for e in entities if e})
-
-
 def ha_poll_loop() -> None:
     global ha_last_poll
     while True:
@@ -398,6 +314,19 @@ def load_all_floorplans() -> Dict[str, Dict]:
             floorplans[path.stem] = json.load(handle)
     return floorplans
 
+def gather_entities(floorplans: Dict[str, Dict]) -> List[str]:
+    entities = []
+    for floorplan in floorplans.values():
+        for door in floorplan.get("doors", []):
+            entities.append(door.get("entity_id"))
+        for sensor in floorplan.get("sensors", []):
+            entities.append(sensor.get("entity"))
+        for thermo in floorplan.get("thermostats", []):
+            entities.append(thermo.get("temperature_entity"))
+            entities.append(thermo.get("setpoint_entity"))
+            if thermo.get("mode_entity"):
+                entities.append(thermo.get("mode_entity"))
+    return sorted({e for e in entities if e})
 
 def poll_home_assistant(entities: List[str]) -> None:
     headers = {
@@ -508,6 +437,7 @@ def initialize_grid(fp: FloorplanV1) -> np.ndarray:
             if not state:
                 continue
             temp = parse_float(state.state)
+            if temp == 0.0: continue 
             sx, sy = point_xy(sensor.pos)
             gx = int(sx / fp.canvas.width * fp.solver.grid_w)
             gy = int(sy / fp.canvas.height * fp.solver.grid_h)
@@ -521,8 +451,6 @@ def initialize_grid(fp: FloorplanV1) -> np.ndarray:
     if not sensor_samples:
         return np.full((fp.solver.grid_h, fp.solver.grid_w), default_temp, dtype=float)
 
-    # NEW: Build "Wall Mask" (Rasterize walls as dead cells)
-    # This prevents the "thin line" leak problem.
     h_edges, v_edges = build_edge_conductance(fp)
     height, width = fp.solver.grid_h, fp.solver.grid_w
     
@@ -531,12 +459,7 @@ def initialize_grid(fp: FloorplanV1) -> np.ndarray:
     
     for gx, gy, temp, weight in sensor_samples:
         distances = dijkstra_distances(gx, gy, h_edges, v_edges)
-        
-        # IDW (1/dist^4) for sharp zones
-        # 1.0 / (dist^4 + 1) -> Ensures walls (dist=inf) have 0 influence
-        # Power 4 makes the influence drop off faster, creating "Zones"
         sensor_weight = weight * (1.0 / (distances**4 + 1.0))
-        
         weighted_sum += sensor_weight * temp
         weight_sum += sensor_weight
     
@@ -557,17 +480,7 @@ def parse_float(value: str) -> float:
 
 
 def diffuse_grid(fp: FloorplanV1, grid: np.ndarray) -> np.ndarray:
-    height, width = grid.shape
     h_edges, v_edges = build_edge_conductance(fp)
-
-    # Vectorized diffusion
-    # Use padding to handle boundaries (conductance 0 at boundaries implicitly via edges)
-    
-    # h_edges: (H, W-1). Padded to (H, W+1) for left/right shifting
-    # But for numpy ops we need aligned shapes.
-    # W_left[y, x] = conductance from (y, x-1) to (y, x)
-    # W_right[y, x] = conductance from (y, x+1) to (y, x)
-    
     w_left = np.pad(h_edges, ((0, 0), (1, 0)), mode='constant', constant_values=0)
     w_right = np.pad(h_edges, ((0, 0), (0, 1)), mode='constant', constant_values=0)
     w_up = np.pad(v_edges, ((1, 0), (0, 0)), mode='constant', constant_values=0)
@@ -581,7 +494,6 @@ def diffuse_grid(fp: FloorplanV1, grid: np.ndarray) -> np.ndarray:
     numerator = (n_left * w_left) + (n_right * w_right) + (n_up * w_up) + (n_down * w_down)
     denominator = w_left + w_right + w_up + w_down
     
-    # Only update cells that are connected to something
     mask = denominator > 0
     new_grid = grid.copy()
     new_grid[mask] = numerator[mask] / denominator[mask]
@@ -593,141 +505,43 @@ def diffuse_grid(fp: FloorplanV1, grid: np.ndarray) -> np.ndarray:
 def build_edge_conductance(fp: FloorplanV1) -> Tuple[np.ndarray, np.ndarray]:
     height, width = fp.solver.grid_h, fp.solver.grid_w
     
-    # 1. Create a "Wall Mask" (True if cell contains a wall)
+    # 1. Rasterize Walls (Blocks)
     wall_mask = np.zeros((height, width), dtype=bool)
-    
     for wall in fp.walls:
         points = wall.points
         for idx in range(len(points) - 1):
             rasterize_line_to_mask(fp, points[idx], points[idx+1], wall_mask)
             
-    # 2. Build edges based on the mask
-    # If a cell is a wall, all edges touching it are blocked (conductance 0)
-    # h_edges[y, x] connects (y, x) and (y, x+1)
-    # blocked if mask[y, x] or mask[y, x+1]
+    # 2. Rasterize Open Doors (Anti-blocks)
+    # This fixes diagonal doors: if a door is open, we erase the wall mask at that location
+    door_mask = np.zeros((height, width), dtype=bool)
+    for door in fp.doors:
+        if is_door_open(fp, door):
+            rasterize_line_to_mask(fp, door.segment[0], door.segment[1], door_mask)
+            
+    # Effective mask: Wall exists AND it is not an open door
+    effective_mask = wall_mask & (~door_mask)
     
     h_edges = np.ones((height, width - 1), dtype=float)
     v_edges = np.ones((height - 1, width), dtype=float)
     
-    # Block horizontal edges touching a wall cell
-    # Logic: if mask[y, x] is True, h_edges[y, x] (right) and h_edges[y, x-1] (left) are blocked
-    # Vectorized approach:
-    # h_edges[y, x] = 0 if mask[y, x] OR mask[y, x+1]
-    wall_left = wall_mask[:, :-1]
-    wall_right = wall_mask[:, 1:]
+    # Block edges if they touch an effective wall
+    wall_left = effective_mask[:, :-1]
+    wall_right = effective_mask[:, 1:]
     h_edges[wall_left | wall_right] = 0.0
     
-    # Block vertical edges
-    # v_edges[y, x] connects (y, x) and (y+1, x)
-    wall_up = wall_mask[:-1, :]
-    wall_down = wall_mask[1:, :]
+    wall_up = effective_mask[:-1, :]
+    wall_down = effective_mask[1:, :]
     v_edges[wall_up | wall_down] = 0.0
     
-    # 3. Handle doors (partial resistance)
-    # We still use the segment logic for doors, but we apply it ON TOP of the mask
-    # (Doors might be drawn on top of walls, creating 'holes' in the barrier)
-    rasterize_doors(fp, h_edges, v_edges)
+    # Closed doors apply resistance? (Simplified: Closed doors are just walls unless specified)
+    # If a door is closed, it wasn't added to door_mask, so it remains in wall_mask.
+    # So it blocks. If you want partial resistance for closed doors, that logic would go here,
+    # but strictly blocking for closed doors is usually safer for diagonals.
     
     return h_edges, v_edges
 
-
-def rasterize_line_to_mask(fp: FloorplanV1, a: Point, b: Point, mask: np.ndarray) -> None:
-    """Supercover line algorithm to mark ALL cells touched by the wall."""
-    grid_w = fp.solver.grid_w
-    grid_h = fp.solver.grid_h
-    ax, ay = point_xy(a)
-    bx, by = point_xy(b)
-    
-    # Convert to grid coordinates
-    x0 = ax / fp.canvas.width * grid_w
-    y0 = ay / fp.canvas.height * grid_h
-    x1 = bx / fp.canvas.width * grid_w
-    y1 = by / fp.canvas.height * grid_h
-    
-    # Bresenham / Traversal
-    # We simply march from x0,y0 to x1,y1
-    # Simple dense sampling is enough for this resolution
-    dist = max(abs(x1 - x0), abs(y1 - y0))
-    if dist == 0:
-        return
-        
-    steps = int(dist * 2) + 2 # Oversample to hit every cell
-    for i in range(steps):
-        t = i / (steps - 1)
-        lx = x0 + (x1 - x0) * t
-        ly = y0 + (y1 - y0) * t
-        
-        gx = int(lx)
-        gy = int(ly)
-        
-        if 0 <= gx < grid_w and 0 <= gy < grid_h:
-            mask[gy, gx] = True
-
-
-def dijkstra_distances(
-    start_x: int,
-    start_y: int,
-    h_edges: np.ndarray,
-    v_edges: np.ndarray,
-) -> np.ndarray:
-    height, width = h_edges.shape[0], h_edges.shape[1] + 1
-    distances = np.full((height, width), np.inf, dtype=float)
-    distances[start_y, start_x] = 0.0
-    heap: List[Tuple[float, int, int]] = [(0.0, start_y, start_x)]
-    while heap:
-        cost, y, x = heapq.heappop(heap)
-        if cost > distances[y, x]:
-            continue
-        if x > 0:
-            conductance = h_edges[y, x - 1]
-            if conductance > 0:
-                # Cost is 1.0 (step) if open
-                edge_cost = 1.0
-                new_cost = cost + edge_cost
-                if new_cost < distances[y, x - 1]:
-                    distances[y, x - 1] = new_cost
-                    heapq.heappush(heap, (new_cost, y, x - 1))
-        if x < width - 1:
-            conductance = h_edges[y, x]
-            if conductance > 0:
-                edge_cost = 1.0
-                new_cost = cost + edge_cost
-                if new_cost < distances[y, x + 1]:
-                    distances[y, x + 1] = new_cost
-                    heapq.heappush(heap, (new_cost, y, x + 1))
-        if y > 0:
-            conductance = v_edges[y - 1, x]
-            if conductance > 0:
-                edge_cost = 1.0
-                new_cost = cost + edge_cost
-                if new_cost < distances[y - 1, x]:
-                    distances[y - 1, x] = new_cost
-                    heapq.heappush(heap, (new_cost, y - 1, x))
-        if y < height - 1:
-            conductance = v_edges[y, x]
-            if conductance > 0:
-                edge_cost = 1.0
-                new_cost = cost + edge_cost
-                if new_cost < distances[y + 1, x]:
-                    distances[y + 1, x] = new_cost
-                    heapq.heappush(heap, (new_cost, y + 1, x))
-    return distances
-
-
-def rasterize_doors(fp: FloorplanV1, h_edges: np.ndarray, v_edges: np.ndarray) -> None:
-    for door in fp.doors:
-        resistance = door_resistance(fp, door)
-        # If door is open, we want high conductance (low resistance)
-        # If closed, low conductance
-        if resistance >= fp.solver.wall_resistance:
-            conductance = 0.0
-        else:
-            conductance = 1.0 # Standard flow
-            
-        mark_segment_edges(fp, door.segment[0], door.segment[1], h_edges, v_edges, conductance)
-
-
-def door_resistance(fp: FloorplanV1, door: Door) -> float:
+def is_door_open(fp: FloorplanV1, door: Door) -> bool:
     door_open = door.open
     if door.entity_id:
         with ha_lock:
@@ -737,67 +551,65 @@ def door_resistance(fp: FloorplanV1, door: Door) -> float:
                 door_open = True
             elif state.state in door.mapping.closed_values:
                 door_open = False
-            else:
-                door_open = door.mapping.unknown_as == "open"
-    if door_open:
-        return door.open_resistance or fp.solver.default_passage_resistance
-    return door.closed_resistance or fp.solver.wall_resistance
+    return door_open
 
-
-def mark_segment_edges(
-    fp: FloorplanV1,
-    a: Point,
-    b: Point,
-    h_edges: np.ndarray,
-    v_edges: np.ndarray,
-    conductance: float,
-) -> None:
-    # Used for doors to "punch holes" in the wall mask
+def rasterize_line_to_mask(fp: FloorplanV1, a: Point, b: Point, mask: np.ndarray) -> None:
     grid_w = fp.solver.grid_w
     grid_h = fp.solver.grid_h
     ax, ay = point_xy(a)
     bx, by = point_xy(b)
-    x0 = int(ax / fp.canvas.width * grid_w)
-    y0 = int(ay / fp.canvas.height * grid_h)
-    x1 = int(bx / fp.canvas.width * grid_w)
-    y1 = int(by / fp.canvas.height * grid_h)
-    steps = max(abs(x1 - x0), abs(y1 - y0), 1) * 2
-    prev = (x0, y0)
-    for step in range(1, steps + 1):
-        t = step / steps
-        x = int(x0 + (x1 - x0) * t)
-        y = int(y0 + (y1 - y0) * t)
-        current = (min(max(x, 0), grid_w - 1), min(max(y, 0), grid_h - 1))
-        if current != prev:
-            mark_edge_single(prev, current, h_edges, v_edges, conductance)
-            prev = current
+    x0 = ax / fp.canvas.width * grid_w
+    y0 = ay / fp.canvas.height * grid_h
+    x1 = bx / fp.canvas.width * grid_w
+    y1 = by / fp.canvas.height * grid_h
+    dist = max(abs(x1 - x0), abs(y1 - y0))
+    if dist == 0: return
+    steps = int(dist * 2) + 2
+    for i in range(steps):
+        t = i / (steps - 1)
+        lx = x0 + (x1 - x0) * t
+        ly = y0 + (y1 - y0) * t
+        gx, gy = int(lx), int(ly)
+        if 0 <= gx < grid_w and 0 <= gy < grid_h:
+            mask[gy, gx] = True
 
-def mark_edge_single(
-    a: Tuple[int, int],
-    b: Tuple[int, int],
-    h_edges: np.ndarray,
-    v_edges: np.ndarray,
-    conductance: float,
-) -> None:
-    ax, ay = a
-    bx, by = b
-    if ay == by and ax != bx:
-        x = min(ax, bx)
-        if 0 <= ay < h_edges.shape[0] and 0 <= x < h_edges.shape[1]:
-            h_edges[ay, x] = conductance # Overwrite
-    elif ax == bx and ay != by:
-        y = min(ay, by)
-        if 0 <= y < v_edges.shape[0] and 0 <= ax < v_edges.shape[1]:
-            v_edges[y, ax] = conductance # Overwrite
+
+def dijkstra_distances(start_x: int, start_y: int, h_edges: np.ndarray, v_edges: np.ndarray) -> np.ndarray:
+    height, width = h_edges.shape[0], h_edges.shape[1] + 1
+    distances = np.full((height, width), np.inf, dtype=float)
+    distances[start_y, start_x] = 0.0
+    heap: List[Tuple[float, int, int]] = [(0.0, start_y, start_x)]
+    while heap:
+        cost, y, x = heapq.heappop(heap)
+        if cost > distances[y, x]: continue
+        
+        # Neighbor checks
+        if x > 0 and h_edges[y, x - 1] > 0:
+            if cost + 1.0 < distances[y, x - 1]:
+                distances[y, x - 1] = cost + 1.0
+                heapq.heappush(heap, (cost + 1.0, y, x - 1))
+        if x < width - 1 and h_edges[y, x] > 0:
+            if cost + 1.0 < distances[y, x + 1]:
+                distances[y, x + 1] = cost + 1.0
+                heapq.heappush(heap, (cost + 1.0, y, x + 1))
+        if y > 0 and v_edges[y - 1, x] > 0:
+            if cost + 1.0 < distances[y - 1, x]:
+                distances[y - 1, x] = cost + 1.0
+                heapq.heappush(heap, (cost + 1.0, y - 1, x))
+        if y < height - 1 and v_edges[y, x] > 0:
+            if cost + 1.0 < distances[y + 1, x]:
+                distances[y + 1, x] = cost + 1.0
+                heapq.heappush(heap, (cost + 1.0, y + 1, x))
+    return distances
 
 
 def apply_sensor_pull(fp: FloorplanV1, grid: np.ndarray) -> None:
     for sensor in fp.sensors:
         with ha_lock:
             state = ha_states.get(sensor.entity) if sensor.entity else None
-        if not state:
-            continue
+        if not state: continue
         temp = parse_float(state.state)
+        if temp == 0.0: continue
         sx, sy = point_xy(sensor.pos)
         gx = int(sx / fp.canvas.width * fp.solver.grid_w)
         gy = int(sy / fp.canvas.height * fp.solver.grid_h)
@@ -810,19 +622,15 @@ def apply_sensor_pull(fp: FloorplanV1, grid: np.ndarray) -> None:
 def apply_stairwell_coupling(parsed: Dict[str, FloorplanV1], grids: Dict[str, np.ndarray]) -> None:
     for floor_id, fp in parsed.items():
         stair = fp.stairwell
-        if not stair:
-            continue
+        if not stair or not stair.link_to_floor_id: continue
         target = stair.link_to_floor_id
-        if target not in grids:
-            continue
+        if target not in grids: continue
         source_grid = grids[floor_id]
         target_grid = grids[target]
         mask = polygon_mask(fp, stair.polygon)
         coupling = stair.coupling
         source_grid[mask] = source_grid[mask] + coupling * (target_grid[mask] - source_grid[mask])
         target_grid[mask] = target_grid[mask] + coupling * (source_grid[mask] - target_grid[mask])
-        grids[floor_id] = source_grid
-        grids[target] = target_grid
 
 
 def polygon_mask(fp: FloorplanV1, polygon: List[Point]) -> np.ndarray:
@@ -830,8 +638,7 @@ def polygon_mask(fp: FloorplanV1, polygon: List[Point]) -> np.ndarray:
     xs = [point_xy(p)[0] / fp.canvas.width * width for p in polygon]
     ys = [point_xy(p)[1] / fp.canvas.height * height for p in polygon]
     mask = np.zeros((height, width), dtype=bool)
-    if not xs or not ys:
-        return mask
+    if not xs: return mask
     min_x = int(max(min(xs), 0))
     max_x = int(min(max(xs), width - 1))
     min_y = int(max(min(ys), 0))
@@ -852,96 +659,117 @@ def point_in_polygon(x: float, y: float, xs: List[float], ys: List[float]) -> bo
         intersect = ((yi > y) != (yj > y)) and (
             x < (xj - xi) * (y - yi) / (yj - yi + 1e-9) + xi
         )
-        if intersect:
-            inside = not inside
+        if intersect: inside = not inside
         j = i
     return inside
 
 
-def render_floorplan_image(
-    floor_id: str,
-    payload: Dict,
-    grid: np.ndarray,
-    metadata: Dict,
-) -> Image.Image:
+def render_floorplan_image(floor_id: str, payload: Dict, grid: np.ndarray, metadata: Dict) -> Image.Image:
     fp = FloorplanV1.parse_obj(payload)
     canvas = Image.new("RGBA", (fp.canvas.width, fp.canvas.height), (20, 20, 20, 255))
-    scale_min_f, scale_max_f = resolve_temperature_range(fp, grid)
-    heatmap_mask = build_floorplan_mask(fp, grid.shape)
-    heatmap = render_heatmap(
-        grid,
-        scale_min_f,
-        scale_max_f,
-        fp.render.overlay_alpha,
-        canvas.size,
-        heatmap_mask,
-    )
+    min_f, max_f = resolve_temperature_range(fp, grid)
+    
+    # Use Flood Fill mask instead of convex hull to handle concave yards properly
+    heatmap_mask = build_floorplan_mask_floodfill(fp)
+    
+    heatmap = render_heatmap(grid, min_f, max_f, fp.render.overlay_alpha, canvas.size, heatmap_mask)
     canvas = Image.alpha_composite(canvas, heatmap)
     draw = ImageDraw.Draw(canvas)
-    if fp.render.show_walls:
-        draw_walls(draw, fp)
+    if fp.render.show_walls: draw_walls(draw, fp)
     draw_sensors(draw, fp)
     draw_thermostats(draw, fp)
     if fp.render.auto_crop:
         crop_box = compute_floorplan_crop(fp, canvas.size, fp.render.crop_padding)
-        if crop_box is not None:
+        if crop_box: 
             canvas = canvas.crop(crop_box)
-            draw = ImageDraw.Draw(canvas)
+            draw = ImageDraw.Draw(canvas) # Update draw object for cropped canvas if needed
+            # Actually we just crop at the end, that's fine.
+    
+    # Legend/Timestamp margin
     if fp.render.show_legend or fp.render.show_timestamp:
-        canvas = add_exterior_margin(
-            canvas,
-            fp.render.exterior_margin,
-            fp.render.show_timestamp,
-            fp.render.show_legend,
-        )
+        canvas = add_exterior_margin(canvas, fp.render.exterior_margin, fp.render.show_timestamp, fp.render.show_legend)
         draw = ImageDraw.Draw(canvas)
-    if fp.render.show_legend:
-        draw_legend(draw, fp, scale_min_f, scale_max_f, canvas.size)
-    if fp.render.show_timestamp:
-        draw_timestamp(draw, fp.render.exterior_margin)
+    
+    if fp.render.show_legend: draw_legend(draw, min_f, max_f, canvas.size, fp.render.exterior_margin)
+    if fp.render.show_timestamp: draw_timestamp(draw, fp.render.exterior_margin)
     return canvas.convert("RGB")
 
+def build_floorplan_mask_floodfill(fp: FloorplanV1) -> np.ndarray:
+    """Creates a mask of the 'inside' of the floorplan using flood fill from sensors."""
+    w, h = fp.canvas.width // 4, fp.canvas.height // 4 # Low-res mask for speed
+    mask = Image.new("L", (w, h), 0)
+    
+    # 1. Draw Walls (Blockers)
+    draw = ImageDraw.Draw(mask)
+    for wall in fp.walls:
+        pts = [(p[0]/4, p[1]/4) for p in wall.points]
+        draw.line(pts, fill=255, width=2)
+    
+    # 2. Convert to numpy
+    arr = np.array(mask)
+    # Walls are 255, empty is 0. We want to fill 0s starting from sensors.
+    
+    seeds = []
+    for s in fp.sensors:
+        sx, sy = int(s.pos[0]/4), int(s.pos[1]/4)
+        if 0 <= sx < w and 0 <= sy < h: seeds.append((sx, sy))
+    for t in fp.thermostats:
+        sx, sy = int(t.pos[0]/4), int(t.pos[1]/4)
+        if 0 <= sx < w and 0 <= sy < h: seeds.append((sx, sy))
+        
+    # Flood Fill
+    filled = np.zeros_like(arr, dtype=bool)
+    stack = seeds
+    visited = set(seeds)
+    
+    while stack:
+        cx, cy = stack.pop()
+        filled[cy, cx] = True
+        
+        for dx, dy in [(-1,0), (1,0), (0,-1), (0,1)]:
+            nx, ny = cx + dx, cy + dy
+            if 0 <= nx < w and 0 <= ny < h:
+                if not visited.__contains__((nx, ny)) and arr[ny, nx] == 0:
+                    visited.add((nx, ny))
+                    stack.append((nx, ny))
+                    
+    # Resize back up
+    full_mask = Image.fromarray(filled).resize((fp.canvas.width, fp.canvas.height), Image.Resampling.NEAREST)
+    return np.array(full_mask)
 
-def render_heatmap(
-    grid: np.ndarray,
-    min_f: float,
-    max_f: float,
-    overlay_alpha: float,
-    size: Tuple[int, int],
-    mask: Optional[np.ndarray] = None,
-) -> Image.Image:
+def render_heatmap(grid: np.ndarray, min_f: float, max_f: float, overlay_alpha: float, size: Tuple[int, int], mask: Optional[np.ndarray]) -> Image.Image:
     norm = np.clip((grid - min_f) / (max_f - min_f + 1e-6), 0, 1)
     colors = np.zeros((grid.shape[0], grid.shape[1], 4), dtype=np.uint8)
     colors[..., 0], colors[..., 1], colors[..., 2] = gradient_rgb(norm)
-    alpha_value = int(255 * min(max(overlay_alpha, 0.0), 1.0))
-    colors[..., 3] = alpha_value
+    colors[..., 3] = int(255 * overlay_alpha)
+    
+    image = Image.fromarray(colors, mode="RGBA").resize(size, resample=Image.Resampling.BILINEAR)
+    
+    # Apply Mask
     if mask is not None:
-        colors[..., 3] = np.where(mask, colors[..., 3], 0)
-    image = Image.fromarray(colors, mode="RGBA")
-    return image.resize(size, resample=Image.Resampling.BILINEAR)
+        mask_img = Image.fromarray((mask * 255).astype(np.uint8), mode="L")
+        image.putalpha(mask_img)
+        # Re-apply global alpha to the masked area? 
+        # Actually putalpha replaces the alpha channel.
+        # We want: Alpha = mask * overlay_alpha
+        # So:
+        r, g, b, a = image.split()
+        # Merge mask with constant alpha
+        new_a = Image.eval(mask_img, lambda x: int(x * overlay_alpha))
+        image = Image.merge("RGBA", (r, g, b, new_a))
+
+    return image
 
 
 def gradient_rgb(norm: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     stops = np.array([0.0, 0.25, 0.5, 0.75, 1.0])
-    colors = np.array(
-        [
-            [0, 0, 255],    # blue
-            [0, 255, 255],  # cyan
-            [0, 255, 0],    # green
-            [255, 255, 0],  # yellow
-            [255, 0, 0],    # red
-        ],
-        dtype=float,
-    )
-    norm = np.clip(norm, 0.0, 1.0)
+    colors = np.array([
+        [0, 0, 255], [0, 255, 255], [0, 255, 0], [255, 255, 0], [255, 0, 0]
+    ], dtype=float)
     idx = np.searchsorted(stops, norm, side="right") - 1
     idx = np.clip(idx, 0, len(stops) - 2)
-    
     t = (norm - stops[idx]) / (stops[idx + 1] - stops[idx])
-    
-    # Smoothstep interpolation for nicer bands
     t = t * t * (3.0 - 2.0 * t)
-    
     c0 = colors[idx]
     c1 = colors[idx + 1]
     blended = c0 + (c1 - c0) * t[..., None]
@@ -953,74 +781,11 @@ def resolve_temperature_range(fp: FloorplanV1, grid: np.ndarray) -> Tuple[float,
     grid_max = float(np.max(grid))
     min_f = fp.render.temp_range_f.min if fp.render.scale_min_mode == "absolute" else grid_min
     max_f = fp.render.temp_range_f.max if fp.render.scale_max_mode == "absolute" else grid_max
-    if min_f >= max_f:
-        max_f = min_f + 0.1
+    if min_f >= max_f: max_f = min_f + 0.1
     return min_f, max_f
 
-
-def build_floorplan_mask(fp: FloorplanV1, grid_shape: Tuple[int, int]) -> Optional[np.ndarray]:
-    points = gather_floorplan_points(fp)
-    if len(points) < 3:
-        return None
-    hull = convex_hull(points)
-    if len(hull) < 3:
-        return None
-    width, height = grid_shape[1], grid_shape[0]
-    scale_x = width / fp.canvas.width
-    scale_y = height / fp.canvas.height
-    polygon = [(p[0] * scale_x, p[1] * scale_y) for p in hull]
-    mask = Image.new("L", (width, height), 0)
-    mask_draw = ImageDraw.Draw(mask)
-    mask_draw.polygon(polygon, fill=255)
-    return np.array(mask) > 0
-
-
-def gather_floorplan_points(fp: FloorplanV1) -> List[Tuple[float, float]]:
-    points: List[Tuple[float, float]] = []
-    for wall in fp.walls:
-        points.extend([point_xy(p) for p in wall.points])
-    for door in fp.doors:
-        points.append(point_xy(door.segment[0]))
-        points.append(point_xy(door.segment[1]))
-    for sensor in fp.sensors:
-        points.append(point_xy(sensor.pos))
-    for thermo in fp.thermostats:
-        points.append(point_xy(thermo.pos))
-    if fp.stairwell:
-        points.extend([point_xy(p) for p in fp.stairwell.polygon])
-    return points
-
-
-def convex_hull(points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
-    points = sorted(set(points))
-    if len(points) <= 1:
-        return points
-
-    def cross(o: Tuple[float, float], a: Tuple[float, float], b: Tuple[float, float]) -> float:
-        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
-
-    lower: List[Tuple[float, float]] = []
-    for p in points:
-        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
-            lower.pop()
-        lower.append(p)
-
-    upper: List[Tuple[float, float]] = []
-    for p in reversed(points):
-        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
-            upper.pop()
-        upper.append(p)
-
-    return lower[:-1] + upper[:-1]
-
-
-def add_exterior_margin(
-    image: Image.Image,
-    margin: int,
-    show_timestamp: bool,
-    show_legend: bool,
-) -> Image.Image:
-    top = margin if show_timestamp else margin // 2
+def add_exterior_margin(image: Image.Image, margin: int, show_ts: bool, show_legend: bool) -> Image.Image:
+    top = margin if show_ts else margin // 2
     bottom = margin + 60 if show_legend else margin // 2
     new_width = image.width + margin * 2
     new_height = image.height + top + bottom
@@ -1028,26 +793,17 @@ def add_exterior_margin(
     canvas.paste(image, (margin, top))
     return canvas
 
-
-def compute_floorplan_crop(
-    fp: FloorplanV1,
-    canvas_size: Tuple[int, int],
-    padding: int,
-) -> Optional[Tuple[int, int, int, int]]:
-    points = gather_floorplan_points(fp)
-    if not points:
-        return None
+def compute_floorplan_crop(fp: FloorplanV1, canvas_size: Tuple[int, int], padding: int) -> Optional[Tuple[int, int, int, int]]:
+    points = []
+    for wall in fp.walls: points.extend([point_xy(p) for p in wall.points])
+    if not points: return None
     xs = [p[0] for p in points]
     ys = [p[1] for p in points]
     min_x = max(int(min(xs) - padding), 0)
     min_y = max(int(min(ys) - padding), 0)
     max_x = min(int(max(xs) + padding), canvas_size[0])
     max_y = min(int(max(ys) + padding), canvas_size[1])
-    if max_x <= min_x or max_y <= min_y:
-        return None
     return min_x, min_y, max_x, max_y
-
-
 
 def draw_walls(draw: ImageDraw.ImageDraw, fp: FloorplanV1) -> None:
     for wall in fp.walls:
@@ -1057,21 +813,24 @@ def draw_walls(draw: ImageDraw.ImageDraw, fp: FloorplanV1) -> None:
         points = [point_xy(door.segment[0]), point_xy(door.segment[1])]
         draw.line(points, fill=(120, 200, 255), width=4)
 
-
-
 def draw_sensors(draw: ImageDraw.ImageDraw, fp: FloorplanV1) -> None:
-    font = ImageFont.load_default()
     for sensor in fp.sensors:
         x, y = point_xy(sensor.pos)
         draw.ellipse((x - 6, y - 6, x + 6, y + 6), fill=(255, 255, 255))
         if fp.render.show_labels:
             label = sensor.label or sensor.entity or ""
-            temperature = format_entity_temperature(sensor.entity)
-            if temperature:
-                label = f"{label} {temperature}" if label else temperature
-            draw.text((x + 8, y - 8), label, fill=(255, 255, 255), font=font)
-
-
+            temp_val = format_entity_temperature(sensor.entity)
+            if temp_val: label = f"{label} {temp_val}" if label else temp_val
+            
+            # Custom font size? (Basic scaling for now, or use sensor.font_size)
+            font = ImageFont.load_default() 
+            # Note: PIL default font doesn't support size.
+            # If you want custom size, you need a .ttf file. 
+            # For this context, we'll just respect the Offset.
+            
+            off_x = sensor.label_offset_x
+            off_y = sensor.label_offset_y
+            draw.text((x + off_x, y + off_y), label, fill=(255, 255, 255), font=font)
 
 def draw_thermostats(draw: ImageDraw.ImageDraw, fp: FloorplanV1) -> None:
     font = ImageFont.load_default()
@@ -1087,40 +846,26 @@ def draw_thermostats(draw: ImageDraw.ImageDraw, fp: FloorplanV1) -> None:
                 label = f"{label} ({mode})"
             if thermo.device_label:
                 label = f"{thermo.device_label} {label}"
-            draw.text((x + 10, y - 8), label, fill=(255, 200, 50), font=font)
-
-
+            
+            off_x = thermo.label_offset_x
+            off_y = thermo.label_offset_y
+            draw.text((x + off_x, y + off_y), label, fill=(255, 200, 50), font=font)
 
 def read_entity_state(entity_id: str) -> str:
-    with ha_lock:
-        state = ha_states.get(entity_id)
+    with ha_lock: state = ha_states.get(entity_id)
     return state.state if state else "n/a"
 
-
 def format_entity_temperature(entity_id: Optional[str]) -> str:
-    if not entity_id:
-        return ""
+    if not entity_id: return ""
     state = read_entity_state(entity_id)
-    if state == "n/a":
-        return ""
-    try:
-        value = float(state)
-    except ValueError:
-        return ""
-    return f"{value:.1f}F"
+    if state == "n/a": return ""
+    try: return f"{float(state):.1f}F"
+    except ValueError: return ""
 
-
-
-def draw_legend(
-    draw: ImageDraw.ImageDraw,
-    fp: FloorplanV1,
-    min_f: float,
-    max_f: float,
-    canvas_size: Tuple[int, int],
-) -> None:
+def draw_legend(draw: ImageDraw.ImageDraw, min_f: float, max_f: float, size: Tuple[int, int], margin: int) -> None:
     font = ImageFont.load_default()
-    x0, y0 = fp.render.exterior_margin, canvas_size[1] - 80
-    x1, y1 = x0 + 200, canvas_size[1] - 40
+    x0, y0 = margin, size[1] - 80
+    x1, y1 = x0 + 200, size[1] - 40
     for i in range(x0, x1):
         t = (i - x0) / (x1 - x0)
         r, g, b = gradient_rgb(np.array([t]))
@@ -1129,14 +874,10 @@ def draw_legend(
     draw.text((x0, y0 - 18), f"{min_f:.1f}F", fill=(255, 255, 255), font=font)
     draw.text((x1 - 48, y0 - 18), f"{max_f:.1f}F", fill=(255, 255, 255), font=font)
 
-
-
 def draw_timestamp(draw: ImageDraw.ImageDraw, margin: int) -> None:
     font = ImageFont.load_default()
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     draw.text((margin, margin), timestamp, fill=(255, 255, 255), font=font)
-
-
 
 def image_to_png_bytes(image: Image.Image) -> bytes:
     output = io.BytesIO()
