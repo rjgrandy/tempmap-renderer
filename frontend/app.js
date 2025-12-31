@@ -34,6 +34,8 @@ const state = {
   // Background Image State
   backgroundImage: null,
   background: { x: 0, y: 0, scale: 1.0, opacity: 0.5 },
+  haStates: {},
+  haPollInterval: null,
 };
 
 const defaultRender = () => ({
@@ -46,7 +48,7 @@ const defaultRender = () => ({
   show_outside_temp: true,
   outside_temp_label: 'Outside',
   outside_temp_entity: '',
-  outside_temp_f: 72,
+  outside_temp_f: null,
 });
 
 const defaultSolver = () => ({
@@ -127,6 +129,80 @@ function setFloorplan(fp) {
   render();
 }
 
+function collectHaEntities(fp) {
+  const entities = new Set();
+  (fp.sensors || []).forEach((sensor) => {
+    if (sensor.entity) {
+      entities.add(sensor.entity);
+    }
+  });
+  (fp.thermostats || []).forEach((thermo) => {
+    if (thermo.temperature_entity) {
+      entities.add(thermo.temperature_entity);
+    }
+    if (thermo.setpoint_entity) {
+      entities.add(thermo.setpoint_entity);
+    }
+    if (thermo.setpoint_low_entity) {
+      entities.add(thermo.setpoint_low_entity);
+    }
+    if (thermo.setpoint_high_entity) {
+      entities.add(thermo.setpoint_high_entity);
+    }
+    if (thermo.mode_entity) {
+      entities.add(thermo.mode_entity);
+    }
+  });
+  if (fp.render?.outside_temp_entity) {
+    entities.add(fp.render.outside_temp_entity);
+  }
+  return Array.from(entities);
+}
+
+function readHaState(entity) {
+  if (!entity) {
+    return null;
+  }
+  return state.haStates[entity] ?? null;
+}
+
+function formatTemperatureFromState(entity) {
+  const raw = readHaState(entity);
+  if (!raw || raw === 'unknown' || raw === 'unavailable' || raw === 'n/a') {
+    return '';
+  }
+  const value = Number(raw);
+  if (!Number.isFinite(value)) {
+    return '';
+  }
+  return `${value.toFixed(1)}F`;
+}
+
+async function refreshHaStates() {
+  const fp = currentFloorplan();
+  if (!fp) {
+    return;
+  }
+  const entities = collectHaEntities(fp);
+  if (!entities.length) {
+    state.haStates = {};
+    render();
+    return;
+  }
+  try {
+    const params = new URLSearchParams({ entities: entities.join(',') });
+    const response = await fetch(`/api/ha/states?${params.toString()}`);
+    if (!response.ok) {
+      return;
+    }
+    const payload = await response.json();
+    state.haStates = payload.states || {};
+    render();
+  } catch (error) {
+    // Ignore HA fetch errors in the editor preview.
+  }
+}
+
 function initialize() {
   state.floorplans.floor1 = createDefaultFloorplan('floor1');
   state.floorplans.floor2 = createDefaultFloorplan('floor2');
@@ -139,6 +215,10 @@ function initialize() {
   fetchFloorplanList();
   renderProperties();
   render();
+  refreshHaStates();
+  if (!state.haPollInterval) {
+    state.haPollInterval = window.setInterval(refreshHaStates, 15000);
+  }
 }
 
 async function fetchFloorplanList() {
@@ -183,6 +263,7 @@ async function loadFloorplan(floorId) {
     updateFloorTabs();
     loadSelect.value = floorId;
     setStatus(`Loaded ${floorId}.`);
+    refreshHaStates();
   } catch (error) {
     setStatus(error.message || `Unable to load ${floorId}.`, true);
   }
@@ -439,9 +520,16 @@ function renderSensors(fp) {
       const offX = (sensor.label_offset_x || 10) / state.view.scale;
       const offY = (sensor.label_offset_y || -8) / state.view.scale;
       
-      ctx.fillText(label, sensor.pos[0] + offX, sensor.pos[1] + offY);
-      // Mockup of second line (visual only, real rendering is in backend)
-      ctx.fillText('72.0F', sensor.pos[0] + offX, sensor.pos[1] + offY + ((sensor.font_size + 2) / state.view.scale));
+      const tempValue = formatTemperatureFromState(sensor.entity);
+      const tempLine = tempValue || (sensor.entity ? 'n/a' : '');
+
+      if (label) {
+        ctx.fillText(label, sensor.pos[0] + offX, sensor.pos[1] + offY);
+      }
+      if (tempLine) {
+        const lineOffset = label ? (sensor.font_size + 2) / state.view.scale : 0;
+        ctx.fillText(tempLine, sensor.pos[0] + offX, sensor.pos[1] + offY + lineOffset);
+      }
     }
   });
 }
@@ -459,20 +547,69 @@ function renderThermostats(fp) {
       const offX = (thermo.label_offset_x || 12) / state.view.scale;
       const offY = (thermo.label_offset_y || -8) / state.view.scale;
 
-      const mode = (thermo.preview_mode || 'heat_cool').toLowerCase();
-      const tempLine = '72.0F';
-      const setpointLine = mode === 'heat'
-        ? '68.0F'
-        : mode === 'cool'
-          ? '74.0F'
-          : '68.0F / 74.0F';
+      const tempValue = formatTemperatureFromState(thermo.temperature_entity);
+      const setpointValue = formatTemperatureFromState(thermo.setpoint_entity);
+      const setpointLow = formatTemperatureFromState(thermo.setpoint_low_entity);
+      const setpointHigh = formatTemperatureFromState(thermo.setpoint_high_entity);
+      const modeState = readHaState(thermo.mode_entity);
+      const modeLower = modeState ? modeState.toLowerCase() : '';
 
-      ctx.fillText(label, thermo.pos[0] + offX, thermo.pos[1] + offY);
-      ctx.fillText(
-        `${tempLine} / ${setpointLine}${mode ? ` (${mode})` : ''}`,
-        thermo.pos[0] + offX,
-        thermo.pos[1] + offY + ((thermo.font_size + 2) / state.view.scale),
-      );
+      let tempLine = '';
+      let modeLabel = modeState;
+      let setpointLine = '';
+      const hasEntityData = tempValue || setpointValue || setpointLow || setpointHigh || modeState;
+
+      if (hasEntityData) {
+        if (['heat_cool', 'auto'].includes(modeLower)) {
+          if (setpointLow && setpointHigh) {
+            setpointLine = `${setpointLow} / ${setpointHigh}`;
+          } else {
+            setpointLine = setpointLow || setpointHigh || setpointValue;
+          }
+        } else if (modeLower === 'heat') {
+          setpointLine = setpointValue || setpointLow;
+        } else if (modeLower === 'cool') {
+          setpointLine = setpointValue || setpointHigh;
+        } else {
+          setpointLine = setpointValue || setpointLow || setpointHigh;
+        }
+
+        const detailParts = [];
+        if (tempValue) {
+          detailParts.push(tempValue);
+        }
+        if (setpointLine) {
+          detailParts.push(setpointLine);
+        }
+        tempLine = detailParts.join(' / ');
+      } else {
+        const previewMode = (thermo.preview_mode || 'heat_cool').toLowerCase();
+        modeLabel = previewMode;
+        const previewTemp = '72.0F';
+        const previewSetpoint = previewMode === 'heat'
+          ? '68.0F'
+          : previewMode === 'cool'
+            ? '74.0F'
+            : '68.0F / 74.0F';
+        tempLine = `${previewTemp} / ${previewSetpoint}`;
+      }
+
+      let detailLine = tempLine;
+      if (modeLabel) {
+        detailLine = detailLine ? `${detailLine} (${modeLabel})` : modeLabel;
+      }
+
+      if (label) {
+        ctx.fillText(label, thermo.pos[0] + offX, thermo.pos[1] + offY);
+      }
+      if (detailLine) {
+        const lineOffset = label ? (thermo.font_size + 2) / state.view.scale : 0;
+        ctx.fillText(
+          detailLine,
+          thermo.pos[0] + offX,
+          thermo.pos[1] + offY + lineOffset,
+        );
+      }
     }
   });
 }
@@ -624,13 +761,13 @@ function renderOutsideTemperature(fp) {
   }
   const label = fp.render.outside_temp_label || 'Outside';
   let tempValue = '';
-  if (fp.render.outside_temp_f !== null && fp.render.outside_temp_f !== undefined) {
+  if (fp.render.outside_temp_entity) {
+    tempValue = formatTemperatureFromState(fp.render.outside_temp_entity) || 'n/a';
+  } else if (fp.render.outside_temp_f !== null && fp.render.outside_temp_f !== undefined) {
     const outsideTemp = Number(fp.render.outside_temp_f);
     if (Number.isFinite(outsideTemp)) {
       tempValue = `${outsideTemp.toFixed(1)}F`;
     }
-  } else if (fp.render.outside_temp_entity) {
-    tempValue = 'n/a';
   }
   if (!tempValue) {
     return;
@@ -680,8 +817,9 @@ function renderProperties() {
     propertiesPanel.appendChild(renderField('Outside Temp Entity', fp.render.outside_temp_entity || '', (val) => {
       pushHistory();
       fp.render.outside_temp_entity = val;
+      refreshHaStates();
     }));
-    propertiesPanel.appendChild(renderField('Outside Temp (F)', fp.render.outside_temp_f ?? '', (val) => {
+    propertiesPanel.appendChild(renderField('Outside Temp (F) Fallback', fp.render.outside_temp_f ?? '', (val) => {
       pushHistory();
       fp.render.outside_temp_f = val === '' ? null : parseFloat(val);
     }));
@@ -764,6 +902,7 @@ function renderProperties() {
     propertiesPanel.appendChild(renderField('Entity ID', item.entity || '', (val) => {
       pushHistory();
       item.entity = val;
+      refreshHaStates();
     }));
     propertiesPanel.appendChild(renderField('Label', item.label || '', (val) => {
       pushHistory();
@@ -800,24 +939,29 @@ function renderProperties() {
     propertiesPanel.appendChild(renderField('Temperature Entity', item.temperature_entity || '', (val) => {
       pushHistory();
       item.temperature_entity = val;
+      refreshHaStates();
     }));
     propertiesPanel.appendChild(renderField('Setpoint Entity', item.setpoint_entity || '', (val) => {
       pushHistory();
       item.setpoint_entity = val;
+      refreshHaStates();
     }));
     propertiesPanel.appendChild(renderField('Setpoint Low Entity', item.setpoint_low_entity || '', (val) => {
       pushHistory();
       item.setpoint_low_entity = val;
+      refreshHaStates();
     }));
     propertiesPanel.appendChild(renderField('Setpoint High Entity', item.setpoint_high_entity || '', (val) => {
       pushHistory();
       item.setpoint_high_entity = val;
+      refreshHaStates();
     }));
     propertiesPanel.appendChild(renderField('Mode Entity', item.mode_entity || '', (val) => {
       pushHistory();
       item.mode_entity = val;
+      refreshHaStates();
     }));
-    propertiesPanel.appendChild(renderField('Preview Mode', item.preview_mode || 'heat_cool', (val) => {
+    propertiesPanel.appendChild(renderField('Preview Mode (editor only)', item.preview_mode || 'heat_cool', (val) => {
       pushHistory();
       item.preview_mode = val;
     }, ['heat', 'cool', 'heat_cool', 'auto', 'off']));
@@ -1079,6 +1223,7 @@ floorTabs.forEach((tab) => {
     updateFloorTabs();
     renderProperties();
     render();
+    refreshHaStates();
   });
 });
 
@@ -1091,6 +1236,7 @@ newBtn.addEventListener('click', () => {
   pushHistory();
   setFloorplan(createDefaultFloorplan(state.floorId));
   setStatus(`Created new ${state.floorId}.`);
+  refreshHaStates();
 });
 
 saveBtn.addEventListener('click', () => {

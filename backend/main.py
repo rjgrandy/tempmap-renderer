@@ -267,6 +267,21 @@ def test_ha() -> Dict:
     return {"status": "ok"}
 
 
+@app.get("/api/ha/states")
+def get_ha_states(entities: Optional[str] = None) -> Dict[str, Dict[str, str]]:
+    if not entities:
+        return {"states": {}}
+    entity_list = [e.strip() for e in entities.split(",") if e.strip()]
+    if not entity_list:
+        return {"states": {}}
+    with ha_lock:
+        states = {
+            entity: ha_states.get(entity).state if ha_states.get(entity) else "n/a"
+            for entity in entity_list
+        }
+    return {"states": states}
+
+
 @app.get("/render/live/{floor_id}.png")
 def render_live_png(floor_id: str) -> Response:
     image = render_floorplan(floor_id)
@@ -340,8 +355,12 @@ def gather_entities(floorplans: Dict[str, Dict]) -> List[str]:
         for thermo in floorplan.get("thermostats", []):
             entities.append(thermo.get("temperature_entity"))
             entities.append(thermo.get("setpoint_entity"))
+            entities.append(thermo.get("setpoint_low_entity"))
+            entities.append(thermo.get("setpoint_high_entity"))
             if thermo.get("mode_entity"):
                 entities.append(thermo.get("mode_entity"))
+        render_cfg = floorplan.get("render", {})
+        entities.append(render_cfg.get("outside_temp_entity"))
     return sorted({e for e in entities if e})
 
 def poll_home_assistant(entities: List[str]) -> None:
@@ -698,8 +717,14 @@ def render_floorplan_image(floor_id: str, payload: Dict, grid: np.ndarray, metad
             # Actually we just crop at the end, that's fine.
     
     # Legend/Timestamp margin
-    if fp.render.show_legend or fp.render.show_timestamp:
-        canvas = add_exterior_margin(canvas, fp.render.exterior_margin, fp.render.show_timestamp, fp.render.show_legend)
+    if fp.render.show_legend or fp.render.show_timestamp or fp.render.show_outside_temp:
+        canvas = add_exterior_margin(
+            canvas,
+            fp.render.exterior_margin,
+            fp.render.show_timestamp,
+            fp.render.show_legend,
+            fp.render.show_outside_temp,
+        )
         draw = ImageDraw.Draw(canvas)
     
     if fp.render.show_outside_temp:
@@ -819,8 +844,14 @@ def resolve_temperature_range(fp: FloorplanV1, grid: np.ndarray) -> Tuple[float,
     if min_f >= max_f: max_f = min_f + 0.1
     return min_f, max_f
 
-def add_exterior_margin(image: Image.Image, margin: int, show_ts: bool, show_legend: bool) -> Image.Image:
-    top = margin if show_ts else margin // 2
+def add_exterior_margin(
+    image: Image.Image,
+    margin: int,
+    show_ts: bool,
+    show_legend: bool,
+    show_outside_temp: bool,
+) -> Image.Image:
+    top = margin if show_ts or show_outside_temp else margin // 2
     bottom = margin + 60 if show_legend else margin // 2
     new_width = image.width + margin * 2
     new_height = image.height + top + bottom
