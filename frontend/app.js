@@ -43,6 +43,10 @@ const defaultRender = () => ({
   show_labels: true,
   show_legend: true,
   show_timestamp: true,
+  show_outside_temp: true,
+  outside_temp_label: 'Outside',
+  outside_temp_entity: '',
+  outside_temp_f: 72,
 });
 
 const defaultSolver = () => ({
@@ -68,6 +72,7 @@ function createDefaultFloorplan(floorId) {
     doors: [],
     sensors: [],
     thermostats: [],
+    room_labels: [],
     stairwell: null,
     render: defaultRender(),
     solver: defaultSolver(),
@@ -295,6 +300,11 @@ function hitTest(point) {
       return { type: 'thermostat', id: thermo.id };
     }
   }
+  for (const label of (fp.room_labels || [])) {
+    if (Math.hypot(point[0] - label.pos[0], point[1] - label.pos[1]) <= threshold) {
+      return { type: 'room_label', id: label.id };
+    }
+  }
   for (const door of (fp.doors || [])) {
     if (distanceToSegment(point, door.segment[0], door.segment[1]) <= threshold) {
       return { type: 'door', id: door.id };
@@ -327,6 +337,9 @@ function findById(type, id) {
   if (type === 'thermostat') {
     return (fp.thermostats || []).find((thermo) => thermo.id === id);
   }
+  if (type === 'room_label') {
+    return (fp.room_labels || []).find((label) => label.id === id);
+  }
   if (type === 'stairwell') {
     return fp.stairwell;
   }
@@ -348,6 +361,8 @@ function removeSelected() {
     fp.sensors = (fp.sensors || []).filter((sensor) => sensor.id !== id);
   } else if (type === 'thermostat') {
     fp.thermostats = (fp.thermostats || []).filter((thermo) => thermo.id !== id);
+  } else if (type === 'room_label') {
+    fp.room_labels = (fp.room_labels || []).filter((label) => label.id !== id);
   } else if (type === 'stairwell') {
     fp.stairwell = null;
   }
@@ -412,8 +427,9 @@ function renderDoors(fp) {
 
 function renderSensors(fp) {
   ctx.fillStyle = '#ffffff';
-  ctx.font = `${12 / state.view.scale}px sans-serif`;
   (fp.sensors || []).forEach((sensor) => {
+    const fontSize = (sensor.font_size || 12) / state.view.scale;
+    ctx.font = `${fontSize}px sans-serif`;
     ctx.beginPath();
     ctx.arc(sensor.pos[0], sensor.pos[1], 6 / state.view.scale, 0, Math.PI * 2);
     ctx.fill();
@@ -425,7 +441,7 @@ function renderSensors(fp) {
       
       ctx.fillText(label, sensor.pos[0] + offX, sensor.pos[1] + offY);
       // Mockup of second line (visual only, real rendering is in backend)
-      ctx.fillText("72.0F", sensor.pos[0] + offX, sensor.pos[1] + offY + (14/state.view.scale));
+      ctx.fillText('72.0F', sensor.pos[0] + offX, sensor.pos[1] + offY + ((sensor.font_size + 2) / state.view.scale));
     }
   });
 }
@@ -433,18 +449,43 @@ function renderSensors(fp) {
 function renderThermostats(fp) {
   ctx.strokeStyle = '#f5c542';
   ctx.lineWidth = 2 / state.view.scale;
-  ctx.font = `${12 / state.view.scale}px sans-serif`;
   (fp.thermostats || []).forEach((thermo) => {
+    const fontSize = (thermo.font_size || 12) / state.view.scale;
+    ctx.font = `${fontSize}px sans-serif`;
     ctx.strokeRect(thermo.pos[0] - 7 / state.view.scale, thermo.pos[1] - 7 / state.view.scale, 14 / state.view.scale, 14 / state.view.scale);
     if (fp.render.show_labels) {
       const label = thermo.device_label || 'Thermostat';
       ctx.fillStyle = '#f5c542';
       const offX = (thermo.label_offset_x || 12) / state.view.scale;
       const offY = (thermo.label_offset_y || -8) / state.view.scale;
-      
+
+      const mode = (thermo.preview_mode || 'heat_cool').toLowerCase();
+      const tempLine = '72.0F';
+      const setpointLine = mode === 'heat'
+        ? '68.0F'
+        : mode === 'cool'
+          ? '74.0F'
+          : '68.0F / 74.0F';
+
       ctx.fillText(label, thermo.pos[0] + offX, thermo.pos[1] + offY);
-      ctx.fillText("72.0 / 74.0", thermo.pos[0] + offX, thermo.pos[1] + offY + (14/state.view.scale));
+      ctx.fillText(
+        `${tempLine} / ${setpointLine}${mode ? ` (${mode})` : ''}`,
+        thermo.pos[0] + offX,
+        thermo.pos[1] + offY + ((thermo.font_size + 2) / state.view.scale),
+      );
     }
+  });
+}
+
+function renderRoomLabels(fp) {
+  ctx.fillStyle = '#ffffff';
+  (fp.room_labels || []).forEach((label) => {
+    if (!label.label) return;
+    const fontSize = (label.font_size || 16) / state.view.scale;
+    ctx.font = `${fontSize}px sans-serif`;
+    const offX = (label.label_offset_x || 0) / state.view.scale;
+    const offY = (label.label_offset_y || 0) / state.view.scale;
+    ctx.fillText(label.label, label.pos[0] + offX, label.pos[1] + offY);
   });
 }
 
@@ -478,6 +519,9 @@ function renderSelection() {
   if (state.selected.type === 'sensor' || state.selected.type === 'thermostat') {
     const pos = item.pos;
     ctx.strokeRect(pos[0] - 10 / state.view.scale, pos[1] - 10 / state.view.scale, 20 / state.view.scale, 20 / state.view.scale);
+  } else if (state.selected.type === 'room_label') {
+    const pos = item.pos;
+    ctx.strokeRect(pos[0] - 12 / state.view.scale, pos[1] - 12 / state.view.scale, 24 / state.view.scale, 24 / state.view.scale);
   } else if (state.selected.type === 'door') {
     ctx.beginPath();
     ctx.moveTo(item.segment[0][0], item.segment[0][1]);
@@ -566,10 +610,34 @@ function render() {
   renderStairwell(fp);
   renderSensors(fp);
   renderThermostats(fp);
+  renderRoomLabels(fp);
   renderDrawingPreview();
   renderSelection();
 
   ctx.setTransform(1, 0, 0, 1, 0, 0);
+  renderOutsideTemperature(fp);
+}
+
+function renderOutsideTemperature(fp) {
+  if (!fp.render?.show_outside_temp) {
+    return;
+  }
+  const label = fp.render.outside_temp_label || 'Outside';
+  let tempValue = '';
+  if (fp.render.outside_temp_f !== null && fp.render.outside_temp_f !== undefined) {
+    const outsideTemp = Number(fp.render.outside_temp_f);
+    if (Number.isFinite(outsideTemp)) {
+      tempValue = `${outsideTemp.toFixed(1)}F`;
+    }
+  } else if (fp.render.outside_temp_entity) {
+    tempValue = 'n/a';
+  }
+  if (!tempValue) {
+    return;
+  }
+  ctx.fillStyle = '#ffffff';
+  ctx.font = '12px sans-serif';
+  ctx.fillText(`${label}: ${tempValue}`, 16, 20);
 }
 
 function renderProperties() {
@@ -595,6 +663,27 @@ function renderProperties() {
       pushHistory();
       fp.scale.px_per_meter = parseFloat(val) || fp.scale.px_per_meter;
       render();
+    }));
+
+    const outsideTitle = document.createElement('h3');
+    outsideTitle.textContent = 'Outside Temperature';
+    outsideTitle.style.marginTop = '20px';
+    propertiesPanel.appendChild(outsideTitle);
+    propertiesPanel.appendChild(renderField('Show Outside Temp', fp.render.show_outside_temp ? 'true' : 'false', (val) => {
+      pushHistory();
+      fp.render.show_outside_temp = val === 'true';
+    }, ['true', 'false']));
+    propertiesPanel.appendChild(renderField('Outside Label', fp.render.outside_temp_label || 'Outside', (val) => {
+      pushHistory();
+      fp.render.outside_temp_label = val;
+    }));
+    propertiesPanel.appendChild(renderField('Outside Temp Entity', fp.render.outside_temp_entity || '', (val) => {
+      pushHistory();
+      fp.render.outside_temp_entity = val;
+    }));
+    propertiesPanel.appendChild(renderField('Outside Temp (F)', fp.render.outside_temp_f ?? '', (val) => {
+      pushHistory();
+      fp.render.outside_temp_f = val === '' ? null : parseFloat(val);
     }));
 
     if (state.backgroundImage) {
@@ -708,18 +797,30 @@ function renderProperties() {
       pushHistory();
       item.device_label = val;
     }));
-    propertiesPanel.appendChild(renderField('Temperature Entity', item.temperature_entity, (val) => {
+    propertiesPanel.appendChild(renderField('Temperature Entity', item.temperature_entity || '', (val) => {
       pushHistory();
       item.temperature_entity = val;
     }));
-    propertiesPanel.appendChild(renderField('Setpoint Entity', item.setpoint_entity, (val) => {
+    propertiesPanel.appendChild(renderField('Setpoint Entity', item.setpoint_entity || '', (val) => {
       pushHistory();
       item.setpoint_entity = val;
+    }));
+    propertiesPanel.appendChild(renderField('Setpoint Low Entity', item.setpoint_low_entity || '', (val) => {
+      pushHistory();
+      item.setpoint_low_entity = val;
+    }));
+    propertiesPanel.appendChild(renderField('Setpoint High Entity', item.setpoint_high_entity || '', (val) => {
+      pushHistory();
+      item.setpoint_high_entity = val;
     }));
     propertiesPanel.appendChild(renderField('Mode Entity', item.mode_entity || '', (val) => {
       pushHistory();
       item.mode_entity = val;
     }));
+    propertiesPanel.appendChild(renderField('Preview Mode', item.preview_mode || 'heat_cool', (val) => {
+      pushHistory();
+      item.preview_mode = val;
+    }, ['heat', 'cool', 'heat_cool', 'auto', 'off']));
     
     // NEW: Font Size & Position
     propertiesPanel.appendChild(renderField('Font Size', item.font_size || 12, (val) => {
@@ -733,6 +834,28 @@ function renderProperties() {
     propertiesPanel.appendChild(renderField('Label Offset Y', item.label_offset_y || -8, (val) => {
         pushHistory();
         item.label_offset_y = parseInt(val) || 0;
+    }));
+  }
+  if (state.selected.type === 'room_label') {
+    propertiesPanel.appendChild(renderField('Room Label ID', item.id, (val) => {
+      pushHistory();
+      item.id = val;
+    }));
+    propertiesPanel.appendChild(renderField('Label', item.label || '', (val) => {
+      pushHistory();
+      item.label = val;
+    }));
+    propertiesPanel.appendChild(renderField('Font Size', item.font_size || 16, (val) => {
+      pushHistory();
+      item.font_size = parseInt(val) || 16;
+    }));
+    propertiesPanel.appendChild(renderField('Label Offset X', item.label_offset_x || 0, (val) => {
+      pushHistory();
+      item.label_offset_x = parseInt(val) || 0;
+    }));
+    propertiesPanel.appendChild(renderField('Label Offset Y', item.label_offset_y || 0, (val) => {
+      pushHistory();
+      item.label_offset_y = parseInt(val) || 0;
     }));
   }
   if (state.selected.type === 'stairwell') {
@@ -857,14 +980,34 @@ function createThermostat(point) {
     pos: point,
     temperature_entity: '',
     setpoint_entity: '',
+    setpoint_low_entity: '',
+    setpoint_high_entity: '',
     mode_entity: '',
     device_label: '',
     label_offset_x: 12,
     label_offset_y: -8,
     font_size: 12,
+    preview_mode: 'heat_cool',
   };
   fp.thermostats.push(thermo);
   state.selected = { type: 'thermostat', id: thermo.id };
+  renderProperties();
+  render();
+}
+
+function createRoomLabel(point) {
+  const fp = currentFloorplan();
+  pushHistory();
+  const label = {
+    id: ensureId('room_label'),
+    pos: point,
+    label: 'Room',
+    font_size: 16,
+    label_offset_x: 0,
+    label_offset_y: 0,
+  };
+  fp.room_labels.push(label);
+  state.selected = { type: 'room_label', id: label.id };
   renderProperties();
   render();
 }
@@ -893,7 +1036,7 @@ function beginMoveDrag(hit, startWorld) {
   const item = findById(hit.type, hit.id);
   if (!item) return;
   const dragState = { type: 'move', itemType: hit.type, id: hit.id, start: startWorld };
-  if (hit.type === 'sensor' || hit.type === 'thermostat') {
+  if (hit.type === 'sensor' || hit.type === 'thermostat' || hit.type === 'room_label') {
     dragState.original = { pos: [...item.pos] };
   } else if (hit.type === 'door') {
     dragState.original = { segment: item.segment.map((pt) => [...pt]) };
@@ -910,7 +1053,7 @@ function updateMoveDrag(world) {
   const delta = [world[0] - state.dragging.start[0], world[1] - state.dragging.start[1]];
   const item = findById(state.dragging.itemType, state.dragging.id);
   if (!item) return;
-  if (state.dragging.itemType === 'sensor' || state.dragging.itemType === 'thermostat') {
+  if (state.dragging.itemType === 'sensor' || state.dragging.itemType === 'thermostat' || state.dragging.itemType === 'room_label') {
     item.pos = [state.dragging.original.pos[0] + delta[0], state.dragging.original.pos[1] + delta[1]];
   } else if (state.dragging.itemType === 'door') {
     item.segment = state.dragging.original.segment.map((pt) => [pt[0] + delta[0], pt[1] + delta[1]]);
@@ -1044,6 +1187,11 @@ canvas.addEventListener('mousedown', (event) => {
 
   if (state.tool === 'thermostat') {
     createThermostat(snapped);
+    return;
+  }
+
+  if (state.tool === 'room_label') {
+    createRoomLabel(snapped);
     return;
   }
 
