@@ -24,7 +24,7 @@ const state = {
   history: { past: [], future: [] },
   spacePressed: false,
 
-  // NEW: Background Image State
+  // Background Image State
   backgroundImage: null,
   background: { x: 0, y: 0, scale: 1.0, opacity: 0.5 },
 };
@@ -208,7 +208,6 @@ function hitTest(point) {
   const fp = currentFloorplan();
   const threshold = 10 / state.view.scale;
   
-  // Robust checks: ensure arrays exist
   for (const sensor of (fp.sensors || [])) {
     if (Math.hypot(point[0] - sensor.pos[0], point[1] - sensor.pos[1]) <= threshold) {
       return { type: 'sensor', id: sensor.id };
@@ -309,7 +308,6 @@ function renderGrid(worldBounds) {
 function renderWalls(fp) {
   ctx.strokeStyle = '#f0f0f0';
   ctx.lineWidth = 4 / state.view.scale;
-  // Safety Check: (fp.walls || [])
   (fp.walls || []).forEach((wall) => {
     if (wall.points.length < 2) return;
     ctx.beginPath();
@@ -327,7 +325,6 @@ function renderWalls(fp) {
 function renderDoors(fp) {
   ctx.strokeStyle = '#4ea1ff';
   ctx.lineWidth = 5 / state.view.scale;
-  // Safety Check: (fp.doors || [])
   (fp.doors || []).forEach((door) => {
     ctx.beginPath();
     ctx.moveTo(door.segment[0][0], door.segment[0][1]);
@@ -339,14 +336,16 @@ function renderDoors(fp) {
 function renderSensors(fp) {
   ctx.fillStyle = '#ffffff';
   ctx.font = `${12 / state.view.scale}px sans-serif`;
-  // Safety Check
   (fp.sensors || []).forEach((sensor) => {
     ctx.beginPath();
     ctx.arc(sensor.pos[0], sensor.pos[1], 6 / state.view.scale, 0, Math.PI * 2);
     ctx.fill();
     if (fp.render.show_labels) {
       const label = sensor.label || sensor.entity || '';
-      ctx.fillText(label, sensor.pos[0] + 10 / state.view.scale, sensor.pos[1] - 8 / state.view.scale);
+      // Visual preview only
+      const offX = (sensor.label_offset_x || 10) / state.view.scale;
+      const offY = (sensor.label_offset_y || -8) / state.view.scale;
+      ctx.fillText(label, sensor.pos[0] + offX, sensor.pos[1] + offY);
     }
   });
 }
@@ -355,13 +354,14 @@ function renderThermostats(fp) {
   ctx.strokeStyle = '#f5c542';
   ctx.lineWidth = 2 / state.view.scale;
   ctx.font = `${12 / state.view.scale}px sans-serif`;
-  // Safety Check
   (fp.thermostats || []).forEach((thermo) => {
     ctx.strokeRect(thermo.pos[0] - 7 / state.view.scale, thermo.pos[1] - 7 / state.view.scale, 14 / state.view.scale, 14 / state.view.scale);
     if (fp.render.show_labels) {
       const label = thermo.device_label || 'Thermostat';
       ctx.fillStyle = '#f5c542';
-      ctx.fillText(label, thermo.pos[0] + 12 / state.view.scale, thermo.pos[1] - 8 / state.view.scale);
+      const offX = (thermo.label_offset_x || 12) / state.view.scale;
+      const offY = (thermo.label_offset_y || -8) / state.view.scale;
+      ctx.fillText(label, thermo.pos[0] + offX, thermo.pos[1] + offY);
     }
   });
 }
@@ -465,22 +465,18 @@ function render() {
 
   ctx.setTransform(state.view.scale, 0, 0, state.view.scale, state.view.x, state.view.y);
 
-  // --- NEW: Render Background Image ---
   if (state.backgroundImage) {
     ctx.save();
     ctx.globalAlpha = state.background.opacity;
-    // Move to the background's specific coordinates and scale
     ctx.translate(state.background.x, state.background.y);
     ctx.scale(state.background.scale, state.background.scale);
     ctx.drawImage(state.backgroundImage, 0, 0);
     ctx.restore();
   }
-  // ------------------------------------
 
   renderGrid([worldLeft, worldTop, worldRight, worldBottom]);
   const fp = currentFloorplan();
   
-  // Render steps with safety inside the functions
   if (fp.render.show_walls) {
     renderWalls(fp);
   }
@@ -509,7 +505,6 @@ function renderProperties() {
       render();
     }));
 
-    // --- NEW: Background Controls ---
     if (state.backgroundImage) {
       const bgTitle = document.createElement('h3');
       bgTitle.textContent = 'Tracing Background';
@@ -533,7 +528,6 @@ function renderProperties() {
         render();
       }));
     }
-    // --------------------------------
     return;
   }
   const item = findById(state.selected.type, state.selected.id);
@@ -598,6 +592,15 @@ function renderProperties() {
       pushHistory();
       item.weight = parseFloat(val) || 1.0;
     }));
+    // NEW: Label Customization
+    propertiesPanel.appendChild(renderField('Label Offset X', item.label_offset_x || 10, (val) => {
+        pushHistory();
+        item.label_offset_x = parseInt(val) || 0;
+    }));
+    propertiesPanel.appendChild(renderField('Label Offset Y', item.label_offset_y || -8, (val) => {
+        pushHistory();
+        item.label_offset_y = parseInt(val) || 0;
+    }));
   }
   if (state.selected.type === 'thermostat') {
     propertiesPanel.appendChild(renderField('Thermostat ID', item.id, (val) => {
@@ -619,6 +622,15 @@ function renderProperties() {
     propertiesPanel.appendChild(renderField('Mode Entity', item.mode_entity || '', (val) => {
       pushHistory();
       item.mode_entity = val;
+    }));
+    // NEW: Label Customization
+    propertiesPanel.appendChild(renderField('Label Offset X', item.label_offset_x || 12, (val) => {
+        pushHistory();
+        item.label_offset_x = parseInt(val) || 0;
+    }));
+    propertiesPanel.appendChild(renderField('Label Offset Y', item.label_offset_y || -8, (val) => {
+        pushHistory();
+        item.label_offset_y = parseInt(val) || 0;
     }));
   }
   if (state.selected.type === 'stairwell') {
@@ -665,7 +677,6 @@ function renderField(labelText, value, onChange, options = null) {
   return wrapper;
 }
 
-// ROBUST FETCH: Handles missing floorplan data gracefully
 async function fetchFloorplanList() {
   try {
     const response = await fetch('/api/floorplans');
@@ -675,7 +686,6 @@ async function fetchFloorplanList() {
     }
     const data = await response.json();
     
-    // Safety check: ensure floorplans array exists
     if (!data.floorplans) {
        console.warn("No floorplans returned from API");
        return;
@@ -762,7 +772,7 @@ function startDrawing(point) {
         return;
       }
       pushHistory();
-      if (!fp.doors) fp.doors = []; // Init if missing
+      if (!fp.doors) fp.doors = [];
       fp.doors.push({
         id: ensureId('door'),
         segment: [state.drawing.start, point],
@@ -783,7 +793,7 @@ function finishDrawing() {
   if (!state.drawing) return;
   if (state.drawing.type === 'wall' && state.drawing.points.length > 1) {
     pushHistory();
-    if (!fp.walls) fp.walls = []; // Init if missing
+    if (!fp.walls) fp.walls = [];
     fp.walls.push({ id: ensureId('wall'), points: state.drawing.points });
   }
   if (state.drawing.type === 'stairwell' && state.drawing.points.length > 2) {
@@ -1057,7 +1067,7 @@ orthoToggle.addEventListener('change', () => {
   state.orthogonalSnap = orthoToggle.checked;
 });
 
-// NEW: Background Upload Handlers
+// Background Upload Handlers
 const bgUploadBtn = document.getElementById('bgUploadBtn');
 const bgUploadInput = document.getElementById('bgUpload');
 
