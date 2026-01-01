@@ -211,7 +211,13 @@ Floorplans live at `/data/floorplans/{floor_id}.json`.
     "show_walls": true,
     "show_labels": true,
     "show_legend": true,
-    "show_timestamp": true
+    "show_timestamp": true,
+    "show_outside_temp": true,
+    "outside_temp_label": "Outside",
+    "outside_temp_entity": "sensor.outdoor_temperature",
+    "outside_temp_f": null,
+    "text_font_size": null,
+    "text_font_path": null
   },
   "solver": {
     "grid_w": 400,
@@ -235,7 +241,11 @@ Floorplans live at `/data/floorplans/{floor_id}.json`.
 - **auto_crop**: trims extra blank space around the floorplan when rendering.
 - **crop_padding**: extra pixels to keep around the geometry when auto-cropping.
 - **exterior_margin**: padding outside the cropped floorplan used to draw the legend and timestamp.
-- **show_walls / show_labels / show_legend / show_timestamp**: toggles for overlay elements.
+- **show_walls / show_labels / show_legend / show_timestamp / show_outside_temp**: toggles for overlay elements.
+- **outside_temp_label**: label to show before the outside temperature.
+- **outside_temp_entity / outside_temp_f**: data source for the outside temperature value.
+- **text_font_size**: override size for all overlay text (uses per-item font sizes when unset).
+- **text_font_path**: optional font file path to use for all overlay text.
 
 > The heatmap is masked to the floorplan hull so areas outside the exterior walls are not colorized.
 > The solver clamps the final grid so values do not fall below the coldest sensor reading on the floor.
