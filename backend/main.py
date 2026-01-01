@@ -1211,7 +1211,7 @@ def render_heatmap(grid: np.ndarray, min_f: float, max_f: float, overlay_alpha: 
 
 
 def gradient_rgb(norm: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    stops = np.array([0.0, 0.25, 0.5, 0.75, 1.0])
+    stops = np.array([0.0, 0.4, 0.5, 0.6, 1.0])
     colors = np.array([
         [0, 0, 255], [0, 255, 255], [0, 255, 0], [255, 255, 0], [255, 0, 0]
     ], dtype=float)
