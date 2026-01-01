@@ -136,6 +136,8 @@ class RenderParams(BaseModel):
     outside_temp_label: str = "Outside"
     outside_temp_entity: Optional[str] = None
     outside_temp_f: Optional[float] = None
+    text_font_size: Optional[int] = None
+    text_font_path: Optional[str] = None
 
 
 class RoomLabel(BaseModel):
@@ -1101,19 +1103,23 @@ def render_floorplan_image(floor_id: str, payload: Dict, grid: np.ndarray, metad
     
     # Legend/Timestamp margin
     if fp.render.show_legend or fp.render.show_timestamp or fp.render.show_outside_temp:
+        top_padding = fp.render.exterior_margin + compute_text_block_height(fp) if (fp.render.show_timestamp or fp.render.show_outside_temp) else 0
         canvas = add_exterior_margin(
             canvas,
             fp.render.exterior_margin,
-            fp.render.show_timestamp,
+            top_padding,
             fp.render.show_legend,
-            fp.render.show_outside_temp,
         )
         draw = ImageDraw.Draw(canvas)
     
+    timestamp_height = 0
+    if fp.render.show_timestamp:
+        timestamp_height = draw_timestamp(draw, fp, fp.render.exterior_margin)
     if fp.render.show_outside_temp:
-        draw_outside_temperature(draw, fp, canvas.size)
-    if fp.render.show_legend: draw_legend(draw, min_f, max_f, canvas.size, fp.render.exterior_margin)
-    if fp.render.show_timestamp: draw_timestamp(draw, fp.render.exterior_margin)
+        outside_offset = fp.render.exterior_margin + (timestamp_height + 4 if timestamp_height else 0)
+        draw_outside_temperature(draw, fp, canvas.size, min_f, max_f, outside_offset)
+    if fp.render.show_legend:
+        draw_legend(draw, min_f, max_f, canvas.size, fp.render.exterior_margin, fp)
     return canvas.convert("RGB")
 
 def build_floorplan_mask_floodfill(fp: FloorplanV1) -> np.ndarray:
@@ -1212,7 +1218,6 @@ def gradient_rgb(norm: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     idx = np.searchsorted(stops, norm, side="right") - 1
     idx = np.clip(idx, 0, len(stops) - 2)
     t = (norm - stops[idx]) / (stops[idx + 1] - stops[idx])
-    t = t * t * (3.0 - 2.0 * t)
     c0 = colors[idx]
     c1 = colors[idx + 1]
     blended = c0 + (c1 - c0) * t[..., None]
@@ -1230,11 +1235,10 @@ def resolve_temperature_range(fp: FloorplanV1, grid: np.ndarray) -> Tuple[float,
 def add_exterior_margin(
     image: Image.Image,
     margin: int,
-    show_ts: bool,
+    top_padding: int,
     show_legend: bool,
-    show_outside_temp: bool,
 ) -> Image.Image:
-    top = margin if show_ts or show_outside_temp else margin // 2
+    top = top_padding if top_padding > 0 else margin // 2
     bottom = margin + 60 if show_legend else margin // 2
     new_width = image.width + margin * 2
     new_height = image.height + top + bottom
@@ -1271,7 +1275,7 @@ def draw_sensors(draw: ImageDraw.ImageDraw, fp: FloorplanV1) -> None:
             temp_val = format_entity_temperature(sensor.entity)
             
             # Helper to get the actual font object (with size)
-            font = get_font(sensor.font_size)
+            font, font_size = resolve_font(fp, sensor.font_size)
             
             # New Logic: Multiline
             lines = []
@@ -1284,7 +1288,7 @@ def draw_sensors(draw: ImageDraw.ImageDraw, fp: FloorplanV1) -> None:
             for line in lines:
                 draw.text((x + off_x, current_y), line, fill=(255, 255, 255), font=font)
                 # Approximate line height = font_size + 2
-                current_y += (sensor.font_size + 2)
+                current_y += (font_size + 2)
 
 def draw_thermostats(draw: ImageDraw.ImageDraw, fp: FloorplanV1) -> None:
     for thermo in fp.thermostats:
@@ -1321,7 +1325,7 @@ def draw_thermostats(draw: ImageDraw.ImageDraw, fp: FloorplanV1) -> None:
             if mode:
                 temp_line = f"{temp_line} ({mode})" if temp_line else mode
             
-            font = get_font(thermo.font_size)
+            font, font_size = resolve_font(fp, thermo.font_size)
 
             lines = [name_line]
             if temp_line:
@@ -1332,35 +1336,52 @@ def draw_thermostats(draw: ImageDraw.ImageDraw, fp: FloorplanV1) -> None:
             
             for line in lines:
                 draw.text((x + off_x, current_y), line, fill=(255, 200, 50), font=font)
-                current_y += (thermo.font_size + 2)
+                current_y += (font_size + 2)
 
 def draw_room_labels(draw: ImageDraw.ImageDraw, fp: FloorplanV1) -> None:
     for label in fp.room_labels:
         if not label.label:
             continue
         x, y = point_xy(label.pos)
-        font = get_font(label.font_size)
+        font, _font_size = resolve_font(fp, label.font_size)
         draw.text((x + label.label_offset_x, y + label.label_offset_y), label.label, fill=(255, 255, 255), font=font)
 
-def draw_outside_temperature(draw: ImageDraw.ImageDraw, fp: FloorplanV1, size: Tuple[int, int]) -> None:
+def draw_outside_temperature(
+    draw: ImageDraw.ImageDraw,
+    fp: FloorplanV1,
+    size: Tuple[int, int],
+    min_f: float,
+    max_f: float,
+    top_offset: int,
+) -> None:
+    outside_temp_value = None
     if fp.render.outside_temp_entity:
-        outside_temp = format_entity_temperature(fp.render.outside_temp_entity)
+        outside_temp_value = read_entity_temperature_value(fp.render.outside_temp_entity)
     elif fp.render.outside_temp_f is not None:
-        outside_temp = f"{fp.render.outside_temp_f:.1f}F"
-    else:
-        outside_temp = ""
-    if not outside_temp:
+        outside_temp_value = fp.render.outside_temp_f
+    if outside_temp_value is None:
         return
-    font = ImageFont.load_default()
+    outside_temp = f"{outside_temp_value:.1f}F"
+    font, font_size = resolve_font(fp, 12)
     label = fp.render.outside_temp_label.strip() or "Outside"
     text = f"{label}: {outside_temp}"
     margin = fp.render.exterior_margin
-    draw.text((margin, margin + 16), text, fill=(255, 255, 255), font=font)
+    box_size = max(10, int(font_size * 0.8))
+    box_y = top_offset + max(0, (font_size - box_size) // 2)
+    color = color_for_temperature(outside_temp_value, min_f, max_f)
+    draw.rectangle(
+        (margin, box_y, margin + box_size, box_y + box_size),
+        fill=color,
+        outline=(255, 255, 255),
+        width=1,
+    )
+    draw.text((margin + box_size + 6, top_offset), text, fill=(255, 255, 255), font=font)
 
-def get_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+def get_font(size: int, font_path: Optional[str] = None) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     """Tries to load a scalable font. Falls back to default if unavailable."""
     # Common paths for DejaVuSans on Linux/Debian
-    candidates = [
+    candidates = [font_path] if font_path else []
+    candidates += [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/TTF/DejaVuSans.ttf",
         "DejaVuSans.ttf"
@@ -1373,6 +1394,21 @@ def get_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     # Fallback to default (size is ignored)
     return ImageFont.load_default()
 
+def resolve_font(fp: FloorplanV1, default_size: int) -> Tuple[ImageFont.FreeTypeFont | ImageFont.ImageFont, int]:
+    size = fp.render.text_font_size or default_size
+    return get_font(size, fp.render.text_font_path), size
+
+def read_entity_temperature_value(entity_id: Optional[str]) -> Optional[float]:
+    if not entity_id:
+        return None
+    state = read_entity_state(entity_id)
+    if state == "n/a":
+        return None
+    try:
+        return float(state)
+    except ValueError:
+        return None
+
 def read_entity_state(entity_id: str) -> str:
     with ha_lock: state = ha_states.get(entity_id)
     return state.state if state else "n/a"
@@ -1384,8 +1420,8 @@ def format_entity_temperature(entity_id: Optional[str]) -> str:
     try: return f"{float(state):.1f}F"
     except ValueError: return ""
 
-def draw_legend(draw: ImageDraw.ImageDraw, min_f: float, max_f: float, size: Tuple[int, int], margin: int) -> None:
-    font = ImageFont.load_default()
+def draw_legend(draw: ImageDraw.ImageDraw, min_f: float, max_f: float, size: Tuple[int, int], margin: int, fp: FloorplanV1) -> None:
+    font, font_size = resolve_font(fp, 12)
     x0, y0 = margin, size[1] - 80
     x1, y1 = x0 + 200, size[1] - 40
     for i in range(x0, x1):
@@ -1393,13 +1429,53 @@ def draw_legend(draw: ImageDraw.ImageDraw, min_f: float, max_f: float, size: Tup
         r, g, b = gradient_rgb(np.array([t]))
         draw.line([(i, y0), (i, y1)], fill=(int(r[0]), int(g[0]), int(b[0])))
     draw.rectangle((x0, y0, x1, y1), outline=(255, 255, 255), width=1)
-    draw.text((x0, y0 - 18), f"{min_f:.1f}F", fill=(255, 255, 255), font=font)
-    draw.text((x1 - 48, y0 - 18), f"{max_f:.1f}F", fill=(255, 255, 255), font=font)
+    label_offset = font_size + 4
+    draw.text((x0, y0 - label_offset), f"{min_f:.1f}F", fill=(255, 255, 255), font=font)
+    draw.text((x1 - 48, y0 - label_offset), f"{max_f:.1f}F", fill=(255, 255, 255), font=font)
 
-def draw_timestamp(draw: ImageDraw.ImageDraw, margin: int) -> None:
-    font = ImageFont.load_default()
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    draw.text((margin, margin), timestamp, fill=(255, 255, 255), font=font)
+def build_timestamp_lines() -> List[str]:
+    now = datetime.now()
+    date_line = f"{now:%a}, {now:%b} {now.day}, {now:%Y}"
+    time_line = now.strftime("%I:%M%p").lstrip("0")
+    return [date_line, time_line]
+
+def measure_multiline_height(line_count: int, font_size: int, spacing: int) -> int:
+    if line_count <= 0:
+        return 0
+    return (font_size * line_count) + (spacing * (line_count - 1))
+
+def compute_text_block_height(fp: FloorplanV1) -> int:
+    font_size = fp.render.text_font_size or 12
+    spacing = max(2, int(font_size * 0.2))
+    height = 0
+    if fp.render.show_timestamp:
+        height += measure_multiline_height(2, font_size, spacing)
+    if fp.render.show_outside_temp:
+        if height:
+            height += 4
+        height += font_size
+    return height
+
+def draw_timestamp(draw: ImageDraw.ImageDraw, fp: FloorplanV1, margin: int) -> int:
+    font, font_size = resolve_font(fp, 12)
+    spacing = max(2, int(font_size * 0.2))
+    lines = build_timestamp_lines()
+    draw.multiline_text(
+        (margin, margin),
+        "\n".join(lines),
+        fill=(255, 255, 255),
+        font=font,
+        spacing=spacing,
+    )
+    return measure_multiline_height(len(lines), font_size, spacing)
+
+def color_for_temperature(value_f: float, min_f: float, max_f: float) -> Tuple[int, int, int]:
+    if min_f >= max_f:
+        return (255, 255, 255)
+    t = (value_f - min_f) / (max_f - min_f)
+    t = float(np.clip(t, 0, 1))
+    r, g, b = gradient_rgb(np.array([t]))
+    return int(r[0]), int(g[0]), int(b[0])
 
 def image_to_png_bytes(image: Image.Image) -> bytes:
     output = io.BytesIO()
