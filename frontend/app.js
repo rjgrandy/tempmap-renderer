@@ -691,10 +691,84 @@ function findWallVertexHit(point, threshold) {
   return null;
 }
 
+function pointInTextBounds(point, text, fontSizeWorld, align, x, y) {
+  if (!text) return false;
+  const width = measureTextWidth(fontSizeWorld, text);
+  const height = fontSizeWorld;
+  let left = x;
+  if (align === 'center') {
+    left = x - width / 2;
+  } else if (align === 'right') {
+    left = x - width;
+  }
+  const padding = 3 / state.view.scale;
+  const top = y - height;
+  return (
+    point[0] >= left - padding
+    && point[0] <= left + width + padding
+    && point[1] >= top - padding
+    && point[1] <= y + padding
+  );
+}
+
+function labelHitTest(point) {
+  const fp = currentFloorplan();
+  for (const sensor of (fp.sensors || [])) {
+    const lines = getSensorLabelLines(sensor);
+    if (!lines.length) continue;
+    const fontSizeWorld = (sensor.font_size || 12) / state.view.scale;
+    const align = getLabelAlignment(sensor);
+    const offX = (sensor.label_offset_x || 10) / state.view.scale;
+    const offY = (sensor.label_offset_y || -8) / state.view.scale;
+    const lineHeight = (sensor.font_size + 2) / state.view.scale;
+    for (let i = 0; i < lines.length; i += 1) {
+      const y = sensor.pos[1] + offY + i * lineHeight;
+      const x = sensor.pos[0] + offX;
+      if (pointInTextBounds(point, lines[i], fontSizeWorld, align, x, y)) {
+        return { type: 'sensor', id: sensor.id, target: 'label' };
+      }
+    }
+  }
+  for (const thermo of (fp.thermostats || [])) {
+    const lines = getThermostatLabelLines(thermo);
+    if (!lines.length) continue;
+    const fontSizeWorld = (thermo.font_size || 12) / state.view.scale;
+    const align = getLabelAlignment(thermo);
+    const offX = (thermo.label_offset_x || 12) / state.view.scale;
+    const offY = (thermo.label_offset_y || -8) / state.view.scale;
+    const lineHeight = (thermo.font_size + 2) / state.view.scale;
+    for (let i = 0; i < lines.length; i += 1) {
+      const y = thermo.pos[1] + offY + i * lineHeight;
+      const x = thermo.pos[0] + offX;
+      if (pointInTextBounds(point, lines[i], fontSizeWorld, align, x, y)) {
+        return { type: 'thermostat', id: thermo.id, target: 'label' };
+      }
+    }
+  }
+  for (const label of (fp.room_labels || [])) {
+    if (!label.label) continue;
+    const fontSizeWorld = (label.font_size || 16) / state.view.scale;
+    const align = getLabelAlignment(label);
+    const offX = (label.label_offset_x || 0) / state.view.scale;
+    const offY = (label.label_offset_y || 0) / state.view.scale;
+    const x = label.pos[0] + offX;
+    const y = label.pos[1] + offY;
+    if (pointInTextBounds(point, label.label, fontSizeWorld, align, x, y)) {
+      return { type: 'room_label', id: label.id, target: 'label' };
+    }
+  }
+  return null;
+}
+
 function hitTest(point) {
   const fp = currentFloorplan();
   const threshold = 10 / state.view.scale;
-  
+
+  const labelHit = labelHitTest(point);
+  if (labelHit) {
+    return labelHit;
+  }
+
   for (const sensor of (fp.sensors || [])) {
     if (Math.hypot(point[0] - sensor.pos[0], point[1] - sensor.pos[1]) <= threshold) {
       return { type: 'sensor', id: sensor.id };
@@ -894,6 +968,82 @@ function renderDoors(fp) {
   });
 }
 
+function getLabelAlignment(item) {
+  return item.label_align || 'left';
+}
+
+function measureTextWidth(fontSize, text) {
+  ctx.save();
+  ctx.font = `${fontSize}px sans-serif`;
+  const width = ctx.measureText(text).width;
+  ctx.restore();
+  return width;
+}
+
+function getSensorLabelLines(sensor) {
+  const label = sensor.label || sensor.entity || '';
+  const tempValue = formatTemperatureFromState(sensor.entity);
+  const tempLine = tempValue || (sensor.entity ? 'n/a' : '');
+  return [label, tempLine].filter(Boolean);
+}
+
+function getThermostatLabelLines(thermo) {
+  const label = thermo.device_label || 'Thermostat';
+  const tempValue = formatTemperatureFromState(thermo.temperature_entity);
+  const setpointValue = formatTemperatureFromState(thermo.setpoint_entity);
+  const setpointLow = formatTemperatureFromState(thermo.setpoint_low_entity);
+  const setpointHigh = formatTemperatureFromState(thermo.setpoint_high_entity);
+  const modeState = readHaState(thermo.mode_entity);
+  const modeLower = modeState ? modeState.toLowerCase() : '';
+
+  let tempLine = '';
+  let modeLabel = modeState;
+  let setpointLine = '';
+  const hasEntityData = tempValue || setpointValue || setpointLow || setpointHigh || modeState;
+
+  if (hasEntityData) {
+    if (['heat_cool', 'auto'].includes(modeLower)) {
+      if (setpointLow && setpointHigh) {
+        setpointLine = `${setpointLow} / ${setpointHigh}`;
+      } else {
+        setpointLine = setpointLow || setpointHigh || setpointValue;
+      }
+    } else if (modeLower === 'heat') {
+      setpointLine = setpointValue || setpointLow;
+    } else if (modeLower === 'cool') {
+      setpointLine = setpointValue || setpointHigh;
+    } else {
+      setpointLine = setpointValue || setpointLow || setpointHigh;
+    }
+
+    const detailParts = [];
+    if (tempValue) {
+      detailParts.push(tempValue);
+    }
+    if (setpointLine) {
+      detailParts.push(setpointLine);
+    }
+    tempLine = detailParts.join(' / ');
+  } else {
+    const previewMode = (thermo.preview_mode || 'heat_cool').toLowerCase();
+    modeLabel = previewMode;
+    const previewTemp = '72.0F';
+    const previewSetpoint = previewMode === 'heat'
+      ? '68.0F'
+      : previewMode === 'cool'
+        ? '74.0F'
+        : '68.0F / 74.0F';
+    tempLine = `${previewTemp} / ${previewSetpoint}`;
+  }
+
+  let detailLine = tempLine;
+  if (modeLabel) {
+    detailLine = detailLine ? `${detailLine} (${modeLabel})` : modeLabel;
+  }
+
+  return [label, detailLine].filter(Boolean);
+}
+
 function renderSensors(fp) {
   ctx.fillStyle = '#ffffff';
   (fp.sensors || []).forEach((sensor) => {
@@ -903,23 +1053,18 @@ function renderSensors(fp) {
     ctx.arc(sensor.pos[0], sensor.pos[1], 6 / state.view.scale, 0, Math.PI * 2);
     ctx.fill();
     if (fp.render.show_labels) {
-      const label = sensor.label || sensor.entity || '';
-      
+      const labelLines = getSensorLabelLines(sensor);
+      ctx.textAlign = getLabelAlignment(sensor);
       const offX = (sensor.label_offset_x || 10) / state.view.scale;
       const offY = (sensor.label_offset_y || -8) / state.view.scale;
-      
-      const tempValue = formatTemperatureFromState(sensor.entity);
-      const tempLine = tempValue || (sensor.entity ? 'n/a' : '');
 
-      if (label) {
-        ctx.fillText(label, sensor.pos[0] + offX, sensor.pos[1] + offY);
-      }
-      if (tempLine) {
-        const lineOffset = label ? (sensor.font_size + 2) / state.view.scale : 0;
-        ctx.fillText(tempLine, sensor.pos[0] + offX, sensor.pos[1] + offY + lineOffset);
-      }
+      labelLines.forEach((line, index) => {
+        const lineOffset = index * ((sensor.font_size + 2) / state.view.scale);
+        ctx.fillText(line, sensor.pos[0] + offX, sensor.pos[1] + offY + lineOffset);
+      });
     }
   });
+  ctx.textAlign = 'left';
 }
 
 function renderThermostats(fp) {
@@ -930,76 +1075,23 @@ function renderThermostats(fp) {
     ctx.font = `${fontSize}px sans-serif`;
     ctx.strokeRect(thermo.pos[0] - 7 / state.view.scale, thermo.pos[1] - 7 / state.view.scale, 14 / state.view.scale, 14 / state.view.scale);
     if (fp.render.show_labels) {
-      const label = thermo.device_label || 'Thermostat';
       ctx.fillStyle = '#f5c542';
+      const labelLines = getThermostatLabelLines(thermo);
+      ctx.textAlign = getLabelAlignment(thermo);
       const offX = (thermo.label_offset_x || 12) / state.view.scale;
       const offY = (thermo.label_offset_y || -8) / state.view.scale;
 
-      const tempValue = formatTemperatureFromState(thermo.temperature_entity);
-      const setpointValue = formatTemperatureFromState(thermo.setpoint_entity);
-      const setpointLow = formatTemperatureFromState(thermo.setpoint_low_entity);
-      const setpointHigh = formatTemperatureFromState(thermo.setpoint_high_entity);
-      const modeState = readHaState(thermo.mode_entity);
-      const modeLower = modeState ? modeState.toLowerCase() : '';
-
-      let tempLine = '';
-      let modeLabel = modeState;
-      let setpointLine = '';
-      const hasEntityData = tempValue || setpointValue || setpointLow || setpointHigh || modeState;
-
-      if (hasEntityData) {
-        if (['heat_cool', 'auto'].includes(modeLower)) {
-          if (setpointLow && setpointHigh) {
-            setpointLine = `${setpointLow} / ${setpointHigh}`;
-          } else {
-            setpointLine = setpointLow || setpointHigh || setpointValue;
-          }
-        } else if (modeLower === 'heat') {
-          setpointLine = setpointValue || setpointLow;
-        } else if (modeLower === 'cool') {
-          setpointLine = setpointValue || setpointHigh;
-        } else {
-          setpointLine = setpointValue || setpointLow || setpointHigh;
-        }
-
-        const detailParts = [];
-        if (tempValue) {
-          detailParts.push(tempValue);
-        }
-        if (setpointLine) {
-          detailParts.push(setpointLine);
-        }
-        tempLine = detailParts.join(' / ');
-      } else {
-        const previewMode = (thermo.preview_mode || 'heat_cool').toLowerCase();
-        modeLabel = previewMode;
-        const previewTemp = '72.0F';
-        const previewSetpoint = previewMode === 'heat'
-          ? '68.0F'
-          : previewMode === 'cool'
-            ? '74.0F'
-            : '68.0F / 74.0F';
-        tempLine = `${previewTemp} / ${previewSetpoint}`;
-      }
-
-      let detailLine = tempLine;
-      if (modeLabel) {
-        detailLine = detailLine ? `${detailLine} (${modeLabel})` : modeLabel;
-      }
-
-      if (label) {
-        ctx.fillText(label, thermo.pos[0] + offX, thermo.pos[1] + offY);
-      }
-      if (detailLine) {
-        const lineOffset = label ? (thermo.font_size + 2) / state.view.scale : 0;
+      labelLines.forEach((line, index) => {
+        const lineOffset = index * ((thermo.font_size + 2) / state.view.scale);
         ctx.fillText(
-          detailLine,
+          line,
           thermo.pos[0] + offX,
           thermo.pos[1] + offY + lineOffset,
         );
-      }
+      });
     }
   });
+  ctx.textAlign = 'left';
 }
 
 function renderRoomLabels(fp) {
@@ -1008,10 +1100,12 @@ function renderRoomLabels(fp) {
     if (!label.label) return;
     const fontSize = (label.font_size || 16) / state.view.scale;
     ctx.font = `${fontSize}px sans-serif`;
+    ctx.textAlign = getLabelAlignment(label);
     const offX = (label.label_offset_x || 0) / state.view.scale;
     const offY = (label.label_offset_y || 0) / state.view.scale;
     ctx.fillText(label.label, label.pos[0] + offX, label.pos[1] + offY);
   });
+  ctx.textAlign = 'left';
 }
 
 function renderStairwell(fp) {
@@ -1195,40 +1289,38 @@ function renderOutsideTemperature(fp) {
 function renderProperties() {
   propertiesPanel.innerHTML = '';
   const fp = currentFloorplan();
-  const title = document.createElement('h3');
   if (!state.selected) {
     if (state.multiSelected.length) {
+      const title = document.createElement('h3');
       title.textContent = `Multiple Items Selected (${state.multiSelected.length})`;
       propertiesPanel.appendChild(title);
       return;
     }
+    const title = document.createElement('h3');
     title.textContent = 'Floorplan Settings';
     propertiesPanel.appendChild(title);
-    propertiesPanel.appendChild(renderField('Floor ID', fp.floor_id, (val) => {
+
+    const layoutSection = createSection('Canvas & Scale');
+    layoutSection.body.appendChild(renderField('Floor ID', fp.floor_id, (val) => {
       renameFloorplan(val);
     }));
-    // NEW: Editable Canvas Dimensions
-    propertiesPanel.appendChild(renderField('Canvas Width', fp.canvas.width, (val) => {
+    layoutSection.body.appendChild(renderField('Canvas Width', fp.canvas.width, (val) => {
       pushHistory();
       fp.canvas.width = parseInt(val) || 1600;
-      // Note: Changing canvas size changes the grid density relative to geometry
-      // but preserves the geometry coordinates.
     }));
-    propertiesPanel.appendChild(renderField('Canvas Height', fp.canvas.height, (val) => {
+    layoutSection.body.appendChild(renderField('Canvas Height', fp.canvas.height, (val) => {
       pushHistory();
       fp.canvas.height = parseInt(val) || 1000;
     }));
-    propertiesPanel.appendChild(renderField('Scale (px/m)', fp.scale.px_per_meter.toFixed(2), (val) => {
+    layoutSection.body.appendChild(renderField('Scale (px/m)', fp.scale.px_per_meter.toFixed(2), (val) => {
       pushHistory();
       fp.scale.px_per_meter = parseFloat(val) || fp.scale.px_per_meter;
       render();
     }));
+    propertiesPanel.appendChild(layoutSection.details);
 
-    const textTitle = document.createElement('h3');
-    textTitle.textContent = 'Render Text';
-    textTitle.style.marginTop = '20px';
-    propertiesPanel.appendChild(textTitle);
-    propertiesPanel.appendChild(renderField('Text Font Size', fp.render.text_font_size ?? '', (val) => {
+    const textSection = createSection('Render Text', { open: false });
+    textSection.body.appendChild(renderField('Text Font Size', fp.render.text_font_size ?? '', (val) => {
       pushHistory();
       if (val === '') {
         fp.render.text_font_size = null;
@@ -1236,284 +1328,337 @@ function renderProperties() {
         fp.render.text_font_size = Math.max(8, parseInt(val, 10) || 12);
       }
     }));
+    propertiesPanel.appendChild(textSection.details);
 
-    const outsideTitle = document.createElement('h3');
-    outsideTitle.textContent = 'Outside Temperature';
-    outsideTitle.style.marginTop = '20px';
-    propertiesPanel.appendChild(outsideTitle);
-    propertiesPanel.appendChild(renderField('Show Timestamp', fp.render.show_timestamp ? 'true' : 'false', (val) => {
+    const outsideSection = createSection('Date/Time & Outside', { open: false });
+    outsideSection.body.appendChild(renderField('Show Timestamp', fp.render.show_timestamp ? 'true' : 'false', (val) => {
       pushHistory();
       fp.render.show_timestamp = val === 'true';
     }, ['true', 'false']));
-    propertiesPanel.appendChild(renderField('Show Outside Temp', fp.render.show_outside_temp ? 'true' : 'false', (val) => {
+    outsideSection.body.appendChild(renderField('Show Outside Temp', fp.render.show_outside_temp ? 'true' : 'false', (val) => {
       pushHistory();
       fp.render.show_outside_temp = val === 'true';
     }, ['true', 'false']));
-    propertiesPanel.appendChild(renderField('Outside Label', fp.render.outside_temp_label || 'Outside', (val) => {
+    outsideSection.body.appendChild(renderField('Outside Label', fp.render.outside_temp_label || 'Outside', (val) => {
       pushHistory();
       fp.render.outside_temp_label = val;
     }));
-    propertiesPanel.appendChild(renderField('Outside Temp Entity', fp.render.outside_temp_entity || '', (val) => {
+    outsideSection.body.appendChild(renderField('Outside Temp Entity', fp.render.outside_temp_entity || '', (val) => {
       pushHistory();
       fp.render.outside_temp_entity = val;
       refreshHaStates();
     }));
-    propertiesPanel.appendChild(renderField('Outside Temp (F) Fallback', fp.render.outside_temp_f ?? '', (val) => {
+    outsideSection.body.appendChild(renderField('Outside Temp (F) Fallback', fp.render.outside_temp_f ?? '', (val) => {
       pushHistory();
       fp.render.outside_temp_f = val === '' ? null : parseFloat(val);
     }));
+    propertiesPanel.appendChild(outsideSection.details);
 
-    const legendTitle = document.createElement('h3');
-    legendTitle.textContent = 'Legend';
-    legendTitle.style.marginTop = '20px';
-    propertiesPanel.appendChild(legendTitle);
-    propertiesPanel.appendChild(renderField('Show Legend', fp.render.show_legend ? 'true' : 'false', (val) => {
+    const legendSection = createSection('Color Scale', { open: false });
+    legendSection.body.appendChild(renderField('Show Legend', fp.render.show_legend ? 'true' : 'false', (val) => {
       pushHistory();
       fp.render.show_legend = val === 'true';
     }, ['true', 'false']));
-    propertiesPanel.appendChild(renderField('Legend Colors (hex)', formatLegendColors(fp.render.legend_colors), (val) => {
+    legendSection.body.appendChild(renderField('Legend Colors (hex)', formatLegendColors(fp.render.legend_colors), (val) => {
       pushHistory();
       fp.render.legend_colors = parseLegendColorsInput(val);
     }));
+    legendSection.body.appendChild(renderField('Scale Min (F)', fp.render.temp_range_f?.min ?? '', (val) => {
+      pushHistory();
+      const next = parseFloat(val);
+      if (Number.isFinite(next)) {
+        fp.render.temp_range_f.min = next;
+      }
+    }));
+    legendSection.body.appendChild(renderField('Scale Max (F)', fp.render.temp_range_f?.max ?? '', (val) => {
+      pushHistory();
+      const next = parseFloat(val);
+      if (Number.isFinite(next)) {
+        fp.render.temp_range_f.max = next;
+      }
+    }));
+    propertiesPanel.appendChild(legendSection.details);
 
-    const chartTitle = document.createElement('h3');
-    chartTitle.textContent = 'Temperature Chart';
-    chartTitle.style.marginTop = '20px';
-    propertiesPanel.appendChild(chartTitle);
-    propertiesPanel.appendChild(renderField('Show Chart', fp.render.show_chart ? 'true' : 'false', (val) => {
+    const chartSection = createSection('Temperature Chart', { open: false });
+    chartSection.body.appendChild(renderField('Show Chart', fp.render.show_chart ? 'true' : 'false', (val) => {
       pushHistory();
       fp.render.show_chart = val === 'true';
     }, ['true', 'false']));
-    propertiesPanel.appendChild(renderField('Chart Temp Entity', fp.render.chart_temp_entity || '', (val) => {
+    chartSection.body.appendChild(renderField('Chart Temp Entity', fp.render.chart_temp_entity || '', (val) => {
       pushHistory();
       fp.render.chart_temp_entity = val;
       refreshHaStates();
     }));
-    propertiesPanel.appendChild(renderField('Chart Forecast Entity', fp.render.chart_forecast_entity || '', (val) => {
+    chartSection.body.appendChild(renderField('Chart Forecast Entity', fp.render.chart_forecast_entity || '', (val) => {
       pushHistory();
       fp.render.chart_forecast_entity = val;
     }));
-    propertiesPanel.appendChild(renderField('Chart History Hours', fp.render.chart_history_hours ?? 12, (val) => {
+    chartSection.body.appendChild(renderField('Chart History Hours', fp.render.chart_history_hours ?? 12, (val) => {
       pushHistory();
       fp.render.chart_history_hours = parseFloat(val) || 12;
     }));
-    propertiesPanel.appendChild(renderField('Chart Forecast Hours', fp.render.chart_forecast_hours ?? 12, (val) => {
+    chartSection.body.appendChild(renderField('Chart Forecast Hours', fp.render.chart_forecast_hours ?? 12, (val) => {
       pushHistory();
       fp.render.chart_forecast_hours = parseFloat(val) || 12;
     }));
-    propertiesPanel.appendChild(renderField('Chart Width (px)', fp.render.chart_width ?? 260, (val) => {
+    chartSection.body.appendChild(renderField('Chart Width (px)', fp.render.chart_width ?? 260, (val) => {
       pushHistory();
       fp.render.chart_width = parseInt(val, 10) || 260;
     }));
-    propertiesPanel.appendChild(renderField('Chart Height (px)', fp.render.chart_height ?? 80, (val) => {
+    chartSection.body.appendChild(renderField('Chart Height (px)', fp.render.chart_height ?? 80, (val) => {
       pushHistory();
       fp.render.chart_height = parseInt(val, 10) || 80;
     }));
+    propertiesPanel.appendChild(chartSection.details);
 
     if (state.backgroundImage) {
-      const bgTitle = document.createElement('h3');
-      bgTitle.textContent = 'Tracing Background';
-      bgTitle.style.marginTop = '20px';
-      propertiesPanel.appendChild(bgTitle);
-
-      propertiesPanel.appendChild(renderField('Opacity', state.background.opacity, (val) => {
+      const bgSection = createSection('Tracing Background', { open: false });
+      bgSection.body.appendChild(renderField('Opacity', state.background.opacity, (val) => {
         state.background.opacity = parseFloat(val);
         render();
       }));
-      propertiesPanel.appendChild(renderField('Scale', state.background.scale, (val) => {
+      bgSection.body.appendChild(renderField('Scale', state.background.scale, (val) => {
         state.background.scale = parseFloat(val);
         render();
       }));
-      propertiesPanel.appendChild(renderField('X Position', state.background.x, (val) => {
+      bgSection.body.appendChild(renderField('X Position', state.background.x, (val) => {
         state.background.x = parseFloat(val);
         render();
       }));
-      propertiesPanel.appendChild(renderField('Y Position', state.background.y, (val) => {
+      bgSection.body.appendChild(renderField('Y Position', state.background.y, (val) => {
         state.background.y = parseFloat(val);
         render();
       }));
-      propertiesPanel.appendChild(renderActionButton('Remove Background', () => {
+      bgSection.body.appendChild(renderActionButton('Remove Background', () => {
         clearBackgroundImage();
       }));
+      propertiesPanel.appendChild(bgSection.details);
     }
+
+    const jsonSection = createSection('Raw JSON', { open: false });
+    const textarea = document.createElement('textarea');
+    textarea.className = 'json-editor';
+    textarea.value = JSON.stringify(fp, null, 2);
+    textarea.style.fontSize = `${fp.render.text_font_size || 12}px`;
+    textarea.style.lineHeight = '1.4';
+    jsonSection.body.appendChild(textarea);
+    const actions = document.createElement('div');
+    actions.className = 'json-actions';
+    const applyButton = document.createElement('button');
+    applyButton.type = 'button';
+    applyButton.textContent = 'Apply JSON';
+    applyButton.addEventListener('click', () => {
+      try {
+        const parsed = JSON.parse(textarea.value);
+        pushHistory();
+        const normalized = normalizeFloorplan(parsed);
+        setFloorplan(normalized);
+        renderProperties();
+        render();
+        showToast('Raw JSON applied.');
+      } catch (error) {
+        showToast(`Invalid JSON: ${error.message}`, 'error');
+      }
+    });
+    const resetButton = document.createElement('button');
+    resetButton.type = 'button';
+    resetButton.textContent = 'Reset';
+    resetButton.addEventListener('click', () => {
+      textarea.value = JSON.stringify(currentFloorplan(), null, 2);
+    });
+    actions.appendChild(applyButton);
+    actions.appendChild(resetButton);
+    jsonSection.body.appendChild(actions);
+    propertiesPanel.appendChild(jsonSection.details);
     return;
   }
   const item = findById(state.selected.type, state.selected.id);
   if (!item) return;
+  const title = document.createElement('h3');
   title.textContent = `${state.selected.type.toUpperCase()} Properties`;
   propertiesPanel.appendChild(title);
+  const detailSection = createSection('Details');
   if (state.selected.type === 'wall') {
-    propertiesPanel.appendChild(renderField('Wall ID', item.id, (val) => {
+    detailSection.body.appendChild(renderField('Wall ID', item.id, (val) => {
       pushHistory();
       item.id = val;
     }));
-    propertiesPanel.appendChild(renderField('Points', `${item.points.length}`, () => {}));
+    detailSection.body.appendChild(renderField('Points', `${item.points.length}`, () => {}));
     if (Number.isInteger(state.selected.vertexIndex)) {
-      propertiesPanel.appendChild(renderField('Selected Vertex', `${state.selected.vertexIndex + 1}`, () => {}));
-      propertiesPanel.appendChild(renderActionButton('Split Wall at Selected Vertex', () => {
+      detailSection.body.appendChild(renderField('Selected Vertex', `${state.selected.vertexIndex + 1}`, () => {}));
+      detailSection.body.appendChild(renderActionButton('Split Wall at Selected Vertex', () => {
         splitWallAtVertex(item.id, state.selected.vertexIndex);
       }));
     }
-    propertiesPanel.appendChild(renderActionButton('Merge Touching Wall', () => {
+    detailSection.body.appendChild(renderActionButton('Merge Touching Wall', () => {
       mergeWallWithNeighbor(item.id);
     }));
   }
   if (state.selected.type === 'door') {
-    propertiesPanel.appendChild(renderField('Door ID', item.id, (val) => {
+    detailSection.body.appendChild(renderField('Door ID', item.id, (val) => {
       pushHistory();
       item.id = val;
     }));
-    propertiesPanel.appendChild(renderField('Entity ID', item.entity_id || '', (val) => {
+    detailSection.body.appendChild(renderField('Entity ID', item.entity_id || '', (val) => {
       pushHistory();
       item.entity_id = val;
     }));
-    propertiesPanel.appendChild(renderField('Open Values', item.mapping.open_values.join(','), (val) => {
+    detailSection.body.appendChild(renderField('Open Values', item.mapping.open_values.join(','), (val) => {
       pushHistory();
       item.mapping.open_values = val.split(',').map((v) => v.trim()).filter(Boolean);
     }));
-    propertiesPanel.appendChild(renderField('Closed Values', item.mapping.closed_values.join(','), (val) => {
+    detailSection.body.appendChild(renderField('Closed Values', item.mapping.closed_values.join(','), (val) => {
       pushHistory();
       item.mapping.closed_values = val.split(',').map((v) => v.trim()).filter(Boolean);
     }));
-    propertiesPanel.appendChild(renderField('Unknown As', item.mapping.unknown_as, (val) => {
+    detailSection.body.appendChild(renderField('Unknown As', item.mapping.unknown_as, (val) => {
       pushHistory();
       item.mapping.unknown_as = val;
     }));
-    propertiesPanel.appendChild(renderField('Manual Open', item.open ? 'true' : 'false', (val) => {
+    detailSection.body.appendChild(renderField('Manual Open', item.open ? 'true' : 'false', (val) => {
       pushHistory();
       item.open = val === 'true';
     }, ['true', 'false']));
-    propertiesPanel.appendChild(renderField('Open Resistance', item.open_resistance ?? '', (val) => {
+    detailSection.body.appendChild(renderField('Open Resistance', item.open_resistance ?? '', (val) => {
       pushHistory();
       item.open_resistance = val === '' ? null : parseFloat(val);
     }));
-    propertiesPanel.appendChild(renderField('Closed Resistance', item.closed_resistance ?? '', (val) => {
+    detailSection.body.appendChild(renderField('Closed Resistance', item.closed_resistance ?? '', (val) => {
       pushHistory();
       item.closed_resistance = val === '' ? null : parseFloat(val);
     }));
   }
   if (state.selected.type === 'sensor') {
-    propertiesPanel.appendChild(renderField('Sensor ID', item.id, (val) => {
+    detailSection.body.appendChild(renderField('Sensor ID', item.id, (val) => {
       pushHistory();
       item.id = val;
     }));
-    propertiesPanel.appendChild(renderField('Entity ID', item.entity || '', (val) => {
+    detailSection.body.appendChild(renderField('Entity ID', item.entity || '', (val) => {
       pushHistory();
       item.entity = val;
       refreshHaStates();
     }));
-    propertiesPanel.appendChild(renderField('Label', item.label || '', (val) => {
+    detailSection.body.appendChild(renderField('Label', item.label || '', (val) => {
       pushHistory();
       item.label = val;
     }));
-    propertiesPanel.appendChild(renderField('Weight', item.weight.toString(), (val) => {
+    detailSection.body.appendChild(renderField('Weight', item.weight.toString(), (val) => {
       pushHistory();
       item.weight = parseFloat(val) || 1.0;
     }));
-    
-    // NEW: Font Size & Position
-    propertiesPanel.appendChild(renderField('Font Size', item.font_size || 12, (val) => {
-        pushHistory();
-        item.font_size = parseInt(val) || 12;
+    detailSection.body.appendChild(renderField('Font Size', item.font_size || 12, (val) => {
+      pushHistory();
+      item.font_size = parseInt(val) || 12;
     }));
-    propertiesPanel.appendChild(renderField('Label Offset X', item.label_offset_x || 10, (val) => {
-        pushHistory();
-        item.label_offset_x = parseInt(val) || 0;
+    detailSection.body.appendChild(renderField('Label Offset X', item.label_offset_x || 10, (val) => {
+      pushHistory();
+      item.label_offset_x = parseInt(val) || 0;
     }));
-    propertiesPanel.appendChild(renderField('Label Offset Y', item.label_offset_y || -8, (val) => {
-        pushHistory();
-        item.label_offset_y = parseInt(val) || 0;
+    detailSection.body.appendChild(renderField('Label Offset Y', item.label_offset_y || -8, (val) => {
+      pushHistory();
+      item.label_offset_y = parseInt(val) || 0;
     }));
+    detailSection.body.appendChild(renderField('Label Justification', item.label_align || 'left', (val) => {
+      pushHistory();
+      item.label_align = val;
+    }, ['left', 'center', 'right']));
   }
   if (state.selected.type === 'thermostat') {
-    propertiesPanel.appendChild(renderField('Thermostat ID', item.id, (val) => {
+    detailSection.body.appendChild(renderField('Thermostat ID', item.id, (val) => {
       pushHistory();
       item.id = val;
     }));
-    propertiesPanel.appendChild(renderField('Device Label', item.device_label || '', (val) => {
+    detailSection.body.appendChild(renderField('Device Label', item.device_label || '', (val) => {
       pushHistory();
       item.device_label = val;
     }));
-    propertiesPanel.appendChild(renderField('Temperature Entity', item.temperature_entity || '', (val) => {
+    detailSection.body.appendChild(renderField('Temperature Entity', item.temperature_entity || '', (val) => {
       pushHistory();
       item.temperature_entity = val;
       refreshHaStates();
     }));
-    propertiesPanel.appendChild(renderField('Setpoint Entity', item.setpoint_entity || '', (val) => {
+    detailSection.body.appendChild(renderField('Setpoint Entity', item.setpoint_entity || '', (val) => {
       pushHistory();
       item.setpoint_entity = val;
       refreshHaStates();
     }));
-    propertiesPanel.appendChild(renderField('Setpoint Low Entity', item.setpoint_low_entity || '', (val) => {
+    detailSection.body.appendChild(renderField('Setpoint Low Entity', item.setpoint_low_entity || '', (val) => {
       pushHistory();
       item.setpoint_low_entity = val;
       refreshHaStates();
     }));
-    propertiesPanel.appendChild(renderField('Setpoint High Entity', item.setpoint_high_entity || '', (val) => {
+    detailSection.body.appendChild(renderField('Setpoint High Entity', item.setpoint_high_entity || '', (val) => {
       pushHistory();
       item.setpoint_high_entity = val;
       refreshHaStates();
     }));
-    propertiesPanel.appendChild(renderField('Mode Entity', item.mode_entity || '', (val) => {
+    detailSection.body.appendChild(renderField('Mode Entity', item.mode_entity || '', (val) => {
       pushHistory();
       item.mode_entity = val;
       refreshHaStates();
     }));
-    propertiesPanel.appendChild(renderField('Preview Mode (editor only)', item.preview_mode || 'heat_cool', (val) => {
+    detailSection.body.appendChild(renderField('Preview Mode (editor only)', item.preview_mode || 'heat_cool', (val) => {
       pushHistory();
       item.preview_mode = val;
     }, ['heat', 'cool', 'heat_cool', 'auto', 'off']));
-    
-    // NEW: Font Size & Position
-    propertiesPanel.appendChild(renderField('Font Size', item.font_size || 12, (val) => {
-        pushHistory();
-        item.font_size = parseInt(val) || 12;
-    }));
-    propertiesPanel.appendChild(renderField('Label Offset X', item.label_offset_x || 12, (val) => {
-        pushHistory();
-        item.label_offset_x = parseInt(val) || 0;
-    }));
-    propertiesPanel.appendChild(renderField('Label Offset Y', item.label_offset_y || -8, (val) => {
-        pushHistory();
-        item.label_offset_y = parseInt(val) || 0;
-    }));
-  }
-  if (state.selected.type === 'room_label') {
-    propertiesPanel.appendChild(renderField('Room Label ID', item.id, (val) => {
+    detailSection.body.appendChild(renderField('Font Size', item.font_size || 12, (val) => {
       pushHistory();
-      item.id = val;
+      item.font_size = parseInt(val) || 12;
     }));
-    propertiesPanel.appendChild(renderField('Label', item.label || '', (val) => {
-      pushHistory();
-      item.label = val;
-    }));
-    propertiesPanel.appendChild(renderField('Font Size', item.font_size || 16, (val) => {
-      pushHistory();
-      item.font_size = parseInt(val) || 16;
-    }));
-    propertiesPanel.appendChild(renderField('Label Offset X', item.label_offset_x || 0, (val) => {
+    detailSection.body.appendChild(renderField('Label Offset X', item.label_offset_x || 12, (val) => {
       pushHistory();
       item.label_offset_x = parseInt(val) || 0;
     }));
-    propertiesPanel.appendChild(renderField('Label Offset Y', item.label_offset_y || 0, (val) => {
+    detailSection.body.appendChild(renderField('Label Offset Y', item.label_offset_y || -8, (val) => {
       pushHistory();
       item.label_offset_y = parseInt(val) || 0;
     }));
+    detailSection.body.appendChild(renderField('Label Justification', item.label_align || 'left', (val) => {
+      pushHistory();
+      item.label_align = val;
+    }, ['left', 'center', 'right']));
   }
-  if (state.selected.type === 'stairwell') {
-    propertiesPanel.appendChild(renderField('Stairwell ID', item.id, (val) => {
+  if (state.selected.type === 'room_label') {
+    detailSection.body.appendChild(renderField('Room Label ID', item.id, (val) => {
       pushHistory();
       item.id = val;
     }));
-    propertiesPanel.appendChild(renderField('Link To Floor', item.link_to_floor_id, (val) => {
+    detailSection.body.appendChild(renderField('Label', item.label || '', (val) => {
+      pushHistory();
+      item.label = val;
+    }));
+    detailSection.body.appendChild(renderField('Font Size', item.font_size || 16, (val) => {
+      pushHistory();
+      item.font_size = parseInt(val) || 16;
+    }));
+    detailSection.body.appendChild(renderField('Label Offset X', item.label_offset_x || 0, (val) => {
+      pushHistory();
+      item.label_offset_x = parseInt(val) || 0;
+    }));
+    detailSection.body.appendChild(renderField('Label Offset Y', item.label_offset_y || 0, (val) => {
+      pushHistory();
+      item.label_offset_y = parseInt(val) || 0;
+    }));
+    detailSection.body.appendChild(renderField('Label Justification', item.label_align || 'left', (val) => {
+      pushHistory();
+      item.label_align = val;
+    }, ['left', 'center', 'right']));
+  }
+  if (state.selected.type === 'stairwell') {
+    detailSection.body.appendChild(renderField('Stairwell ID', item.id, (val) => {
+      pushHistory();
+      item.id = val;
+    }));
+    detailSection.body.appendChild(renderField('Link To Floor', item.link_to_floor_id, (val) => {
       pushHistory();
       item.link_to_floor_id = val;
     }));
-    propertiesPanel.appendChild(renderField('Coupling', item.coupling.toString(), (val) => {
+    detailSection.body.appendChild(renderField('Coupling', item.coupling.toString(), (val) => {
       pushHistory();
       item.coupling = parseFloat(val) || 0.05;
     }));
   }
+  propertiesPanel.appendChild(detailSection.details);
 }
 
 function renderField(labelText, value, onChange, options = null) {
@@ -1553,6 +1698,38 @@ function renderActionButton(labelText, onClick) {
   button.addEventListener('click', onClick);
   wrapper.appendChild(button);
   return wrapper;
+}
+
+function createSection(title, { open = true } = {}) {
+  const details = document.createElement('details');
+  details.open = open;
+  const summary = document.createElement('summary');
+  summary.textContent = title;
+  details.appendChild(summary);
+  const body = document.createElement('div');
+  body.className = 'section-body';
+  details.appendChild(body);
+  return { details, body };
+}
+
+function normalizeFloorplan(value) {
+  const base = createDefaultFloorplan(state.floorId);
+  const merged = {
+    ...base,
+    ...value,
+    canvas: { ...base.canvas, ...(value?.canvas || {}) },
+    scale: { ...base.scale, ...(value?.scale || {}) },
+    render: { ...base.render, ...(value?.render || {}) },
+    solver: { ...base.solver, ...(value?.solver || {}) },
+  };
+  merged.floor_id = state.floorId;
+  merged.walls = Array.isArray(value?.walls) ? value.walls : [];
+  merged.doors = Array.isArray(value?.doors) ? value.doors : [];
+  merged.sensors = Array.isArray(value?.sensors) ? value.sensors : [];
+  merged.thermostats = Array.isArray(value?.thermostats) ? value.thermostats : [];
+  merged.room_labels = Array.isArray(value?.room_labels) ? value.room_labels : [];
+  merged.stairwell = value?.stairwell || null;
+  return merged;
 }
 
 function formatLegendColors(value) {
@@ -1633,6 +1810,7 @@ function createSensor(point) {
     label_offset_x: 10,
     label_offset_y: -8,
     font_size: 12,
+    label_align: 'left',
   };
   fp.sensors.push(sensor);
   state.selected = { type: 'sensor', id: sensor.id };
@@ -1656,6 +1834,7 @@ function createThermostat(point) {
     label_offset_y: -8,
     font_size: 12,
     preview_mode: 'heat_cool',
+    label_align: 'left',
   };
   fp.thermostats.push(thermo);
   state.selected = { type: 'thermostat', id: thermo.id };
@@ -1673,6 +1852,7 @@ function createRoomLabel(point) {
     font_size: 16,
     label_offset_x: 0,
     label_offset_y: 0,
+    label_align: 'left',
   };
   fp.room_labels.push(label);
   state.selected = { type: 'room_label', id: label.id };
@@ -2030,7 +2210,8 @@ canvas.addEventListener('mousedown', (event) => {
         state.multiSelected = [];
       }
       renderProperties();
-      const labelOffset = event.shiftKey && (hit.type === 'sensor' || hit.type === 'thermostat');
+      const labelOffset = hit.target === 'label'
+        || (event.shiftKey && (hit.type === 'sensor' || hit.type === 'thermostat' || hit.type === 'room_label'));
       const stretch = event.shiftKey && hit.type === 'wall';
       if (state.multiSelected.length && isMultiHit) {
         beginMultiDrag(world);
