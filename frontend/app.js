@@ -80,7 +80,7 @@ const defaultRender = () => ({
   chart_history_hours: 12,
   chart_forecast_hours: 12,
   chart_width: 260,
-  chart_height: 80,
+  chart_height: 160,
   text_font_size: null,
 });
 
