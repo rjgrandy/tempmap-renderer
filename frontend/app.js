@@ -716,11 +716,12 @@ function labelHitTest(point) {
   for (const sensor of (fp.sensors || [])) {
     const lines = getSensorLabelLines(sensor);
     if (!lines.length) continue;
-    const fontSizeWorld = (sensor.font_size || 12) / state.view.scale;
+    const baseFontSize = sensor.font_size || 12;
+    const fontSizeWorld = baseFontSize / state.view.scale;
     const align = getLabelAlignment(sensor);
     const offX = (sensor.label_offset_x || 10) / state.view.scale;
     const offY = (sensor.label_offset_y || -8) / state.view.scale;
-    const lineHeight = (sensor.font_size + 2) / state.view.scale;
+    const lineHeight = (baseFontSize + 2) / state.view.scale;
     for (let i = 0; i < lines.length; i += 1) {
       const y = sensor.pos[1] + offY + i * lineHeight;
       const x = sensor.pos[0] + offX;
@@ -732,11 +733,12 @@ function labelHitTest(point) {
   for (const thermo of (fp.thermostats || [])) {
     const lines = getThermostatLabelLines(thermo);
     if (!lines.length) continue;
-    const fontSizeWorld = (thermo.font_size || 12) / state.view.scale;
+    const baseFontSize = thermo.font_size || 12;
+    const fontSizeWorld = baseFontSize / state.view.scale;
     const align = getLabelAlignment(thermo);
     const offX = (thermo.label_offset_x || 12) / state.view.scale;
     const offY = (thermo.label_offset_y || -8) / state.view.scale;
-    const lineHeight = (thermo.font_size + 2) / state.view.scale;
+    const lineHeight = (baseFontSize + 2) / state.view.scale;
     for (let i = 0; i < lines.length; i += 1) {
       const y = thermo.pos[1] + offY + i * lineHeight;
       const x = thermo.pos[0] + offX;
@@ -1047,7 +1049,8 @@ function getThermostatLabelLines(thermo) {
 function renderSensors(fp) {
   ctx.fillStyle = '#ffffff';
   (fp.sensors || []).forEach((sensor) => {
-    const fontSize = (sensor.font_size || 12) / state.view.scale;
+    const baseFontSize = sensor.font_size || 12;
+    const fontSize = baseFontSize / state.view.scale;
     ctx.font = `${fontSize}px sans-serif`;
     ctx.beginPath();
     ctx.arc(sensor.pos[0], sensor.pos[1], 6 / state.view.scale, 0, Math.PI * 2);
@@ -1059,7 +1062,7 @@ function renderSensors(fp) {
       const offY = (sensor.label_offset_y || -8) / state.view.scale;
 
       labelLines.forEach((line, index) => {
-        const lineOffset = index * ((sensor.font_size + 2) / state.view.scale);
+        const lineOffset = index * ((baseFontSize + 2) / state.view.scale);
         ctx.fillText(line, sensor.pos[0] + offX, sensor.pos[1] + offY + lineOffset);
       });
     }
@@ -1071,7 +1074,8 @@ function renderThermostats(fp) {
   ctx.strokeStyle = '#f5c542';
   ctx.lineWidth = 2 / state.view.scale;
   (fp.thermostats || []).forEach((thermo) => {
-    const fontSize = (thermo.font_size || 12) / state.view.scale;
+    const baseFontSize = thermo.font_size || 12;
+    const fontSize = baseFontSize / state.view.scale;
     ctx.font = `${fontSize}px sans-serif`;
     ctx.strokeRect(thermo.pos[0] - 7 / state.view.scale, thermo.pos[1] - 7 / state.view.scale, 14 / state.view.scale, 14 / state.view.scale);
     if (fp.render.show_labels) {
@@ -1082,7 +1086,7 @@ function renderThermostats(fp) {
       const offY = (thermo.label_offset_y || -8) / state.view.scale;
 
       labelLines.forEach((line, index) => {
-        const lineOffset = index * ((thermo.font_size + 2) / state.view.scale);
+        const lineOffset = index * ((baseFontSize + 2) / state.view.scale);
         ctx.fillText(
           line,
           thermo.pos[0] + offX,
