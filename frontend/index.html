@@ -165,6 +165,20 @@
         padding: 6px 8px;
         font-size: 12px;
       }
+      .properties button {
+        width: 100%;
+        background: var(--panel-2);
+        color: var(--text);
+        border: 1px solid #32384d;
+        border-radius: 6px;
+        padding: 6px 8px;
+        font-size: 12px;
+        cursor: pointer;
+      }
+      .properties button:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+      }
       .statusbar {
         padding: 6px 12px;
         background: var(--panel);
@@ -225,6 +239,7 @@
           
           <input type="file" id="bgUpload" accept="image/*" style="display: none;" />
           <button id="bgUploadBtn">Upload BG</button>
+          <button id="bgRemoveBtn">Remove BG</button>
           <button id="saveBtn" class="primary">Save</button>
           <button id="undoBtn">Undo</button>
           <button id="redoBtn">Redo</button>

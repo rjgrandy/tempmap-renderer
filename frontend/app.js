@@ -14,6 +14,7 @@ const redoBtn = document.getElementById('redoBtn');
 const snapToggle = document.getElementById('snapToggle');
 const orthoToggle = document.getElementById('orthoToggle');
 const gridSizeInput = document.getElementById('gridSizeInput');
+const bgRemoveBtn = document.getElementById('bgRemoveBtn');
 
 const toolButtons = Array.from(document.querySelectorAll('.tool-button'));
 const floorTabs = Array.from(document.querySelectorAll('.tab'));
@@ -63,6 +64,7 @@ const defaultRender = () => ({
   outside_temp_label: 'Outside',
   outside_temp_entity: '',
   outside_temp_f: null,
+  text_font_size: null,
 });
 
 const defaultSolver = () => ({
@@ -124,6 +126,19 @@ function showToast(message, variant = 'info') {
   toastTimer = window.setTimeout(() => {
     toast.classList.remove('visible');
   }, 3200);
+}
+
+function isEditableTarget(target) {
+  if (!target) return false;
+  if (target.isContentEditable) return true;
+  const tag = target.tagName ? target.tagName.toLowerCase() : '';
+  return tag === 'input' || tag === 'textarea' || tag === 'select';
+}
+
+function updateBackgroundControls() {
+  if (bgRemoveBtn) {
+    bgRemoveBtn.disabled = !state.backgroundImage;
+  }
 }
 
 function pushHistory() {
@@ -282,6 +297,7 @@ async function initialize() {
   await ensureFloorplanLoaded(initialFloorId, { announce: false });
   pushHistory();
   renderProperties();
+  updateBackgroundControls();
   render();
   refreshHaStates();
   if (!state.haPollInterval) {
@@ -414,6 +430,52 @@ async function saveFloorplan() {
   }
 }
 
+function updateStoryAssignmentsForRename(oldId, newId) {
+  let changed = false;
+  Object.entries(state.storyAssignments).forEach(([storyId, floorId]) => {
+    if (floorId === oldId) {
+      state.storyAssignments[storyId] = newId;
+      changed = true;
+    }
+  });
+  if (changed) {
+    saveStoryAssignments();
+  }
+}
+
+async function renameFloorplan(newId) {
+  const trimmed = newId.trim();
+  const oldId = state.floorId;
+  if (!trimmed || trimmed === oldId) {
+    return;
+  }
+  try {
+    setStatus(`Renaming ${oldId}...`);
+    const response = await fetch(`/api/floorplans/${encodeURIComponent(oldId)}/rename`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ new_id: trimmed }),
+    });
+    if (!response.ok) {
+      const message = await response.text();
+      throw new Error(message || `Unable to rename ${oldId}`);
+    }
+    const payload = await response.json();
+    state.floorId = trimmed;
+    state.floorplans[trimmed] = payload;
+    delete state.floorplans[oldId];
+    updateStoryAssignmentsForRename(oldId, trimmed);
+    setFloorplan(payload);
+    updateStatusMeta();
+    showToast(`Renamed ${oldId} to ${trimmed}.`);
+    await fetchFloorplanList();
+  } catch (error) {
+    setStatus(error.message || `Unable to rename ${oldId}.`, true);
+    showToast(error.message || `Unable to rename ${oldId}.`, 'error');
+    renderProperties();
+  }
+}
+
 function updateToolButtons() {
   toolButtons.forEach((btn) => {
     btn.classList.toggle('active', btn.dataset.tool === state.tool);
@@ -516,6 +578,22 @@ function pointInPolygon(point, polygon) {
   return inside;
 }
 
+function pointDistance(p1, p2) {
+  return Math.hypot(p1[0] - p2[0], p1[1] - p2[1]);
+}
+
+function findWallVertexHit(point, threshold) {
+  const fp = currentFloorplan();
+  for (const wall of (fp.walls || [])) {
+    for (let i = 0; i < wall.points.length; i += 1) {
+      if (pointDistance(point, wall.points[i]) <= threshold) {
+        return { type: 'wall_vertex', id: wall.id, vertexIndex: i };
+      }
+    }
+  }
+  return null;
+}
+
 function hitTest(point) {
   const fp = currentFloorplan();
   const threshold = 10 / state.view.scale;
@@ -539,6 +617,10 @@ function hitTest(point) {
     if (distanceToSegment(point, door.segment[0], door.segment[1]) <= threshold) {
       return { type: 'door', id: door.id };
     }
+  }
+  const vertexHit = findWallVertexHit(point, threshold);
+  if (vertexHit) {
+    return vertexHit;
   }
   for (const wall of (fp.walls || [])) {
     for (let i = 0; i < wall.points.length - 1; i += 1) {
@@ -823,6 +905,15 @@ function renderSelection() {
       }
     });
     ctx.stroke();
+    const handleSize = 6 / state.view.scale;
+    ctx.fillStyle = '#ff6b6b';
+    item.points.forEach((pt, idx) => {
+      const half = handleSize / 2;
+      ctx.fillRect(pt[0] - half, pt[1] - half, handleSize, handleSize);
+      if (state.selected.vertexIndex === idx) {
+        ctx.strokeRect(pt[0] - half, pt[1] - half, handleSize, handleSize);
+      }
+    });
   } else if (state.selected.type === 'stairwell') {
     ctx.beginPath();
     item.polygon.forEach((pt, idx) => {
@@ -933,7 +1024,9 @@ function renderProperties() {
   if (!state.selected) {
     title.textContent = 'Floorplan Settings';
     propertiesPanel.appendChild(title);
-    propertiesPanel.appendChild(renderField('Floor ID', fp.floor_id, () => {}));
+    propertiesPanel.appendChild(renderField('Floor ID', fp.floor_id, (val) => {
+      renameFloorplan(val);
+    }));
     // NEW: Editable Canvas Dimensions
     propertiesPanel.appendChild(renderField('Canvas Width', fp.canvas.width, (val) => {
       pushHistory();
@@ -949,6 +1042,19 @@ function renderProperties() {
       pushHistory();
       fp.scale.px_per_meter = parseFloat(val) || fp.scale.px_per_meter;
       render();
+    }));
+
+    const textTitle = document.createElement('h3');
+    textTitle.textContent = 'Render Text';
+    textTitle.style.marginTop = '20px';
+    propertiesPanel.appendChild(textTitle);
+    propertiesPanel.appendChild(renderField('Text Font Size', fp.render.text_font_size ?? '', (val) => {
+      pushHistory();
+      if (val === '') {
+        fp.render.text_font_size = null;
+      } else {
+        fp.render.text_font_size = Math.max(8, parseInt(val, 10) || 12);
+      }
     }));
 
     const outsideTitle = document.createElement('h3');
@@ -995,6 +1101,9 @@ function renderProperties() {
         state.background.y = parseFloat(val);
         render();
       }));
+      propertiesPanel.appendChild(renderActionButton('Remove Background', () => {
+        clearBackgroundImage();
+      }));
     }
     return;
   }
@@ -1008,6 +1117,15 @@ function renderProperties() {
       item.id = val;
     }));
     propertiesPanel.appendChild(renderField('Points', `${item.points.length}`, () => {}));
+    if (Number.isInteger(state.selected.vertexIndex)) {
+      propertiesPanel.appendChild(renderField('Selected Vertex', `${state.selected.vertexIndex + 1}`, () => {}));
+      propertiesPanel.appendChild(renderActionButton('Split Wall at Selected Vertex', () => {
+        splitWallAtVertex(item.id, state.selected.vertexIndex);
+      }));
+    }
+    propertiesPanel.appendChild(renderActionButton('Merge Touching Wall', () => {
+      mergeWallWithNeighbor(item.id);
+    }));
   }
   if (state.selected.type === 'door') {
     propertiesPanel.appendChild(renderField('Door ID', item.id, (val) => {
@@ -1195,6 +1313,17 @@ function renderField(labelText, value, onChange, options = null) {
   return wrapper;
 }
 
+function renderActionButton(labelText, onClick) {
+  const wrapper = document.createElement('div');
+  wrapper.className = 'field';
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.textContent = labelText;
+  button.addEventListener('click', onClick);
+  wrapper.appendChild(button);
+  return wrapper;
+}
+
 function setTool(tool) {
   state.tool = tool;
   state.drawing = null;
@@ -1325,36 +1454,126 @@ function applyScaleCalibration(p1, p2) {
   setStatus(`Scale set to ${fp.scale.px_per_meter.toFixed(2)} px/m.`);
 }
 
-function beginMoveDrag(hit, startWorld) {
-  const item = findById(hit.type, hit.id);
+function beginMoveDrag(hit, startWorld, options = {}) {
+  const resolvedType = hit.type === 'wall_vertex' ? 'wall' : hit.type;
+  const item = findById(resolvedType, hit.id);
   if (!item) return;
-  const dragState = { type: 'move', itemType: hit.type, id: hit.id, start: startWorld };
-  if (hit.type === 'sensor' || hit.type === 'thermostat' || hit.type === 'room_label') {
+  const dragType = options.labelOffset ? 'label_offset' : 'move';
+  const dragState = { type: dragType, itemType: hit.type, id: hit.id, start: startWorld };
+  if (resolvedType === 'sensor' || resolvedType === 'thermostat' || resolvedType === 'room_label') {
     dragState.original = { pos: [...item.pos] };
-  } else if (hit.type === 'door') {
+    if (dragType === 'label_offset') {
+      dragState.original.offset = {
+        x: item.label_offset_x || 0,
+        y: item.label_offset_y || 0,
+      };
+    }
+  } else if (resolvedType === 'door') {
     dragState.original = { segment: item.segment.map((pt) => [...pt]) };
-  } else if (hit.type === 'wall') {
+  } else if (resolvedType === 'wall') {
     dragState.original = { points: item.points.map((pt) => [...pt]) };
-  } else if (hit.type === 'stairwell') {
+    if (hit.type === 'wall_vertex') {
+      dragState.vertexIndex = hit.vertexIndex;
+    }
+  } else if (resolvedType === 'stairwell') {
     dragState.original = { polygon: item.polygon.map((pt) => [...pt]) };
   }
   state.dragging = dragState;
 }
 
 function updateMoveDrag(world) {
-  if (!state.dragging || state.dragging.type !== 'move') return;
+  if (!state.dragging || (state.dragging.type !== 'move' && state.dragging.type !== 'label_offset')) return;
   const delta = [world[0] - state.dragging.start[0], world[1] - state.dragging.start[1]];
-  const item = findById(state.dragging.itemType, state.dragging.id);
+  const resolvedType = state.dragging.itemType === 'wall_vertex' ? 'wall' : state.dragging.itemType;
+  const item = findById(resolvedType, state.dragging.id);
   if (!item) return;
-  if (state.dragging.itemType === 'sensor' || state.dragging.itemType === 'thermostat' || state.dragging.itemType === 'room_label') {
-    item.pos = [state.dragging.original.pos[0] + delta[0], state.dragging.original.pos[1] + delta[1]];
-  } else if (state.dragging.itemType === 'door') {
+  if (resolvedType === 'sensor' || resolvedType === 'thermostat' || resolvedType === 'room_label') {
+    if (state.dragging.type === 'label_offset' && state.dragging.original.offset) {
+      item.label_offset_x = Math.round(state.dragging.original.offset.x + delta[0] * state.view.scale);
+      item.label_offset_y = Math.round(state.dragging.original.offset.y + delta[1] * state.view.scale);
+    } else {
+      item.pos = [state.dragging.original.pos[0] + delta[0], state.dragging.original.pos[1] + delta[1]];
+    }
+  } else if (resolvedType === 'door') {
     item.segment = state.dragging.original.segment.map((pt) => [pt[0] + delta[0], pt[1] + delta[1]]);
-  } else if (state.dragging.itemType === 'wall') {
-    item.points = state.dragging.original.points.map((pt) => [pt[0] + delta[0], pt[1] + delta[1]]);
-  } else if (state.dragging.itemType === 'stairwell') {
+  } else if (resolvedType === 'wall') {
+    if (state.dragging.itemType === 'wall_vertex') {
+      const updated = state.dragging.original.points.map((pt) => [...pt]);
+      updated[state.dragging.vertexIndex] = [
+        state.dragging.original.points[state.dragging.vertexIndex][0] + delta[0],
+        state.dragging.original.points[state.dragging.vertexIndex][1] + delta[1],
+      ];
+      item.points = updated;
+    } else {
+      item.points = state.dragging.original.points.map((pt) => [pt[0] + delta[0], pt[1] + delta[1]]);
+    }
+  } else if (resolvedType === 'stairwell') {
     item.polygon = state.dragging.original.polygon.map((pt) => [pt[0] + delta[0], pt[1] + delta[1]]);
   }
+  render();
+}
+
+function mergeWallWithNeighbor(wallId) {
+  const fp = currentFloorplan();
+  const wall = (fp.walls || []).find((item) => item.id === wallId);
+  if (!wall) return;
+  const threshold = 10 / state.view.scale;
+  let best = null;
+  (fp.walls || []).forEach((other) => {
+    if (other.id === wall.id) return;
+    const combos = [
+      { a: wall.points[wall.points.length - 1], b: other.points[0], mode: 'end-start' },
+      { a: wall.points[wall.points.length - 1], b: other.points[other.points.length - 1], mode: 'end-end' },
+      { a: wall.points[0], b: other.points[0], mode: 'start-start' },
+      { a: wall.points[0], b: other.points[other.points.length - 1], mode: 'start-end' },
+    ];
+    combos.forEach((combo) => {
+      const distance = pointDistance(combo.a, combo.b);
+      if (distance <= threshold && (!best || distance < best.distance)) {
+        best = { other, mode: combo.mode, distance };
+      }
+    });
+  });
+  if (!best) {
+    showToast('No touching wall found to merge.', 'error');
+    return;
+  }
+  pushHistory();
+  let mergedPoints = [];
+  if (best.mode === 'end-start') {
+    mergedPoints = [...wall.points, ...best.other.points.slice(1)];
+  } else if (best.mode === 'end-end') {
+    mergedPoints = [...wall.points, ...best.other.points.slice(0, -1).reverse()];
+  } else if (best.mode === 'start-start') {
+    mergedPoints = [...wall.points.slice().reverse(), ...best.other.points.slice(1)];
+  } else if (best.mode === 'start-end') {
+    mergedPoints = [...best.other.points, ...wall.points.slice(1)];
+  }
+  fp.walls = (fp.walls || []).filter((item) => item.id !== wall.id && item.id !== best.other.id);
+  const newWall = { id: ensureId('wall'), points: mergedPoints };
+  fp.walls.push(newWall);
+  state.selected = { type: 'wall', id: newWall.id };
+  renderProperties();
+  render();
+}
+
+function splitWallAtVertex(wallId, vertexIndex) {
+  const fp = currentFloorplan();
+  const wall = (fp.walls || []).find((item) => item.id === wallId);
+  if (!wall) return;
+  if (vertexIndex <= 0 || vertexIndex >= wall.points.length - 1) {
+    showToast('Select a middle vertex to split the wall.', 'error');
+    return;
+  }
+  pushHistory();
+  const leftPoints = wall.points.slice(0, vertexIndex + 1);
+  const rightPoints = wall.points.slice(vertexIndex);
+  fp.walls = (fp.walls || []).filter((item) => item.id !== wall.id);
+  const leftWall = { id: ensureId('wall'), points: leftPoints };
+  const rightWall = { id: ensureId('wall'), points: rightPoints };
+  fp.walls.push(leftWall, rightWall);
+  state.selected = { type: 'wall', id: rightWall.id, vertexIndex: 0 };
+  renderProperties();
   render();
 }
 
@@ -1452,9 +1671,14 @@ canvas.addEventListener('mousedown', (event) => {
   if (state.tool === 'select') {
     const hit = hitTest(world);
     if (hit) {
-      state.selected = hit;
+      if (hit.type === 'wall_vertex') {
+        state.selected = { type: 'wall', id: hit.id, vertexIndex: hit.vertexIndex };
+      } else {
+        state.selected = hit;
+      }
       renderProperties();
-      beginMoveDrag(hit, world);
+      const labelOffset = event.shiftKey && (hit.type === 'sensor' || hit.type === 'thermostat');
+      beginMoveDrag(hit, world, { labelOffset });
     } else {
       state.selected = null;
       renderProperties();
@@ -1561,7 +1785,7 @@ canvas.addEventListener('mouseup', (event) => {
     state.dragging = null;
     return;
   }
-  if (state.dragging?.type === 'move') {
+  if (state.dragging?.type === 'move' || state.dragging?.type === 'label_offset') {
     pushHistory();
     state.dragging = null;
     renderProperties();
@@ -1577,7 +1801,7 @@ canvas.addEventListener('mouseleave', () => {
   if (state.dragging?.type === 'pan') {
     state.dragging = null;
   }
-  if (state.dragging?.type === 'move') {
+  if (state.dragging?.type === 'move' || state.dragging?.type === 'label_offset') {
     pushHistory();
     state.dragging = null;
   }
@@ -1607,6 +1831,9 @@ canvas.addEventListener('wheel', (event) => {
 window.addEventListener('resize', resizeCanvas);
 
 window.addEventListener('keydown', (event) => {
+  if (isEditableTarget(event.target)) {
+    return;
+  }
   if (event.code === 'Space') {
     state.spacePressed = true;
   }
@@ -1615,9 +1842,11 @@ window.addEventListener('keydown', (event) => {
     render();
   }
   if ((event.key === 'Delete' || event.key === 'Backspace') && state.selected) {
+    event.preventDefault();
     removeSelected();
   }
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'z') {
+    event.preventDefault();
     if (event.shiftKey) {
       redo();
     } else {
@@ -1625,7 +1854,12 @@ window.addEventListener('keydown', (event) => {
     }
   }
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'y') {
+    event.preventDefault();
     redo();
+  }
+  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's') {
+    event.preventDefault();
+    saveFloorplan();
   }
 });
 
@@ -1635,6 +1869,20 @@ window.addEventListener('keyup', (event) => {
   }
 });
 
+function clearBackgroundImage() {
+  if (!state.backgroundImage) {
+    showToast('No background image to remove.', 'error');
+    return;
+  }
+  state.backgroundImage = null;
+  state.background = { x: 0, y: 0, scale: 1.0, opacity: 0.5 };
+  renderProperties();
+  render();
+  updateBackgroundControls();
+  setStatus('Background image removed.');
+  showToast('Background image removed.');
+}
+
 // Background Upload Handlers
 const bgUploadBtn = document.getElementById('bgUploadBtn');
 const bgUploadInput = document.getElementById('bgUpload');
@@ -1642,6 +1890,12 @@ const bgUploadInput = document.getElementById('bgUpload');
 bgUploadBtn.addEventListener('click', () => {
   bgUploadInput.click();
 });
+
+if (bgRemoveBtn) {
+  bgRemoveBtn.addEventListener('click', () => {
+    clearBackgroundImage();
+  });
+}
 
 bgUploadInput.addEventListener('change', (e) => {
   const file = e.target.files[0];
@@ -1656,6 +1910,7 @@ bgUploadInput.addEventListener('change', (e) => {
       state.background = { x: 0, y: 0, scale: 1.0, opacity: 0.5 };
       renderProperties();
       render();
+      updateBackgroundControls();
       setStatus('Background image loaded. Adjust settings in panel.');
     };
     img.src = event.target.result;
