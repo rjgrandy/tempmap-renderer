@@ -175,6 +175,93 @@
         font-size: 12px;
         cursor: pointer;
       }
+      .properties details {
+        border: 1px solid #2b3142;
+        border-radius: 8px;
+        margin-bottom: 10px;
+        background: var(--panel-2);
+      }
+      .properties summary {
+        padding: 6px 8px;
+        cursor: pointer;
+        font-size: 12px;
+        color: var(--text);
+        list-style: none;
+      }
+      .properties summary::-webkit-details-marker {
+        display: none;
+      }
+      .properties details[open] summary {
+        border-bottom: 1px solid #2b3142;
+      }
+      .properties .section-body {
+        padding: 8px;
+      }
+      .modal {
+        position: fixed;
+        inset: 0;
+        background: rgba(8, 10, 14, 0.72);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 100;
+      }
+      .modal.hidden {
+        display: none;
+      }
+      .modal-content {
+        background: var(--panel);
+        border: 1px solid #2b3142;
+        border-radius: 12px;
+        width: min(1100px, 92vw);
+        height: min(90vh, 900px);
+        display: flex;
+        flex-direction: column;
+        padding: 16px;
+        gap: 12px;
+        box-shadow: 0 20px 60px rgba(0, 0, 0, 0.55);
+      }
+      .modal-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+      .modal-header h3 {
+        margin: 0;
+        font-size: 16px;
+      }
+      .modal-actions {
+        display: flex;
+        gap: 8px;
+      }
+      .modal-actions button {
+        background: var(--panel-2);
+        color: var(--text);
+        border: 1px solid #32384d;
+        border-radius: 6px;
+        padding: 6px 12px;
+        font-size: 12px;
+        cursor: pointer;
+      }
+      .modal-actions button.primary {
+        background: var(--accent);
+        color: #0b1020;
+        border: none;
+      }
+      #jsonEditor {
+        flex: 1;
+        width: 100%;
+        background: var(--panel-2);
+        color: var(--text);
+        border: 1px solid #32384d;
+        border-radius: 8px;
+        padding: 12px;
+        font-family: "SFMono-Regular", "Consolas", "Liberation Mono", monospace;
+        font-size: 11px;
+        line-height: 1.5;
+        resize: none;
+      }
       .properties button:disabled {
         opacity: 0.6;
         cursor: not-allowed;
@@ -278,6 +365,21 @@
         <div class="status-pill" id="coordReadout"></div>
         <div class="status-pill">Space + Drag to Pan • Mouse Wheel to Zoom</div>
       </footer>
+    </div>
+    <div id="jsonModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="jsonModalTitle">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h3 id="jsonModalTitle">Raw Floorplan JSON</h3>
+          <div class="modal-actions">
+            <button id="jsonCloseBtn" type="button">Close</button>
+          </div>
+        </div>
+        <textarea id="jsonEditor" spellcheck="false"></textarea>
+        <div class="modal-actions">
+          <button id="jsonResetBtn" type="button">Reset</button>
+          <button id="jsonApplyBtn" class="primary" type="button">Apply JSON</button>
+        </div>
+      </div>
     </div>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
     <script src="app.js"></script>
