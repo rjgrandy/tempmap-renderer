@@ -867,7 +867,7 @@ def stitch_images_horizontally(
         widths.append(image.width)
         heights.append(image.height)
         label_text = floor_id
-        text_width, text_height = font.getsize(label_text)
+        text_width, text_height = measure_text_size(font, label_text)
         label_heights.append(text_height)
     max_height = max(heights)
     label_height = max(label_heights) if label_heights else 0
@@ -880,7 +880,7 @@ def stitch_images_horizontally(
         y_offset = label_height + border_px
         stitched.paste(image, (x_cursor, y_offset))
         label_text = floor_id
-        text_width, text_height = font.getsize(label_text)
+        text_width, text_height = measure_text_size(font, label_text)
         text_x = x_cursor + max(0, (image.width - text_width) // 2)
         draw.text((text_x, 0), label_text, font=font, fill=(255, 255, 255, 255))
         x_cursor += image.width + border_px
@@ -1538,13 +1538,25 @@ def measure_text_width(font: ImageFont.ImageFont | ImageFont.FreeTypeFont, text:
         width, _height = font.getsize(text)
         return width
 
+
+def measure_text_size(font: ImageFont.ImageFont | ImageFont.FreeTypeFont, text: str) -> Tuple[int, int]:
+    try:
+        bbox = font.getbbox(text)
+        return bbox[2] - bbox[0], bbox[3] - bbox[1]
+    except AttributeError:
+        return font.getsize(text)
+
+
+def clock_radius_for_font(font_size: int) -> int:
+    return max(12, int(font_size * 2.2))
+
 def compute_text_block_height(fp: FloorplanV1) -> int:
     font_size = fp.render.text_font_size or 12
     spacing = max(2, int(font_size * 0.2))
     height = 0
     if fp.render.show_timestamp:
         timestamp_height = measure_multiline_height(2, font_size, spacing)
-        clock_height = int(font_size * 1.8)
+        clock_height = clock_radius_for_font(font_size) * 2
         height += max(timestamp_height, clock_height)
     if fp.render.show_outside_temp:
         if height:
@@ -1591,7 +1603,7 @@ def draw_timestamp(draw: ImageDraw.ImageDraw, fp: FloorplanV1, margin: int) -> i
         spacing=spacing,
     )
     text_width = max((measure_text_width(font, line) for line in lines), default=0)
-    clock_radius = int(font_size * 0.9)
+    clock_radius = clock_radius_for_font(font_size)
     clock_center = (
         margin + text_width + clock_radius + 12,
         margin + font_size + spacing + (font_size / 2),
