@@ -6,6 +6,7 @@ const statusMeta = document.getElementById('statusMeta');
 const toast = document.getElementById('toast');
 const loadSelect = document.getElementById('loadSelect');
 const loadBtn = document.getElementById('loadBtn');
+const assignStoryBtn = document.getElementById('assignStoryBtn');
 const newBtn = document.getElementById('newBtn');
 const saveBtn = document.getElementById('saveBtn');
 const undoBtn = document.getElementById('undoBtn');
@@ -19,8 +20,13 @@ const floorTabs = Array.from(document.querySelectorAll('.tab'));
 
 const state = {
   tool: 'select',
+  storyId: 'floor1',
   floorId: 'floor1',
   floorplans: {
+    floor1: null,
+    floor2: null,
+  },
+  storyAssignments: {
     floor1: null,
     floor2: null,
   },
@@ -39,6 +45,11 @@ const state = {
   background: { x: 0, y: 0, scale: 1.0, opacity: 0.5 },
   haStates: {},
   haPollInterval: null,
+};
+
+const storyLabels = {
+  floor1: 'First Story',
+  floor2: 'Second Story',
 };
 
 const defaultRender = () => ({
@@ -94,7 +105,8 @@ function setStatus(text, isError = false) {
 }
 
 function updateStatusMeta() {
-  statusMeta.textContent = `Floor: ${state.floorId} • Grid: ${state.gridSize}px`;
+  const storyLabel = storyLabels[state.storyId] || state.storyId;
+  statusMeta.textContent = `Story: ${storyLabel} • Floorplan: ${state.floorId} • Grid: ${state.gridSize}px`;
 }
 
 let toastTimer = null;
@@ -202,6 +214,30 @@ function formatTemperatureFromState(entity) {
   return `${value.toFixed(1)}F`;
 }
 
+function saveStoryAssignments() {
+  localStorage.setItem('storyAssignments', JSON.stringify(state.storyAssignments));
+}
+
+function loadStoryAssignments() {
+  try {
+    const raw = localStorage.getItem('storyAssignments');
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object') {
+      state.storyAssignments = {
+        floor1: parsed.floor1 ?? null,
+        floor2: parsed.floor2 ?? null,
+      };
+    }
+  } catch (error) {
+    // Ignore malformed local storage data.
+  }
+}
+
+function getAssignedFloorplanId(storyId) {
+  return state.storyAssignments[storyId] || storyId;
+}
+
 async function refreshHaStates() {
   const fp = currentFloorplan();
   if (!fp) {
@@ -228,6 +264,7 @@ async function refreshHaStates() {
 }
 
 async function initialize() {
+  loadStoryAssignments();
   updateToolButtons();
   updateFloorTabs();
   snapToggle.checked = state.snapToGrid;
@@ -236,7 +273,7 @@ async function initialize() {
   updateStatusMeta();
   resizeCanvas();
   fetchFloorplanList();
-  await ensureFloorplanLoaded(state.floorId, { announce: false });
+  await ensureFloorplanLoaded(getAssignedFloorplanId(state.storyId), { announce: false });
   pushHistory();
   renderProperties();
   render();
@@ -309,6 +346,19 @@ async function loadFloorplan(floorId, { allowCreate = false, announce = true } =
     }
     refreshHaStates();
   } catch (error) {
+    if (allowCreate) {
+      state.floorId = floorId;
+      setFloorplan(createDefaultFloorplan(floorId));
+      updateFloorTabs();
+      loadSelect.value = floorId;
+      setStatus(`Unable to load ${floorId}. Started a new floorplan instead.`, true);
+      updateStatusMeta();
+      if (announce) {
+        showToast(`Unable to load ${floorId}. Started a new floorplan instead.`, 'error');
+      }
+      refreshHaStates();
+      return;
+    }
     setStatus(error.message || `Unable to load ${floorId}.`, true);
     showToast(error.message || `Unable to load ${floorId}.`, 'error');
   }
@@ -346,7 +396,7 @@ function updateToolButtons() {
 
 function updateFloorTabs() {
   floorTabs.forEach((tab) => {
-    tab.classList.toggle('active', tab.dataset.floor === state.floorId);
+    tab.classList.toggle('active', tab.dataset.floor === state.storyId);
   });
 }
 
@@ -367,6 +417,12 @@ async function ensureFloorplanLoaded(floorId, { announce = true } = {}) {
     return;
   }
   await loadFloorplan(floorId, { allowCreate: true, announce });
+}
+
+function switchStory(storyId) {
+  state.storyId = storyId;
+  const assignedFloorplanId = getAssignedFloorplanId(storyId);
+  ensureFloorplanLoaded(assignedFloorplanId);
 }
 
 function resizeCanvas() {
@@ -1285,13 +1341,24 @@ toolButtons.forEach((btn) => {
 floorTabs.forEach((tab) => {
   tab.addEventListener('click', () => {
     const floorId = tab.dataset.floor;
-    ensureFloorplanLoaded(floorId);
+    switchStory(floorId);
   });
 });
 
 loadBtn.addEventListener('click', () => {
   if (!loadSelect.value) return;
   loadFloorplan(loadSelect.value);
+});
+
+assignStoryBtn.addEventListener('click', () => {
+  if (!loadSelect.value) return;
+  const storyLabel = storyLabels[state.storyId] || state.storyId;
+  state.storyAssignments[state.storyId] = loadSelect.value;
+  saveStoryAssignments();
+  setStatus(`Assigned ${loadSelect.value} to ${storyLabel}.`);
+  updateStatusMeta();
+  showToast(`Assigned ${loadSelect.value} to ${storyLabel}.`);
+  ensureFloorplanLoaded(loadSelect.value);
 });
 
 newBtn.addEventListener('click', () => {

@@ -91,7 +91,7 @@
         display: flex;
         flex-direction: column;
         gap: 8px;
-        overflow-y: auto;
+        overflow-y: hidden;
       }
       .tool-button {
         background: transparent;
@@ -206,13 +206,14 @@
     <div id="app">
       <header class="topbar">
         <div class="tabs">
-          <button class="tab" data-floor="floor1">Floor 1</button>
-          <button class="tab" data-floor="floor2">Floor 2</button>
+          <button class="tab" data-floor="floor1">First Story</button>
+          <button class="tab" data-floor="floor2">Second Story</button>
         </div>
         <div class="top-actions">
           <label for="loadSelect">Load</label>
           <select id="loadSelect"></select>
           <button id="loadBtn">Load</button>
+          <button id="assignStoryBtn">Set Story</button>
           <button id="newBtn">New</button>
           
           <input type="file" id="bgUpload" accept="image/*" style="display: none;" />
