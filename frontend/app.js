@@ -17,6 +17,11 @@ const snapToggle = document.getElementById('snapToggle');
 const orthoToggle = document.getElementById('orthoToggle');
 const gridSizeInput = document.getElementById('gridSizeInput');
 const bgRemoveBtn = document.getElementById('bgRemoveBtn');
+const jsonModal = document.getElementById('jsonModal');
+const jsonEditor = document.getElementById('jsonEditor');
+const jsonApplyBtn = document.getElementById('jsonApplyBtn');
+const jsonResetBtn = document.getElementById('jsonResetBtn');
+const jsonCloseBtn = document.getElementById('jsonCloseBtn');
 
 const toolButtons = Array.from(document.querySelectorAll('.tool-button'));
 const floorTabs = Array.from(document.querySelectorAll('.tab'));
@@ -1440,39 +1445,9 @@ function renderProperties() {
     }
 
     const jsonSection = createSection('Raw JSON', { open: false });
-    const textarea = document.createElement('textarea');
-    textarea.className = 'json-editor';
-    textarea.value = JSON.stringify(fp, null, 2);
-    textarea.style.fontSize = `${fp.render.text_font_size || 12}px`;
-    textarea.style.lineHeight = '1.4';
-    jsonSection.body.appendChild(textarea);
-    const actions = document.createElement('div');
-    actions.className = 'json-actions';
-    const applyButton = document.createElement('button');
-    applyButton.type = 'button';
-    applyButton.textContent = 'Apply JSON';
-    applyButton.addEventListener('click', () => {
-      try {
-        const parsed = JSON.parse(textarea.value);
-        pushHistory();
-        const normalized = normalizeFloorplan(parsed);
-        setFloorplan(normalized);
-        renderProperties();
-        render();
-        showToast('Raw JSON applied.');
-      } catch (error) {
-        showToast(`Invalid JSON: ${error.message}`, 'error');
-      }
-    });
-    const resetButton = document.createElement('button');
-    resetButton.type = 'button';
-    resetButton.textContent = 'Reset';
-    resetButton.addEventListener('click', () => {
-      textarea.value = JSON.stringify(currentFloorplan(), null, 2);
-    });
-    actions.appendChild(applyButton);
-    actions.appendChild(resetButton);
-    jsonSection.body.appendChild(actions);
+    jsonSection.body.appendChild(renderActionButton('Open JSON Editor', () => {
+      openJsonEditor();
+    }));
     propertiesPanel.appendChild(jsonSection.details);
     return;
   }
@@ -1734,6 +1709,18 @@ function normalizeFloorplan(value) {
   merged.room_labels = Array.isArray(value?.room_labels) ? value.room_labels : [];
   merged.stairwell = value?.stairwell || null;
   return merged;
+}
+
+function openJsonEditor() {
+  if (!jsonModal || !jsonEditor) return;
+  jsonEditor.value = JSON.stringify(currentFloorplan(), null, 2);
+  jsonModal.classList.remove('hidden');
+  jsonEditor.focus();
+}
+
+function closeJsonEditor() {
+  if (!jsonModal) return;
+  jsonModal.classList.add('hidden');
 }
 
 function formatLegendColors(value) {
@@ -2183,6 +2170,42 @@ gridSizeInput.addEventListener('change', (event) => {
   showToast(`Grid size set to ${next}px.`);
   render();
 });
+
+if (jsonCloseBtn) {
+  jsonCloseBtn.addEventListener('click', () => {
+    closeJsonEditor();
+  });
+}
+
+if (jsonModal) {
+  jsonModal.addEventListener('click', (event) => {
+    if (event.target === jsonModal) {
+      closeJsonEditor();
+    }
+  });
+}
+
+if (jsonApplyBtn && jsonEditor) {
+  jsonApplyBtn.addEventListener('click', () => {
+    try {
+      const parsed = JSON.parse(jsonEditor.value);
+      pushHistory();
+      const normalized = normalizeFloorplan(parsed);
+      setFloorplan(normalized);
+      renderProperties();
+      render();
+      showToast('Raw JSON applied.');
+    } catch (error) {
+      showToast(`Invalid JSON: ${error.message}`, 'error');
+    }
+  });
+}
+
+if (jsonResetBtn && jsonEditor) {
+  jsonResetBtn.addEventListener('click', () => {
+    jsonEditor.value = JSON.stringify(currentFloorplan(), null, 2);
+  });
+}
 
 canvas.addEventListener('mousedown', (event) => {
   const rect = canvas.getBoundingClientRect();

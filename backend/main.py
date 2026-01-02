@@ -1799,15 +1799,12 @@ def draw_legend(
     palette: List[Tuple[int, int, int]],
 ) -> int:
     font, font_size = resolve_font(fp, 12)
-    title = "Legend"
-    title_height = font_size + 2
     x0 = origin[0]
-    y0 = origin[1] + title_height + 2
+    y0 = origin[1]
     x1 = x0 + 200
-    gradient_height = 18
-    label_offset = font_size + 2
+    gradient_height = 26
+    label_offset = font_size + 4
     y1 = y0 + gradient_height
-    draw.text((origin[0], origin[1]), title, fill=(255, 255, 255), font=font)
     for i in range(x0, x1):
         t = (i - x0) / (x1 - x0)
         r, g, b = gradient_rgb(np.array([t]), palette)
@@ -1817,7 +1814,7 @@ def draw_legend(
     max_label = f"{max_f:.1f}F"
     max_label_width = measure_text_width(font, max_label)
     draw.text((x1 - max_label_width, y0 - label_offset), max_label, fill=(255, 255, 255), font=font)
-    return title_height + 2 + label_offset + gradient_height
+    return label_offset + gradient_height
 
 def build_timestamp_lines(now: datetime) -> List[str]:
     date_line = now.strftime("%b %d, %Y")
@@ -1881,32 +1878,33 @@ def compute_timestamp_block_width(fp: FloorplanV1) -> int:
 
 def compute_legend_height(fp: FloorplanV1) -> int:
     font_size = fp.render.text_font_size or 12
-    title_height = font_size + 2
-    label_offset = font_size + 2
-    gradient_height = 18
-    return title_height + 2 + label_offset + gradient_height
+    label_offset = font_size + 4
+    gradient_height = 26
+    return label_offset + gradient_height
 
 def compute_chart_height(fp: FloorplanV1) -> int:
-    return max(90, fp.render.chart_height)
+    return max(120, fp.render.chart_height)
 
 def compute_info_panel_height(fp: FloorplanV1) -> int:
     font_size = fp.render.text_font_size or 12
     box_size = max(16, int(font_size * 1.4))
+    section_gap = 12
+    item_gap = 6
     height = 0
     if fp.render.show_timestamp:
         height += compute_timestamp_block_height(fp)
     if fp.render.show_outside_temp:
         if resolve_outside_temperature(fp) is not None:
             if height:
-                height += 4
+                height += item_gap
             height += max(box_size, font_size)
     if fp.render.show_chart:
         if height:
-            height += 8
+            height += section_gap
         height += compute_chart_height(fp)
     if fp.render.show_legend:
         if height:
-            height += 8
+            height += section_gap
         height += compute_legend_height(fp)
     return height
 
@@ -1938,6 +1936,8 @@ def draw_info_panel(
     margin = fp.render.exterior_margin
     y_cursor = 0
     has_content = False
+    section_gap = 12
+    item_gap = 6
     left = margin
     if fp.render.show_timestamp:
         draw_timestamp(
@@ -1949,7 +1949,7 @@ def draw_info_panel(
         has_content = True
     if fp.render.show_outside_temp:
         if has_content:
-            y_cursor += 4
+            y_cursor += item_gap
         outside_info = resolve_outside_temperature(fp)
         if outside_info:
             outside_temp_value, outside_text = outside_info
@@ -1969,12 +1969,12 @@ def draw_info_panel(
             has_content = True
     if fp.render.show_chart:
         if has_content:
-            y_cursor += 8
+            y_cursor += section_gap
         draw_temperature_chart(draw, fp, size, min_f, max_f, (left, y_cursor + margin))
         y_cursor += compute_chart_height(fp)
     if fp.render.show_legend:
         if has_content:
-            y_cursor += 8
+            y_cursor += section_gap
         y_cursor += draw_legend(draw, min_f, max_f, (left, y_cursor + margin), fp, palette)
         has_content = True
 
