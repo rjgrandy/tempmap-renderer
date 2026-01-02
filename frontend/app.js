@@ -2,6 +2,8 @@ const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
 const propertiesPanel = document.getElementById('properties');
 const statusText = document.getElementById('statusText');
+const statusMeta = document.getElementById('statusMeta');
+const toast = document.getElementById('toast');
 const loadSelect = document.getElementById('loadSelect');
 const loadBtn = document.getElementById('loadBtn');
 const newBtn = document.getElementById('newBtn');
@@ -10,6 +12,7 @@ const undoBtn = document.getElementById('undoBtn');
 const redoBtn = document.getElementById('redoBtn');
 const snapToggle = document.getElementById('snapToggle');
 const orthoToggle = document.getElementById('orthoToggle');
+const gridSizeInput = document.getElementById('gridSizeInput');
 
 const toolButtons = Array.from(document.querySelectorAll('.tool-button'));
 const floorTabs = Array.from(document.querySelectorAll('.tab'));
@@ -88,6 +91,27 @@ function deepCopy(obj) {
 function setStatus(text, isError = false) {
   statusText.textContent = text;
   statusText.classList.toggle('danger', isError);
+}
+
+function updateStatusMeta() {
+  statusMeta.textContent = `Floor: ${state.floorId} • Grid: ${state.gridSize}px`;
+}
+
+let toastTimer = null;
+
+function showToast(message, variant = 'info') {
+  if (!toast) {
+    return;
+  }
+  toast.textContent = message;
+  toast.classList.toggle('error', variant === 'error');
+  toast.classList.add('visible');
+  if (toastTimer) {
+    window.clearTimeout(toastTimer);
+  }
+  toastTimer = window.setTimeout(() => {
+    toast.classList.remove('visible');
+  }, 3200);
 }
 
 function pushHistory() {
@@ -203,16 +227,17 @@ async function refreshHaStates() {
   }
 }
 
-function initialize() {
-  state.floorplans.floor1 = createDefaultFloorplan('floor1');
-  state.floorplans.floor2 = createDefaultFloorplan('floor2');
-  pushHistory();
+async function initialize() {
   updateToolButtons();
   updateFloorTabs();
   snapToggle.checked = state.snapToGrid;
   orthoToggle.checked = state.orthogonalSnap;
+  gridSizeInput.value = state.gridSize;
+  updateStatusMeta();
   resizeCanvas();
   fetchFloorplanList();
+  await ensureFloorplanLoaded(state.floorId, { announce: false });
+  pushHistory();
   renderProperties();
   render();
   refreshHaStates();
@@ -245,16 +270,31 @@ async function fetchFloorplanList() {
     }
     loadSelect.value = state.floorId;
     setStatus('Floorplan list loaded.');
+    updateStatusMeta();
   } catch (error) {
     setStatus(error.message || 'Unable to load floorplans.', true);
+    showToast(error.message || 'Unable to load floorplans.', 'error');
   }
 }
 
-async function loadFloorplan(floorId) {
+async function loadFloorplan(floorId, { allowCreate = false, announce = true } = {}) {
   try {
     setStatus(`Loading ${floorId}...`);
     const response = await fetch(`/api/floorplans/${floorId}`);
     if (!response.ok) {
+      if (response.status === 404 && allowCreate) {
+        state.floorId = floorId;
+        setFloorplan(createDefaultFloorplan(floorId));
+        updateFloorTabs();
+        loadSelect.value = floorId;
+        setStatus(`No saved ${floorId} yet. Started a new floorplan.`);
+        updateStatusMeta();
+        if (announce) {
+          showToast(`No saved ${floorId} yet. Started a new floorplan.`);
+        }
+        refreshHaStates();
+        return;
+      }
       throw new Error(`Failed to load ${floorId} (${response.status})`);
     }
     const payload = await response.json();
@@ -263,9 +303,14 @@ async function loadFloorplan(floorId) {
     updateFloorTabs();
     loadSelect.value = floorId;
     setStatus(`Loaded ${floorId}.`);
+    updateStatusMeta();
+    if (announce) {
+      showToast(`Loaded ${floorId}.`);
+    }
     refreshHaStates();
   } catch (error) {
     setStatus(error.message || `Unable to load ${floorId}.`, true);
+    showToast(error.message || `Unable to load ${floorId}.`, 'error');
   }
 }
 
@@ -284,9 +329,12 @@ async function saveFloorplan() {
     }
     await response.json();
     setStatus(`Saved ${fp.floor_id}.`);
+    updateStatusMeta();
+    showToast(`Saved ${fp.floor_id}.`);
     fetchFloorplanList();
   } catch (error) {
     setStatus(error.message || 'Unable to save floorplan.', true);
+    showToast(error.message || 'Unable to save floorplan.', 'error');
   }
 }
 
@@ -300,6 +348,25 @@ function updateFloorTabs() {
   floorTabs.forEach((tab) => {
     tab.classList.toggle('active', tab.dataset.floor === state.floorId);
   });
+}
+
+async function ensureFloorplanLoaded(floorId, { announce = true } = {}) {
+  if (state.floorplans[floorId]) {
+    state.floorId = floorId;
+    setFloorplan(state.floorplans[floorId]);
+    updateFloorTabs();
+    if (loadSelect.value) {
+      loadSelect.value = floorId;
+    }
+    setStatus(`Viewing ${floorId}.`);
+    updateStatusMeta();
+    if (announce) {
+      showToast(`Viewing ${floorId}.`);
+    }
+    refreshHaStates();
+    return;
+  }
+  await loadFloorplan(floorId, { allowCreate: true, announce });
 }
 
 function resizeCanvas() {
@@ -1217,13 +1284,8 @@ toolButtons.forEach((btn) => {
 
 floorTabs.forEach((tab) => {
   tab.addEventListener('click', () => {
-    state.floorId = tab.dataset.floor;
-    state.selected = null;
-    state.drawing = null;
-    updateFloorTabs();
-    renderProperties();
-    render();
-    refreshHaStates();
+    const floorId = tab.dataset.floor;
+    ensureFloorplanLoaded(floorId);
   });
 });
 
@@ -1236,6 +1298,8 @@ newBtn.addEventListener('click', () => {
   pushHistory();
   setFloorplan(createDefaultFloorplan(state.floorId));
   setStatus(`Created new ${state.floorId}.`);
+  updateStatusMeta();
+  showToast(`Created new ${state.floorId}.`);
   refreshHaStates();
 });
 
@@ -1258,6 +1322,22 @@ snapToggle.addEventListener('change', (event) => {
 
 orthoToggle.addEventListener('change', (event) => {
   state.orthogonalSnap = event.target.checked;
+  render();
+});
+
+gridSizeInput.addEventListener('change', (event) => {
+  const value = Number(event.target.value);
+  if (!Number.isFinite(value) || value <= 0) {
+    gridSizeInput.value = state.gridSize;
+    return;
+  }
+  const next = Math.min(200, Math.max(5, value));
+  state.gridSize = next;
+  gridSizeInput.value = next;
+  setStatus(`Grid size set to ${next}px.`);
+  updateStatusMeta();
+  showToast(`Grid size set to ${next}px.`);
+  render();
 });
 
 canvas.addEventListener('mousedown', (event) => {

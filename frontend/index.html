@@ -115,6 +115,9 @@
         gap: 6px;
         align-items: center;
       }
+      .toolbar label input[type="number"] {
+        width: 64px;
+      }
       .canvas-wrap {
         position: relative;
         background: #10131c;
@@ -172,6 +175,31 @@
       .danger {
         color: var(--danger);
       }
+      .toast {
+        position: fixed;
+        right: 16px;
+        top: 16px;
+        background: var(--panel);
+        border: 1px solid #32384d;
+        color: var(--text);
+        padding: 10px 14px;
+        border-radius: 8px;
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+        opacity: 0;
+        transform: translateY(-8px);
+        pointer-events: none;
+        transition: opacity 0.2s ease, transform 0.2s ease;
+        z-index: 50;
+        max-width: 280px;
+      }
+      .toast.visible {
+        opacity: 1;
+        transform: translateY(0);
+      }
+      .toast.error {
+        border-color: rgba(255, 107, 107, 0.6);
+        color: var(--danger);
+      }
     </style>
   </head>
   <body>
@@ -208,6 +236,10 @@
           <hr />
           <label><input type="checkbox" id="snapToggle" checked /> Snap</label>
           <label><input type="checkbox" id="orthoToggle" checked /> Ortho</label>
+          <label>
+            Grid
+            <input type="number" id="gridSizeInput" min="5" max="200" step="5" />
+          </label>
         </aside>
         <section class="canvas-wrap">
           <canvas id="canvas"></canvas>
@@ -218,9 +250,11 @@
       </div>
       <footer class="statusbar">
         <div class="status-pill" id="statusText">Ready</div>
+        <div class="status-pill" id="statusMeta"></div>
         <div class="status-pill">Space + Drag to Pan • Mouse Wheel to Zoom</div>
       </footer>
     </div>
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
     <script src="app.js"></script>
   </body>
 </html>
