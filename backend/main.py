@@ -13,7 +13,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from typing import Literal
@@ -132,11 +132,19 @@ class RenderParams(BaseModel):
     show_walls: bool = True
     show_labels: bool = True
     show_legend: bool = True
+    legend_colors: Optional[List[str]] = None
     show_timestamp: bool = True
     show_outside_temp: bool = True
     outside_temp_label: str = "Outside"
     outside_temp_entity: Optional[str] = None
     outside_temp_f: Optional[float] = None
+    show_chart: bool = False
+    chart_temp_entity: Optional[str] = None
+    chart_forecast_entity: Optional[str] = None
+    chart_history_hours: float = 12.0
+    chart_forecast_hours: float = 12.0
+    chart_width: int = 260
+    chart_height: int = 80
     text_font_size: Optional[int] = None
     text_font_path: Optional[str] = None
 
@@ -288,6 +296,17 @@ def put_floorplan(floor_id: str, payload: Dict) -> Dict:
     validated = parse_floorplan(payload)
     save_floorplan_file(floor_id, validated)
     return validated
+
+
+@app.delete("/api/floorplans/{floor_id}")
+def delete_floorplan(floor_id: str) -> Dict:
+    floor_id = validate_floorplan_id(floor_id)
+    path = Path(config.data_path) / "floorplans" / f"{floor_id}.json"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Floorplan not found")
+    path.unlink(missing_ok=True)
+    update_floorplan_links(floor_id, None)
+    return {"deleted": floor_id}
 
 
 @app.post("/api/floorplans/{floor_id}/rename")
@@ -447,7 +466,7 @@ def load_all_floorplans() -> Dict[str, Dict]:
     return floorplans
 
 
-def update_floorplan_links(old_id: str, new_id: str) -> None:
+def update_floorplan_links(old_id: str, new_id: Optional[str]) -> None:
     floor_dir = Path(config.data_path) / "floorplans"
     for path in floor_dir.glob("*.json"):
         with path.open("r", encoding="utf-8") as handle:
@@ -478,6 +497,7 @@ def gather_entities(floorplans: Dict[str, Dict]) -> List[str]:
                 entities.append(thermo.get("mode_entity"))
         render_cfg = floorplan.get("render", {})
         entities.append(render_cfg.get("outside_temp_entity"))
+        entities.append(render_cfg.get("chart_temp_entity"))
     return sorted({e for e in entities if e})
 
 def poll_home_assistant(entities: List[str]) -> None:
@@ -1170,11 +1190,12 @@ def render_floorplan_image(floor_id: str, payload: Dict, grid: np.ndarray, metad
     fp = FloorplanV1.parse_obj(payload)
     canvas = Image.new("RGBA", (fp.canvas.width, fp.canvas.height), (20, 20, 20, 255))
     min_f, max_f = resolve_temperature_range(fp, grid)
+    palette = resolve_legend_palette(fp)
     
     # Use Flood Fill mask instead of convex hull to handle concave yards properly
     heatmap_mask = build_floorplan_mask_floodfill(fp)
     
-    heatmap = render_heatmap(grid, min_f, max_f, fp.render.overlay_alpha, canvas.size, heatmap_mask)
+    heatmap = render_heatmap(grid, min_f, max_f, fp.render.overlay_alpha, canvas.size, heatmap_mask, palette)
     canvas = Image.alpha_composite(canvas, heatmap)
     draw = ImageDraw.Draw(canvas)
     if fp.render.show_walls: draw_walls(draw, fp)
@@ -1184,6 +1205,7 @@ def render_floorplan_image(floor_id: str, payload: Dict, grid: np.ndarray, metad
     if fp.render.auto_crop:
         crop_box = compute_floorplan_crop(fp, canvas.size, fp.render.crop_padding)
         if crop_box: 
+            canvas, crop_box = expand_canvas_for_crop(canvas, crop_box)
             canvas = canvas.crop(crop_box)
             draw = ImageDraw.Draw(canvas) # Update draw object for cropped canvas if needed
             # Actually we just crop at the end, that's fine.
@@ -1206,7 +1228,9 @@ def render_floorplan_image(floor_id: str, payload: Dict, grid: np.ndarray, metad
         outside_offset = fp.render.exterior_margin + (timestamp_height + 4 if timestamp_height else 0)
         draw_outside_temperature(draw, fp, canvas.size, min_f, max_f, outside_offset)
     if fp.render.show_legend:
-        draw_legend(draw, min_f, max_f, canvas.size, fp.render.exterior_margin, fp)
+        draw_legend(draw, min_f, max_f, canvas.size, fp.render.exterior_margin, fp, palette)
+    if fp.render.show_chart:
+        draw_temperature_chart(draw, fp, canvas.size, min_f, max_f)
     return canvas.convert("RGB")
 
 def build_floorplan_mask_floodfill(fp: FloorplanV1) -> np.ndarray:
@@ -1273,10 +1297,10 @@ def build_floorplan_mask_floodfill(fp: FloorplanV1) -> np.ndarray:
     full_mask = Image.fromarray(filled).resize((fp.canvas.width, fp.canvas.height), Image.Resampling.NEAREST)
     return np.array(full_mask)
 
-def render_heatmap(grid: np.ndarray, min_f: float, max_f: float, overlay_alpha: float, size: Tuple[int, int], mask: Optional[np.ndarray]) -> Image.Image:
+def render_heatmap(grid: np.ndarray, min_f: float, max_f: float, overlay_alpha: float, size: Tuple[int, int], mask: Optional[np.ndarray], palette: List[Tuple[int, int, int]]) -> Image.Image:
     norm = np.clip((grid - min_f) / (max_f - min_f + 1e-6), 0, 1)
     colors = np.zeros((grid.shape[0], grid.shape[1], 4), dtype=np.uint8)
-    colors[..., 0], colors[..., 1], colors[..., 2] = gradient_rgb(norm)
+    colors[..., 0], colors[..., 1], colors[..., 2] = gradient_rgb(norm, palette)
     colors[..., 3] = int(255 * overlay_alpha)
     
     image = Image.fromarray(colors, mode="RGBA").resize(size, resample=Image.Resampling.BILINEAR)
@@ -1297,11 +1321,11 @@ def render_heatmap(grid: np.ndarray, min_f: float, max_f: float, overlay_alpha: 
     return image
 
 
-def gradient_rgb(norm: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    stops = np.array([0.0, 0.4, 0.5, 0.6, 1.0])
-    colors = np.array([
-        [0, 0, 255], [0, 255, 255], [0, 255, 0], [255, 255, 0], [255, 0, 0]
-    ], dtype=float)
+def gradient_rgb(norm: np.ndarray, palette: List[Tuple[int, int, int]]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if len(palette) < 2:
+        palette = [(0, 0, 255), (255, 0, 0)]
+    stops = np.linspace(0.0, 1.0, len(palette))
+    colors = np.array(palette, dtype=float)
     idx = np.searchsorted(stops, norm, side="right") - 1
     idx = np.clip(idx, 0, len(stops) - 2)
     t = (norm - stops[idx]) / (stops[idx + 1] - stops[idx])
@@ -1309,6 +1333,34 @@ def gradient_rgb(norm: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     c1 = colors[idx + 1]
     blended = c0 + (c1 - c0) * t[..., None]
     return blended[..., 0].astype(np.uint8), blended[..., 1].astype(np.uint8), blended[..., 2].astype(np.uint8)
+
+def parse_hex_color(value: str) -> Optional[Tuple[int, int, int]]:
+    cleaned = value.strip().lstrip("#")
+    if len(cleaned) not in {3, 6}:
+        return None
+    try:
+        if len(cleaned) == 3:
+            cleaned = "".join([ch * 2 for ch in cleaned])
+        return tuple(int(cleaned[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return None
+
+def resolve_legend_palette(fp: FloorplanV1) -> List[Tuple[int, int, int]]:
+    if fp.render.legend_colors:
+        parsed = []
+        for raw in fp.render.legend_colors:
+            color = parse_hex_color(raw)
+            if color:
+                parsed.append(color)
+        if len(parsed) >= 2:
+            return parsed
+    return [
+        (0, 0, 255),
+        (0, 255, 255),
+        (0, 255, 0),
+        (255, 255, 0),
+        (255, 0, 0),
+    ]
 
 
 def resolve_temperature_range(fp: FloorplanV1, grid: np.ndarray) -> Tuple[float, float]:
@@ -1333,16 +1385,39 @@ def add_exterior_margin(
     canvas.paste(image, (margin, top))
     return canvas
 
+def expand_canvas_for_crop(
+    image: Image.Image,
+    crop_box: Tuple[int, int, int, int],
+) -> Tuple[Image.Image, Tuple[int, int, int, int]]:
+    min_x, min_y, max_x, max_y = crop_box
+    left_pad = max(0, -min_x)
+    top_pad = max(0, -min_y)
+    right_pad = max(0, max_x - image.width)
+    bottom_pad = max(0, max_y - image.height)
+    if not any([left_pad, top_pad, right_pad, bottom_pad]):
+        return image, crop_box
+    new_width = image.width + left_pad + right_pad
+    new_height = image.height + top_pad + bottom_pad
+    expanded = Image.new("RGBA", (new_width, new_height), (20, 20, 20, 255))
+    expanded.paste(image, (left_pad, top_pad))
+    shifted_crop = (
+        min_x + left_pad,
+        min_y + top_pad,
+        max_x + left_pad,
+        max_y + top_pad,
+    )
+    return expanded, shifted_crop
+
 def compute_floorplan_crop(fp: FloorplanV1, canvas_size: Tuple[int, int], padding: int) -> Optional[Tuple[int, int, int, int]]:
     points = []
     for wall in fp.walls: points.extend([point_xy(p) for p in wall.points])
     if not points: return None
     xs = [p[0] for p in points]
     ys = [p[1] for p in points]
-    min_x = max(int(min(xs) - padding), 0)
-    min_y = max(int(min(ys) - padding), 0)
-    max_x = min(int(max(xs) + padding), canvas_size[0])
-    max_y = min(int(max(ys) + padding), canvas_size[1])
+    min_x = int(min(xs) - padding)
+    min_y = int(min(ys) - padding)
+    max_x = int(max(xs) + padding)
+    max_y = int(max(ys) + padding)
     return min_x, min_y, max_x, max_y
 
 def draw_walls(draw: ImageDraw.ImageDraw, fp: FloorplanV1) -> None:
@@ -1455,7 +1530,7 @@ def draw_outside_temperature(
     margin = fp.render.exterior_margin
     box_size = max(16, int(font_size * 1.4))
     box_y = top_offset + max(0, (font_size - box_size) // 2)
-    color = color_for_temperature(outside_temp_value, min_f, max_f)
+    color = color_for_temperature(outside_temp_value, min_f, max_f, resolve_legend_palette(fp))
     draw.rectangle(
         (margin, box_y, margin + box_size, box_y + box_size),
         fill=color,
@@ -1463,6 +1538,144 @@ def draw_outside_temperature(
         width=1,
     )
     draw.text((margin + box_size + 6, top_offset), text, fill=(255, 255, 255), font=font)
+
+def fetch_history_series(entity_id: Optional[str], hours: float) -> List[Tuple[datetime, float]]:
+    if not entity_id or not config.ha_base_url or not config.ha_token or hours <= 0:
+        return []
+    start = datetime.now(timezone.utc) - timedelta(hours=hours)
+    url = f"{config.ha_base_url.rstrip('/')}/api/history/period/{start.isoformat()}"
+    headers = {"Authorization": f"Bearer {config.ha_token}"}
+    params = {"filter_entity_id": entity_id, "minimal_response": "1"}
+    try:
+        response = requests.get(url, headers=headers, params=params, timeout=10)
+    except requests.RequestException:
+        return []
+    if response.status_code != 200:
+        return []
+    payload = response.json()
+    if not payload or not isinstance(payload, list) or not payload[0]:
+        return []
+    series = []
+    for item in payload[0]:
+        state = item.get("state")
+        if state is None:
+            continue
+        try:
+            temp = float(state)
+        except (TypeError, ValueError):
+            continue
+        raw_ts = item.get("last_updated") or item.get("last_changed")
+        if not raw_ts:
+            continue
+        try:
+            ts = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        series.append((ts, temp))
+    return series
+
+def fetch_forecast_series(entity_id: Optional[str]) -> List[Tuple[datetime, float]]:
+    if not entity_id or not config.ha_base_url or not config.ha_token:
+        return []
+    url = f"{config.ha_base_url.rstrip('/')}/api/states/{entity_id}"
+    headers = {"Authorization": f"Bearer {config.ha_token}"}
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+    except requests.RequestException:
+        return []
+    if response.status_code != 200:
+        return []
+    payload = response.json()
+    forecast = payload.get("attributes", {}).get("forecast") or []
+    series = []
+    for entry in forecast:
+        temp = entry.get("temperature") or entry.get("temp")
+        if temp is None:
+            continue
+        ts_raw = entry.get("datetime") or entry.get("time")
+        if not ts_raw:
+            continue
+        try:
+            ts = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        series.append((ts, float(temp)))
+    return series
+
+def draw_temperature_chart(
+    draw: ImageDraw.ImageDraw,
+    fp: FloorplanV1,
+    size: Tuple[int, int],
+    min_f: float,
+    max_f: float,
+) -> None:
+    entity_id = fp.render.chart_temp_entity or fp.render.outside_temp_entity
+    if not entity_id:
+        return
+    history_hours = max(fp.render.chart_history_hours, 0.0)
+    forecast_hours = max(fp.render.chart_forecast_hours, 0.0)
+    if history_hours == 0 and forecast_hours == 0:
+        return
+    now = datetime.now(timezone.utc)
+    history = fetch_history_series(entity_id, history_hours)
+    forecast = fetch_forecast_series(fp.render.chart_forecast_entity) if fp.render.chart_forecast_entity else []
+    start = now - timedelta(hours=history_hours)
+    end = now + timedelta(hours=forecast_hours)
+    if not history and not forecast:
+        return
+
+    data_points = [(ts, temp) for ts, temp in history if start <= ts <= end]
+    data_points += [(ts, temp) for ts, temp in forecast if start <= ts <= end]
+    if not data_points:
+        return
+
+    temps = [temp for _ts, temp in data_points]
+    chart_min = min(min(temps), min_f)
+    chart_max = max(max(temps), max_f)
+    if chart_min >= chart_max:
+        chart_max = chart_min + 0.1
+
+    margin = fp.render.exterior_margin
+    width = max(120, fp.render.chart_width)
+    height = max(60, fp.render.chart_height)
+    x1 = size[0] - margin
+    x0 = max(margin, x1 - width)
+    y1 = size[1] - margin
+    y0 = max(margin, y1 - height)
+
+    draw.rectangle((x0, y0, x1, y1), outline=(255, 255, 255), width=1)
+
+    total_seconds = (end - start).total_seconds() or 1.0
+    def to_xy(ts: datetime, temp: float) -> Tuple[float, float]:
+        ratio_x = (ts - start).total_seconds() / total_seconds
+        ratio_y = (temp - chart_min) / (chart_max - chart_min)
+        x = x0 + ratio_x * (x1 - x0)
+        y = y1 - ratio_y * (y1 - y0)
+        return x, y
+
+    hour_cursor = start.replace(minute=0, second=0, microsecond=0)
+    while hour_cursor < end:
+        next_hour = hour_cursor + timedelta(hours=1)
+        hour_center = hour_cursor + (next_hour - hour_cursor) / 2
+        is_day = 6 <= hour_center.astimezone().hour < 18
+        if not is_day:
+            x_start, _ = to_xy(hour_cursor, chart_min)
+            x_end, _ = to_xy(next_hour, chart_min)
+            draw.rectangle((x_start, y0, x_end, y1), fill=(80, 80, 80, 60))
+        hour_cursor = next_hour
+
+    history_points = [to_xy(ts, temp) for ts, temp in history if start <= ts <= now]
+    if len(history_points) > 1:
+        draw.line(history_points, fill=(255, 255, 255), width=2)
+
+    forecast_points = [to_xy(ts, temp) for ts, temp in forecast if now <= ts <= end]
+    if len(forecast_points) > 1:
+        draw.line(forecast_points, fill=(180, 180, 180), width=2)
+
+    current_temp = read_entity_temperature_value(entity_id)
+    if current_temp is not None:
+        cx, cy = to_xy(now, current_temp)
+        draw.ellipse((cx - 3, cy - 3, cx + 3, cy + 3), fill=(255, 255, 255))
 
 def get_font(size: int, font_path: Optional[str] = None) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     """Tries to load a scalable font. Falls back to default if unavailable."""
@@ -1507,13 +1720,13 @@ def format_entity_temperature(entity_id: Optional[str]) -> str:
     try: return f"{float(state):.1f}F"
     except ValueError: return ""
 
-def draw_legend(draw: ImageDraw.ImageDraw, min_f: float, max_f: float, size: Tuple[int, int], margin: int, fp: FloorplanV1) -> None:
+def draw_legend(draw: ImageDraw.ImageDraw, min_f: float, max_f: float, size: Tuple[int, int], margin: int, fp: FloorplanV1, palette: List[Tuple[int, int, int]]) -> None:
     font, font_size = resolve_font(fp, 12)
     x0, y0 = margin, size[1] - 80
     x1, y1 = x0 + 200, size[1] - 40
     for i in range(x0, x1):
         t = (i - x0) / (x1 - x0)
-        r, g, b = gradient_rgb(np.array([t]))
+        r, g, b = gradient_rgb(np.array([t]), palette)
         draw.line([(i, y0), (i, y1)], fill=(int(r[0]), int(g[0]), int(b[0])))
     draw.rectangle((x0, y0, x1, y1), outline=(255, 255, 255), width=1)
     label_offset = font_size + 4
@@ -1609,14 +1822,14 @@ def draw_timestamp(draw: ImageDraw.ImageDraw, fp: FloorplanV1, margin: int) -> i
         margin + font_size + spacing + (font_size / 2),
     )
     draw_analog_clock(draw, clock_center, clock_radius, now)
-    return max(measure_multiline_height(len(lines), font_size, spacing), clock_radius * 2)
+    return measure_multiline_height(len(lines), font_size, spacing)
 
-def color_for_temperature(value_f: float, min_f: float, max_f: float) -> Tuple[int, int, int]:
+def color_for_temperature(value_f: float, min_f: float, max_f: float, palette: List[Tuple[int, int, int]]) -> Tuple[int, int, int]:
     if min_f >= max_f:
         return (255, 255, 255)
     t = (value_f - min_f) / (max_f - min_f)
     t = float(np.clip(t, 0, 1))
-    r, g, b = gradient_rgb(np.array([t]))
+    r, g, b = gradient_rgb(np.array([t]), palette)
     return int(r[0]), int(g[0]), int(b[0])
 
 def image_to_png_bytes(image: Image.Image) -> bytes:

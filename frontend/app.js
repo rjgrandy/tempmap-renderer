@@ -3,11 +3,13 @@ const ctx = canvas.getContext('2d');
 const propertiesPanel = document.getElementById('properties');
 const statusText = document.getElementById('statusText');
 const statusMeta = document.getElementById('statusMeta');
+const coordReadout = document.getElementById('coordReadout');
 const toast = document.getElementById('toast');
 const loadSelect = document.getElementById('loadSelect');
 const loadBtn = document.getElementById('loadBtn');
 const assignStoryBtn = document.getElementById('assignStoryBtn');
 const newBtn = document.getElementById('newBtn');
+const deleteBtn = document.getElementById('deleteBtn');
 const saveBtn = document.getElementById('saveBtn');
 const undoBtn = document.getElementById('undoBtn');
 const redoBtn = document.getElementById('redoBtn');
@@ -37,6 +39,8 @@ const state = {
   view: { x: 40, y: 40, scale: 1 },
   drawing: null,
   selected: null,
+  multiSelected: [],
+  selectionBox: null,
   dragging: null,
   history: { past: [], future: [] },
   spacePressed: false,
@@ -59,11 +63,19 @@ const defaultRender = () => ({
   show_walls: true,
   show_labels: true,
   show_legend: true,
+  legend_colors: null,
   show_timestamp: true,
   show_outside_temp: true,
   outside_temp_label: 'Outside',
   outside_temp_entity: '',
   outside_temp_f: null,
+  show_chart: false,
+  chart_temp_entity: '',
+  chart_forecast_entity: '',
+  chart_history_hours: 12,
+  chart_forecast_hours: 12,
+  chart_width: 260,
+  chart_height: 80,
   text_font_size: null,
 });
 
@@ -109,6 +121,15 @@ function setStatus(text, isError = false) {
 function updateStatusMeta() {
   const storyLabel = storyLabels[state.storyId] || state.storyId;
   statusMeta.textContent = `Story: ${storyLabel} • Floorplan: ${state.floorId} • Grid: ${state.gridSize}px`;
+}
+
+function updateCoordReadout(point) {
+  if (!coordReadout) return;
+  if (!point) {
+    coordReadout.textContent = '';
+    return;
+  }
+  coordReadout.textContent = `X: ${point[0].toFixed(1)} • Y: ${point[1].toFixed(1)}`;
 }
 
 let toastTimer = null;
@@ -175,6 +196,8 @@ function setFloorplan(fp) {
   fp.floor_id = state.floorId;
   state.floorplans[state.floorId] = fp;
   state.selected = null;
+  state.multiSelected = [];
+  state.selectionBox = null;
   state.drawing = null;
   renderProperties();
   render();
@@ -206,6 +229,9 @@ function collectHaEntities(fp) {
   });
   if (fp.render?.outside_temp_entity) {
     entities.add(fp.render.outside_temp_entity);
+  }
+  if (fp.render?.chart_temp_entity) {
+    entities.add(fp.render.chart_temp_entity);
   }
   return Array.from(entities);
 }
@@ -430,6 +456,38 @@ async function saveFloorplan() {
   }
 }
 
+async function deleteFloorplan() {
+  const floorId = loadSelect.value || state.floorId;
+  if (!floorId) {
+    showToast('Select a floorplan to delete.', 'error');
+    return;
+  }
+  if (!window.confirm(`Delete floorplan "${floorId}"? This cannot be undone.`)) {
+    return;
+  }
+  try {
+    const response = await fetch(`/api/floorplans/${encodeURIComponent(floorId)}`, { method: 'DELETE' });
+    if (!response.ok) {
+      const message = await response.text();
+      throw new Error(message || `Failed to delete ${floorId}`);
+    }
+    delete state.floorplans[floorId];
+    Object.entries(state.storyAssignments).forEach(([storyId, assigned]) => {
+      if (assigned === floorId) {
+        state.storyAssignments[storyId] = null;
+      }
+    });
+    saveStoryAssignments();
+    const remaining = await fetchFloorplanList();
+    const nextId = remaining.find((id) => id !== floorId) || state.storyId;
+    await ensureFloorplanLoaded(nextId, { announce: true });
+    showToast(`Deleted ${floorId}.`);
+  } catch (error) {
+    setStatus(error.message || 'Unable to delete floorplan.', true);
+    showToast(error.message || 'Unable to delete floorplan.', 'error');
+  }
+}
+
 function updateStoryAssignmentsForRename(oldId, newId) {
   let changed = false;
   Object.entries(state.storyAssignments).forEach(([storyId, floorId]) => {
@@ -548,6 +606,45 @@ function snapPoint(point, reference = null) {
   return snapped;
 }
 
+function collectSnapTargets(exclude = []) {
+  const fp = currentFloorplan();
+  const excludeSet = new Set(exclude.map((key) => `${key.type}:${key.id}:${key.index ?? ''}`));
+  const targets = [];
+  (fp.walls || []).forEach((wall) => {
+    wall.points.forEach((pt, idx) => {
+      if (excludeSet.has(`wall:${wall.id}:${idx}`)) return;
+      targets.push({ point: pt });
+    });
+  });
+  (fp.doors || []).forEach((door) => {
+    door.segment.forEach((pt, idx) => {
+      if (excludeSet.has(`door:${door.id}:${idx}`)) return;
+      targets.push({ point: pt });
+    });
+  });
+  return targets;
+}
+
+function resolveSnapPoint(point, reference = null, exclude = []) {
+  if (!state.snapToGrid) {
+    return point;
+  }
+  let snapped = snapPoint(point, reference);
+  const threshold = 10 / state.view.scale;
+  const targets = collectSnapTargets(exclude);
+  let best = null;
+  targets.forEach(({ point: target }) => {
+    const dist = pointDistance(snapped, target);
+    if (dist <= threshold && (!best || dist < best.dist)) {
+      best = { point: target, dist };
+    }
+  });
+  if (best) {
+    snapped = [...best.point];
+  }
+  return snapped;
+}
+
 function distanceToSegment(point, a, b) {
   const [px, py] = point;
   const [x1, y1] = a;
@@ -625,7 +722,7 @@ function hitTest(point) {
   for (const wall of (fp.walls || [])) {
     for (let i = 0; i < wall.points.length - 1; i += 1) {
       if (distanceToSegment(point, wall.points[i], wall.points[i + 1]) <= threshold) {
-        return { type: 'wall', id: wall.id };
+        return { type: 'wall', id: wall.id, segmentIndex: i };
       }
     }
   }
@@ -633,6 +730,61 @@ function hitTest(point) {
     return { type: 'stairwell', id: fp.stairwell.id };
   }
   return null;
+}
+
+function boundsFromPoints(points) {
+  const xs = points.map((pt) => pt[0]);
+  const ys = points.map((pt) => pt[1]);
+  return {
+    minX: Math.min(...xs),
+    minY: Math.min(...ys),
+    maxX: Math.max(...xs),
+    maxY: Math.max(...ys),
+  };
+}
+
+function getItemBounds(type, item) {
+  if (type === 'sensor' || type === 'thermostat' || type === 'room_label') {
+    const [x, y] = item.pos;
+    const size = 10;
+    return { minX: x - size, minY: y - size, maxX: x + size, maxY: y + size };
+  }
+  if (type === 'door') {
+    return boundsFromPoints(item.segment);
+  }
+  if (type === 'wall') {
+    return boundsFromPoints(item.points);
+  }
+  if (type === 'stairwell') {
+    return boundsFromPoints(item.polygon);
+  }
+  return null;
+}
+
+function itemIntersectsBox(bounds, box) {
+  return !(bounds.maxX < box.minX || bounds.minX > box.maxX || bounds.maxY < box.minY || bounds.minY > box.maxY);
+}
+
+function findItemsInBox(box) {
+  const fp = currentFloorplan();
+  const hits = [];
+  const items = [
+    ...(fp.sensors || []).map((item) => ({ type: 'sensor', item })),
+    ...(fp.thermostats || []).map((item) => ({ type: 'thermostat', item })),
+    ...(fp.room_labels || []).map((item) => ({ type: 'room_label', item })),
+    ...(fp.doors || []).map((item) => ({ type: 'door', item })),
+    ...(fp.walls || []).map((item) => ({ type: 'wall', item })),
+  ];
+  if (fp.stairwell) {
+    items.push({ type: 'stairwell', item: fp.stairwell });
+  }
+  items.forEach(({ type, item }) => {
+    const bounds = getItemBounds(type, item);
+    if (bounds && itemIntersectsBox(bounds, box)) {
+      hits.push({ type, id: item.id });
+    }
+  });
+  return hits;
 }
 
 function findById(type, id) {
@@ -660,25 +812,30 @@ function findById(type, id) {
 
 function removeSelected() {
   const fp = currentFloorplan();
-  if (!state.selected) {
+  if (!state.selected && !state.multiSelected.length) {
     return;
   }
   pushHistory();
-  const { type, id } = state.selected;
-  if (type === 'wall') {
-    fp.walls = (fp.walls || []).filter((wall) => wall.id !== id);
-  } else if (type === 'door') {
-    fp.doors = (fp.doors || []).filter((door) => door.id !== id);
-  } else if (type === 'sensor') {
-    fp.sensors = (fp.sensors || []).filter((sensor) => sensor.id !== id);
-  } else if (type === 'thermostat') {
-    fp.thermostats = (fp.thermostats || []).filter((thermo) => thermo.id !== id);
-  } else if (type === 'room_label') {
-    fp.room_labels = (fp.room_labels || []).filter((label) => label.id !== id);
-  } else if (type === 'stairwell') {
-    fp.stairwell = null;
-  }
+  const targets = state.multiSelected.length
+    ? state.multiSelected
+    : [state.selected];
+  targets.forEach(({ type, id }) => {
+    if (type === 'wall') {
+      fp.walls = (fp.walls || []).filter((wall) => wall.id !== id);
+    } else if (type === 'door') {
+      fp.doors = (fp.doors || []).filter((door) => door.id !== id);
+    } else if (type === 'sensor') {
+      fp.sensors = (fp.sensors || []).filter((sensor) => sensor.id !== id);
+    } else if (type === 'thermostat') {
+      fp.thermostats = (fp.thermostats || []).filter((thermo) => thermo.id !== id);
+    } else if (type === 'room_label') {
+      fp.room_labels = (fp.room_labels || []).filter((label) => label.id !== id);
+    } else if (type === 'stairwell') {
+      fp.stairwell = null;
+    }
+  });
   state.selected = null;
+  state.multiSelected = [];
   renderProperties();
   render();
 }
@@ -878,54 +1035,71 @@ function renderStairwell(fp) {
 }
 
 function renderSelection() {
-  if (!state.selected) return;
   const fp = currentFloorplan();
-  const item = findById(state.selected.type, state.selected.id);
-  if (!item) return;
   ctx.strokeStyle = '#ff6b6b';
   ctx.lineWidth = 2 / state.view.scale;
-  if (state.selected.type === 'sensor' || state.selected.type === 'thermostat') {
-    const pos = item.pos;
-    ctx.strokeRect(pos[0] - 10 / state.view.scale, pos[1] - 10 / state.view.scale, 20 / state.view.scale, 20 / state.view.scale);
-  } else if (state.selected.type === 'room_label') {
-    const pos = item.pos;
-    ctx.strokeRect(pos[0] - 12 / state.view.scale, pos[1] - 12 / state.view.scale, 24 / state.view.scale, 24 / state.view.scale);
-  } else if (state.selected.type === 'door') {
-    ctx.beginPath();
-    ctx.moveTo(item.segment[0][0], item.segment[0][1]);
-    ctx.lineTo(item.segment[1][0], item.segment[1][1]);
-    ctx.stroke();
-  } else if (state.selected.type === 'wall') {
-    ctx.beginPath();
-    item.points.forEach((pt, idx) => {
-      if (idx === 0) {
-        ctx.moveTo(pt[0], pt[1]);
-      } else {
-        ctx.lineTo(pt[0], pt[1]);
-      }
-    });
-    ctx.stroke();
-    const handleSize = 6 / state.view.scale;
-    ctx.fillStyle = '#ff6b6b';
-    item.points.forEach((pt, idx) => {
-      const half = handleSize / 2;
-      ctx.fillRect(pt[0] - half, pt[1] - half, handleSize, handleSize);
-      if (state.selected.vertexIndex === idx) {
-        ctx.strokeRect(pt[0] - half, pt[1] - half, handleSize, handleSize);
-      }
-    });
-  } else if (state.selected.type === 'stairwell') {
-    ctx.beginPath();
-    item.polygon.forEach((pt, idx) => {
-      if (idx === 0) {
-        ctx.moveTo(pt[0], pt[1]);
-      } else {
-        ctx.lineTo(pt[0], pt[1]);
-      }
-    });
-    ctx.closePath();
-    ctx.stroke();
-  }
+  const selections = state.multiSelected.length ? state.multiSelected : (state.selected ? [state.selected] : []);
+  selections.forEach((selection) => {
+    const item = findById(selection.type, selection.id);
+    if (!item) return;
+    if (selection.type === 'sensor' || selection.type === 'thermostat') {
+      const pos = item.pos;
+      ctx.strokeRect(pos[0] - 10 / state.view.scale, pos[1] - 10 / state.view.scale, 20 / state.view.scale, 20 / state.view.scale);
+    } else if (selection.type === 'room_label') {
+      const pos = item.pos;
+      ctx.strokeRect(pos[0] - 12 / state.view.scale, pos[1] - 12 / state.view.scale, 24 / state.view.scale, 24 / state.view.scale);
+    } else if (selection.type === 'door') {
+      ctx.beginPath();
+      ctx.moveTo(item.segment[0][0], item.segment[0][1]);
+      ctx.lineTo(item.segment[1][0], item.segment[1][1]);
+      ctx.stroke();
+    } else if (selection.type === 'wall') {
+      ctx.beginPath();
+      item.points.forEach((pt, idx) => {
+        if (idx === 0) {
+          ctx.moveTo(pt[0], pt[1]);
+        } else {
+          ctx.lineTo(pt[0], pt[1]);
+        }
+      });
+      ctx.stroke();
+      const handleSize = 6 / state.view.scale;
+      ctx.fillStyle = '#ff6b6b';
+      item.points.forEach((pt, idx) => {
+        const half = handleSize / 2;
+        ctx.fillRect(pt[0] - half, pt[1] - half, handleSize, handleSize);
+        if (selection.vertexIndex === idx) {
+          ctx.strokeRect(pt[0] - half, pt[1] - half, handleSize, handleSize);
+        }
+      });
+    } else if (selection.type === 'stairwell') {
+      ctx.beginPath();
+      item.polygon.forEach((pt, idx) => {
+        if (idx === 0) {
+          ctx.moveTo(pt[0], pt[1]);
+        } else {
+          ctx.lineTo(pt[0], pt[1]);
+        }
+      });
+      ctx.closePath();
+      ctx.stroke();
+    }
+  });
+}
+
+function renderSelectionBox() {
+  if (!state.selectionBox) return;
+  const { start, end } = state.selectionBox;
+  const left = Math.min(start[0], end[0]);
+  const top = Math.min(start[1], end[1]);
+  const width = Math.abs(start[0] - end[0]);
+  const height = Math.abs(start[1] - end[1]);
+  ctx.save();
+  ctx.strokeStyle = '#4ea1ff';
+  ctx.lineWidth = 1 / state.view.scale;
+  ctx.setLineDash([6 / state.view.scale, 4 / state.view.scale]);
+  ctx.strokeRect(left, top, width, height);
+  ctx.restore();
 }
 
 function renderDrawingPreview() {
@@ -989,6 +1163,7 @@ function render() {
   renderThermostats(fp);
   renderRoomLabels(fp);
   renderDrawingPreview();
+  renderSelectionBox();
   renderSelection();
 
   ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -1022,6 +1197,11 @@ function renderProperties() {
   const fp = currentFloorplan();
   const title = document.createElement('h3');
   if (!state.selected) {
+    if (state.multiSelected.length) {
+      title.textContent = `Multiple Items Selected (${state.multiSelected.length})`;
+      propertiesPanel.appendChild(title);
+      return;
+    }
     title.textContent = 'Floorplan Settings';
     propertiesPanel.appendChild(title);
     propertiesPanel.appendChild(renderField('Floor ID', fp.floor_id, (val) => {
@@ -1061,6 +1241,10 @@ function renderProperties() {
     outsideTitle.textContent = 'Outside Temperature';
     outsideTitle.style.marginTop = '20px';
     propertiesPanel.appendChild(outsideTitle);
+    propertiesPanel.appendChild(renderField('Show Timestamp', fp.render.show_timestamp ? 'true' : 'false', (val) => {
+      pushHistory();
+      fp.render.show_timestamp = val === 'true';
+    }, ['true', 'false']));
     propertiesPanel.appendChild(renderField('Show Outside Temp', fp.render.show_outside_temp ? 'true' : 'false', (val) => {
       pushHistory();
       fp.render.show_outside_temp = val === 'true';
@@ -1077,6 +1261,53 @@ function renderProperties() {
     propertiesPanel.appendChild(renderField('Outside Temp (F) Fallback', fp.render.outside_temp_f ?? '', (val) => {
       pushHistory();
       fp.render.outside_temp_f = val === '' ? null : parseFloat(val);
+    }));
+
+    const legendTitle = document.createElement('h3');
+    legendTitle.textContent = 'Legend';
+    legendTitle.style.marginTop = '20px';
+    propertiesPanel.appendChild(legendTitle);
+    propertiesPanel.appendChild(renderField('Show Legend', fp.render.show_legend ? 'true' : 'false', (val) => {
+      pushHistory();
+      fp.render.show_legend = val === 'true';
+    }, ['true', 'false']));
+    propertiesPanel.appendChild(renderField('Legend Colors (hex)', formatLegendColors(fp.render.legend_colors), (val) => {
+      pushHistory();
+      fp.render.legend_colors = parseLegendColorsInput(val);
+    }));
+
+    const chartTitle = document.createElement('h3');
+    chartTitle.textContent = 'Temperature Chart';
+    chartTitle.style.marginTop = '20px';
+    propertiesPanel.appendChild(chartTitle);
+    propertiesPanel.appendChild(renderField('Show Chart', fp.render.show_chart ? 'true' : 'false', (val) => {
+      pushHistory();
+      fp.render.show_chart = val === 'true';
+    }, ['true', 'false']));
+    propertiesPanel.appendChild(renderField('Chart Temp Entity', fp.render.chart_temp_entity || '', (val) => {
+      pushHistory();
+      fp.render.chart_temp_entity = val;
+      refreshHaStates();
+    }));
+    propertiesPanel.appendChild(renderField('Chart Forecast Entity', fp.render.chart_forecast_entity || '', (val) => {
+      pushHistory();
+      fp.render.chart_forecast_entity = val;
+    }));
+    propertiesPanel.appendChild(renderField('Chart History Hours', fp.render.chart_history_hours ?? 12, (val) => {
+      pushHistory();
+      fp.render.chart_history_hours = parseFloat(val) || 12;
+    }));
+    propertiesPanel.appendChild(renderField('Chart Forecast Hours', fp.render.chart_forecast_hours ?? 12, (val) => {
+      pushHistory();
+      fp.render.chart_forecast_hours = parseFloat(val) || 12;
+    }));
+    propertiesPanel.appendChild(renderField('Chart Width (px)', fp.render.chart_width ?? 260, (val) => {
+      pushHistory();
+      fp.render.chart_width = parseInt(val, 10) || 260;
+    }));
+    propertiesPanel.appendChild(renderField('Chart Height (px)', fp.render.chart_height ?? 80, (val) => {
+      pushHistory();
+      fp.render.chart_height = parseInt(val, 10) || 80;
     }));
 
     if (state.backgroundImage) {
@@ -1324,6 +1555,21 @@ function renderActionButton(labelText, onClick) {
   return wrapper;
 }
 
+function formatLegendColors(value) {
+  if (!value || !Array.isArray(value) || !value.length) {
+    return '';
+  }
+  return value.join(', ');
+}
+
+function parseLegendColorsInput(value) {
+  const colors = value
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  return colors.length ? colors : null;
+}
+
 function setTool(tool) {
   state.tool = tool;
   state.drawing = null;
@@ -1458,8 +1704,14 @@ function beginMoveDrag(hit, startWorld, options = {}) {
   const resolvedType = hit.type === 'wall_vertex' ? 'wall' : hit.type;
   const item = findById(resolvedType, hit.id);
   if (!item) return;
-  const dragType = options.labelOffset ? 'label_offset' : 'move';
-  const dragState = { type: dragType, itemType: hit.type, id: hit.id, start: startWorld };
+  const dragType = options.labelOffset ? 'label_offset' : options.stretch ? 'stretch_wall' : 'move';
+  const dragState = {
+    type: dragType,
+    itemType: hit.type,
+    id: hit.id,
+    start: startWorld,
+    segmentIndex: hit.segmentIndex,
+  };
   if (resolvedType === 'sensor' || resolvedType === 'thermostat' || resolvedType === 'room_label') {
     dragState.original = { pos: [...item.pos] };
     if (dragType === 'label_offset') {
@@ -1475,14 +1727,69 @@ function beginMoveDrag(hit, startWorld, options = {}) {
     if (hit.type === 'wall_vertex') {
       dragState.vertexIndex = hit.vertexIndex;
     }
+    if (dragType === 'stretch_wall') {
+      const first = item.points[0];
+      const last = item.points[item.points.length - 1];
+      const distToStart = pointDistance(startWorld, first);
+      const distToEnd = pointDistance(startWorld, last);
+      dragState.stretchAnchorIndex = distToStart <= distToEnd ? 0 : item.points.length - 1;
+    }
   } else if (resolvedType === 'stairwell') {
     dragState.original = { polygon: item.polygon.map((pt) => [...pt]) };
   }
   state.dragging = dragState;
 }
 
+function beginMultiDrag(startWorld) {
+  const items = state.multiSelected.map((selection) => {
+    const item = findById(selection.type, selection.id);
+    if (!item) return null;
+    if (selection.type === 'sensor' || selection.type === 'thermostat' || selection.type === 'room_label') {
+      return { ...selection, original: { pos: [...item.pos] } };
+    }
+    if (selection.type === 'door') {
+      return { ...selection, original: { segment: item.segment.map((pt) => [...pt]) } };
+    }
+    if (selection.type === 'wall') {
+      return { ...selection, original: { points: item.points.map((pt) => [...pt]) } };
+    }
+    if (selection.type === 'stairwell') {
+      return { ...selection, original: { polygon: item.polygon.map((pt) => [...pt]) } };
+    }
+    return null;
+  }).filter(Boolean);
+  state.dragging = {
+    type: 'multi_move',
+    start: startWorld,
+    items,
+  };
+}
+
 function updateMoveDrag(world) {
-  if (!state.dragging || (state.dragging.type !== 'move' && state.dragging.type !== 'label_offset')) return;
+  if (!state.dragging || !['move', 'label_offset', 'stretch_wall', 'multi_move'].includes(state.dragging.type)) return;
+  if (state.dragging.type === 'multi_move') {
+    const reference = state.dragging.items[0]?.original?.pos || state.dragging.items[0]?.original?.segment?.[0] || state.dragging.items[0]?.original?.points?.[0] || world;
+    const snappedReference = resolveSnapPoint(
+      [reference[0] + (world[0] - state.dragging.start[0]), reference[1] + (world[1] - state.dragging.start[1])],
+      reference,
+    );
+    const delta = [snappedReference[0] - reference[0], snappedReference[1] - reference[1]];
+    state.dragging.items.forEach((selection) => {
+      const item = findById(selection.type, selection.id);
+      if (!item) return;
+      if (selection.type === 'sensor' || selection.type === 'thermostat' || selection.type === 'room_label') {
+        item.pos = [selection.original.pos[0] + delta[0], selection.original.pos[1] + delta[1]];
+      } else if (selection.type === 'door') {
+        item.segment = selection.original.segment.map((pt) => [pt[0] + delta[0], pt[1] + delta[1]]);
+      } else if (selection.type === 'wall') {
+        item.points = selection.original.points.map((pt) => [pt[0] + delta[0], pt[1] + delta[1]]);
+      } else if (selection.type === 'stairwell') {
+        item.polygon = selection.original.polygon.map((pt) => [pt[0] + delta[0], pt[1] + delta[1]]);
+      }
+    });
+    render();
+    return;
+  }
   const delta = [world[0] - state.dragging.start[0], world[1] - state.dragging.start[1]];
   const resolvedType = state.dragging.itemType === 'wall_vertex' ? 'wall' : state.dragging.itemType;
   const item = findById(resolvedType, state.dragging.id);
@@ -1492,23 +1799,60 @@ function updateMoveDrag(world) {
       item.label_offset_x = Math.round(state.dragging.original.offset.x + delta[0] * state.view.scale);
       item.label_offset_y = Math.round(state.dragging.original.offset.y + delta[1] * state.view.scale);
     } else {
-      item.pos = [state.dragging.original.pos[0] + delta[0], state.dragging.original.pos[1] + delta[1]];
+      const base = state.dragging.original.pos;
+      const next = resolveSnapPoint([base[0] + delta[0], base[1] + delta[1]], base);
+      item.pos = next;
     }
   } else if (resolvedType === 'door') {
-    item.segment = state.dragging.original.segment.map((pt) => [pt[0] + delta[0], pt[1] + delta[1]]);
+    const reference = state.dragging.original.segment[0];
+    const snappedReference = resolveSnapPoint([reference[0] + delta[0], reference[1] + delta[1]], reference);
+    const snappedDelta = [snappedReference[0] - reference[0], snappedReference[1] - reference[1]];
+    item.segment = state.dragging.original.segment.map((pt) => [pt[0] + snappedDelta[0], pt[1] + snappedDelta[1]]);
   } else if (resolvedType === 'wall') {
     if (state.dragging.itemType === 'wall_vertex') {
       const updated = state.dragging.original.points.map((pt) => [...pt]);
-      updated[state.dragging.vertexIndex] = [
-        state.dragging.original.points[state.dragging.vertexIndex][0] + delta[0],
-        state.dragging.original.points[state.dragging.vertexIndex][1] + delta[1],
-      ];
+      const base = state.dragging.original.points[state.dragging.vertexIndex];
+      const snapped = resolveSnapPoint(
+        [base[0] + delta[0], base[1] + delta[1]],
+        base,
+        [{ type: 'wall', id: item.id, index: state.dragging.vertexIndex }],
+      );
+      updated[state.dragging.vertexIndex] = snapped;
       item.points = updated;
+    } else if (state.dragging.type === 'stretch_wall') {
+      const originalPoints = state.dragging.original.points;
+      const anchorIndex = state.dragging.stretchAnchorIndex ?? 0;
+      const anchor = originalPoints[anchorIndex];
+      const endIndex = anchorIndex === 0 ? originalPoints.length - 1 : 0;
+      const end = originalPoints[endIndex];
+      const axis = [end[0] - anchor[0], end[1] - anchor[1]];
+      const axisLength = Math.hypot(axis[0], axis[1]) || 1;
+      const axisUnit = [axis[0] / axisLength, axis[1] / axisLength];
+      const targetEnd = resolveSnapPoint([end[0] + delta[0], end[1] + delta[1]], end, [
+        { type: 'wall', id: item.id, index: endIndex },
+      ]);
+      const newLength = Math.max(1, (targetEnd[0] - anchor[0]) * axisUnit[0] + (targetEnd[1] - anchor[1]) * axisUnit[1]);
+      const scale = newLength / axisLength;
+      item.points = originalPoints.map((pt) => {
+        const vec = [pt[0] - anchor[0], pt[1] - anchor[1]];
+        const proj = vec[0] * axisUnit[0] + vec[1] * axisUnit[1];
+        const perp = [vec[0] - proj * axisUnit[0], vec[1] - proj * axisUnit[1]];
+        return [
+          anchor[0] + axisUnit[0] * proj * scale + perp[0],
+          anchor[1] + axisUnit[1] * proj * scale + perp[1],
+        ];
+      });
     } else {
-      item.points = state.dragging.original.points.map((pt) => [pt[0] + delta[0], pt[1] + delta[1]]);
+      const reference = state.dragging.original.points[0];
+      const snappedReference = resolveSnapPoint([reference[0] + delta[0], reference[1] + delta[1]], reference);
+      const snappedDelta = [snappedReference[0] - reference[0], snappedReference[1] - reference[1]];
+      item.points = state.dragging.original.points.map((pt) => [pt[0] + snappedDelta[0], pt[1] + snappedDelta[1]]);
     }
   } else if (resolvedType === 'stairwell') {
-    item.polygon = state.dragging.original.polygon.map((pt) => [pt[0] + delta[0], pt[1] + delta[1]]);
+    const reference = state.dragging.original.polygon[0];
+    const snappedReference = resolveSnapPoint([reference[0] + delta[0], reference[1] + delta[1]], reference);
+    const snappedDelta = [snappedReference[0] - reference[0], snappedReference[1] - reference[1]];
+    item.polygon = state.dragging.original.polygon.map((pt) => [pt[0] + snappedDelta[0], pt[1] + snappedDelta[1]]);
   }
   render();
 }
@@ -1615,6 +1959,10 @@ newBtn.addEventListener('click', () => {
   refreshHaStates();
 });
 
+deleteBtn.addEventListener('click', () => {
+  deleteFloorplan();
+});
+
 saveBtn.addEventListener('click', () => {
   saveFloorplan();
 });
@@ -1671,16 +2019,28 @@ canvas.addEventListener('mousedown', (event) => {
   if (state.tool === 'select') {
     const hit = hitTest(world);
     if (hit) {
-      if (hit.type === 'wall_vertex') {
-        state.selected = { type: 'wall', id: hit.id, vertexIndex: hit.vertexIndex };
-      } else {
-        state.selected = hit;
+      state.selectionBox = null;
+      const isMultiHit = state.multiSelected.some((item) => item.type === hit.type && item.id === hit.id);
+      if (!isMultiHit) {
+        if (hit.type === 'wall_vertex') {
+          state.selected = { type: 'wall', id: hit.id, vertexIndex: hit.vertexIndex };
+        } else {
+          state.selected = hit;
+        }
+        state.multiSelected = [];
       }
       renderProperties();
       const labelOffset = event.shiftKey && (hit.type === 'sensor' || hit.type === 'thermostat');
-      beginMoveDrag(hit, world, { labelOffset });
+      const stretch = event.shiftKey && hit.type === 'wall';
+      if (state.multiSelected.length && isMultiHit) {
+        beginMultiDrag(world);
+      } else {
+        beginMoveDrag(hit, world, { labelOffset, stretch });
+      }
     } else {
       state.selected = null;
+      state.multiSelected = [];
+      state.selectionBox = { start: world, end: world };
       renderProperties();
     }
     render();
@@ -1752,6 +2112,7 @@ canvas.addEventListener('mousedown', (event) => {
 canvas.addEventListener('mousemove', (event) => {
   const rect = canvas.getBoundingClientRect();
   const world = screenToWorld(event.clientX - rect.left, event.clientY - rect.top);
+  updateCoordReadout(world);
 
   if (state.dragging?.type === 'pan') {
     state.view.x = state.dragging.origin.x + (event.clientX - state.dragging.start[0]);
@@ -1762,6 +2123,15 @@ canvas.addEventListener('mousemove', (event) => {
 
   if (state.dragging?.type === 'move') {
     updateMoveDrag(world);
+    return;
+  }
+  if (state.dragging?.type === 'label_offset' || state.dragging?.type === 'stretch_wall' || state.dragging?.type === 'multi_move') {
+    updateMoveDrag(world);
+    return;
+  }
+  if (state.selectionBox) {
+    state.selectionBox.end = world;
+    render();
     return;
   }
 
@@ -1785,10 +2155,26 @@ canvas.addEventListener('mouseup', (event) => {
     state.dragging = null;
     return;
   }
-  if (state.dragging?.type === 'move' || state.dragging?.type === 'label_offset') {
+  if (state.dragging?.type === 'move' || state.dragging?.type === 'label_offset' || state.dragging?.type === 'stretch_wall' || state.dragging?.type === 'multi_move') {
     pushHistory();
     state.dragging = null;
     renderProperties();
+    return;
+  }
+  if (state.selectionBox) {
+    const { start, end } = state.selectionBox;
+    const box = {
+      minX: Math.min(start[0], end[0]),
+      minY: Math.min(start[1], end[1]),
+      maxX: Math.max(start[0], end[0]),
+      maxY: Math.max(start[1], end[1]),
+    };
+    const hits = findItemsInBox(box);
+    state.selectionBox = null;
+    state.multiSelected = hits;
+    state.selected = hits.length === 1 ? hits[0] : null;
+    renderProperties();
+    render();
     return;
   }
   if (state.tool === 'door' && state.drawing?.type === 'door' && state.drawing.start) {
@@ -1801,10 +2187,15 @@ canvas.addEventListener('mouseleave', () => {
   if (state.dragging?.type === 'pan') {
     state.dragging = null;
   }
-  if (state.dragging?.type === 'move' || state.dragging?.type === 'label_offset') {
+  if (state.dragging?.type === 'move' || state.dragging?.type === 'label_offset' || state.dragging?.type === 'stretch_wall' || state.dragging?.type === 'multi_move') {
     pushHistory();
     state.dragging = null;
   }
+  if (state.selectionBox) {
+    state.selectionBox = null;
+    render();
+  }
+  updateCoordReadout(null);
 });
 
 canvas.addEventListener('dblclick', () => {
@@ -1839,6 +2230,7 @@ window.addEventListener('keydown', (event) => {
   }
   if (event.key === 'Escape') {
     state.drawing = null;
+    state.selectionBox = null;
     render();
   }
   if ((event.key === 'Delete' || event.key === 'Backspace') && state.selected) {
