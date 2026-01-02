@@ -292,9 +292,7 @@ def put_floorplan(floor_id: str, payload: Dict) -> Dict:
 
 @app.post("/api/floorplans/{floor_id}/rename")
 def rename_floorplan(floor_id: str, payload: RenameFloorplanRequest) -> Dict:
-    new_id = payload.new_id.strip()
-    if not new_id:
-        raise HTTPException(status_code=400, detail="new_id is required")
+    new_id = validate_floorplan_id(payload.new_id)
     if new_id == floor_id:
         return load_floorplan_file(floor_id)
     floor_dir = Path(config.data_path) / "floorplans"
@@ -395,6 +393,24 @@ def parse_floorplan(payload: Dict) -> Dict:
     except ValidationError as error:
         raise HTTPException(status_code=422, detail=error.errors()) from error
     return json.loads(parsed.json())
+
+
+def validate_floorplan_id(floor_id: str) -> str:
+    cleaned = floor_id.strip()
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="new_id is required")
+    if cleaned in {".", ".."}:
+        raise HTTPException(status_code=400, detail="Invalid floorplan id")
+    if Path(cleaned).name != cleaned or "/" in cleaned or "\\" in cleaned:
+        raise HTTPException(status_code=400, detail="Invalid floorplan id")
+    floor_dir = Path(config.data_path) / "floorplans"
+    base_dir = floor_dir.resolve()
+    target = (floor_dir / f"{cleaned}.json").resolve()
+    try:
+        target.relative_to(base_dir)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail="Invalid floorplan id") from error
+    return cleaned
 
 
 def now_iso() -> str:
