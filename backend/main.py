@@ -4,6 +4,7 @@ import bisect
 import heapq
 import io
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -167,6 +168,10 @@ class FloorplanV1(BaseModel):
         extra = "ignore"
 
 
+class RenameFloorplanRequest(BaseModel):
+    new_id: str
+
+
 class AppConfig(BaseModel):
     data_path: str
     ha_base_url: str
@@ -282,6 +287,28 @@ def get_floorplan(floor_id: str) -> Dict:
 def put_floorplan(floor_id: str, payload: Dict) -> Dict:
     validated = parse_floorplan(payload)
     save_floorplan_file(floor_id, validated)
+    return validated
+
+
+@app.post("/api/floorplans/{floor_id}/rename")
+def rename_floorplan(floor_id: str, payload: RenameFloorplanRequest) -> Dict:
+    new_id = payload.new_id.strip()
+    if not new_id:
+        raise HTTPException(status_code=400, detail="new_id is required")
+    if new_id == floor_id:
+        return load_floorplan_file(floor_id)
+    floor_dir = Path(config.data_path) / "floorplans"
+    old_path = floor_dir / f"{floor_id}.json"
+    new_path = floor_dir / f"{new_id}.json"
+    if not old_path.exists():
+        raise HTTPException(status_code=404, detail="Floorplan not found")
+    if new_path.exists():
+        raise HTTPException(status_code=409, detail="Floorplan already exists")
+    payload_data = load_floorplan_file(floor_id)
+    payload_data["floor_id"] = new_id
+    validated = parse_floorplan(payload_data)
+    save_floorplan_file(new_id, validated)
+    old_path.unlink(missing_ok=True)
     return validated
 
 
@@ -491,6 +518,33 @@ def cleanup_frames() -> None:
 
 def render_floorplan(floor_id: str) -> Image.Image:
     floorplans = load_all_floorplans()
+    if floor_id == "all":
+        if not floorplans:
+            raise HTTPException(status_code=404, detail="Floorplans not found")
+        grids, metadata = solve_all_floorplans(floorplans)
+        images = []
+        for floor_key in sorted(floorplans.keys()):
+            grid = grids.get(floor_key)
+            if grid is None:
+                continue
+            images.append(
+                (
+                    floor_key,
+                    render_floorplan_image(
+                        floor_key,
+                        floorplans[floor_key],
+                        grid,
+                        metadata.get(floor_key, {}),
+                    ),
+                )
+            )
+        if not images:
+            raise HTTPException(status_code=404, detail="Floorplans not found")
+        return stitch_images_horizontally(
+            images,
+            config.timelapse_border_px,
+            config.timelapse_label_font_size,
+        )
     if floor_id not in floorplans:
         raise HTTPException(status_code=404, detail="Floorplan not found")
     grids, metadata = solve_all_floorplans(floorplans)
@@ -1366,7 +1420,7 @@ def draw_outside_temperature(
     label = fp.render.outside_temp_label.strip() or "Outside"
     text = f"{label}: {outside_temp}"
     margin = fp.render.exterior_margin
-    box_size = max(10, int(font_size * 0.8))
+    box_size = max(16, int(font_size * 1.4))
     box_y = top_offset + max(0, (font_size - box_size) // 2)
     color = color_for_temperature(outside_temp_value, min_f, max_f)
     draw.rectangle(
@@ -1433,8 +1487,7 @@ def draw_legend(draw: ImageDraw.ImageDraw, min_f: float, max_f: float, size: Tup
     draw.text((x0, y0 - label_offset), f"{min_f:.1f}F", fill=(255, 255, 255), font=font)
     draw.text((x1 - 48, y0 - label_offset), f"{max_f:.1f}F", fill=(255, 255, 255), font=font)
 
-def build_timestamp_lines() -> List[str]:
-    now = datetime.now()
+def build_timestamp_lines(now: datetime) -> List[str]:
     date_line = f"{now:%a}, {now:%b} {now.day}, {now:%Y}"
     time_line = now.strftime("%I:%M%p").lstrip("0")
     return [date_line, time_line]
@@ -1444,22 +1497,59 @@ def measure_multiline_height(line_count: int, font_size: int, spacing: int) -> i
         return 0
     return (font_size * line_count) + (spacing * (line_count - 1))
 
+def measure_text_width(font: ImageFont.ImageFont | ImageFont.FreeTypeFont, text: str) -> int:
+    try:
+        bbox = font.getbbox(text)
+        return bbox[2] - bbox[0]
+    except AttributeError:
+        width, _height = font.getsize(text)
+        return width
+
 def compute_text_block_height(fp: FloorplanV1) -> int:
     font_size = fp.render.text_font_size or 12
     spacing = max(2, int(font_size * 0.2))
     height = 0
     if fp.render.show_timestamp:
-        height += measure_multiline_height(2, font_size, spacing)
+        timestamp_height = measure_multiline_height(2, font_size, spacing)
+        clock_height = int(font_size * 1.8)
+        height += max(timestamp_height, clock_height)
     if fp.render.show_outside_temp:
         if height:
             height += 4
         height += font_size
     return height
 
+def draw_analog_clock(
+    draw: ImageDraw.ImageDraw,
+    center: Tuple[float, float],
+    radius: int,
+    now: datetime,
+) -> None:
+    if radius <= 0:
+        return
+    cx, cy = center
+    draw.ellipse(
+        (cx - radius, cy - radius, cx + radius, cy + radius),
+        outline=(255, 255, 255),
+        width=2,
+    )
+    hour_angle = (now.hour % 12 + now.minute / 60.0) * 30.0
+    minute_angle = (now.minute + now.second / 60.0) * 6.0
+    for angle, length, width in [
+        (hour_angle, radius * 0.55, 3),
+        (minute_angle, radius * 0.8, 2),
+    ]:
+        radians = math.radians(angle - 90)
+        x = cx + math.cos(radians) * length
+        y = cy + math.sin(radians) * length
+        draw.line((cx, cy, x, y), fill=(255, 255, 255), width=width)
+    draw.ellipse((cx - 2, cy - 2, cx + 2, cy + 2), fill=(255, 255, 255))
+
 def draw_timestamp(draw: ImageDraw.ImageDraw, fp: FloorplanV1, margin: int) -> int:
     font, font_size = resolve_font(fp, 12)
     spacing = max(2, int(font_size * 0.2))
-    lines = build_timestamp_lines()
+    now = datetime.now()
+    lines = build_timestamp_lines(now)
     draw.multiline_text(
         (margin, margin),
         "\n".join(lines),
@@ -1467,7 +1557,14 @@ def draw_timestamp(draw: ImageDraw.ImageDraw, fp: FloorplanV1, margin: int) -> i
         font=font,
         spacing=spacing,
     )
-    return measure_multiline_height(len(lines), font_size, spacing)
+    text_width = max((measure_text_width(font, line) for line in lines), default=0)
+    clock_radius = int(font_size * 0.9)
+    clock_center = (
+        margin + text_width + clock_radius + 12,
+        margin + font_size + spacing + (font_size / 2),
+    )
+    draw_analog_clock(draw, clock_center, clock_radius, now)
+    return max(measure_multiline_height(len(lines), font_size, spacing), clock_radius * 2)
 
 def color_for_temperature(value_f: float, min_f: float, max_f: float) -> Tuple[int, int, int]:
     if min_f >= max_f:
