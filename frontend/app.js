@@ -272,8 +272,14 @@ async function initialize() {
   gridSizeInput.value = state.gridSize;
   updateStatusMeta();
   resizeCanvas();
-  fetchFloorplanList();
-  await ensureFloorplanLoaded(getAssignedFloorplanId(state.storyId), { announce: false });
+  const availableFloorplans = await fetchFloorplanList();
+  let initialFloorId = getAssignedFloorplanId(state.storyId);
+  if (availableFloorplans.length && !availableFloorplans.includes(initialFloorId)) {
+    initialFloorId = availableFloorplans[0];
+    state.storyAssignments[state.storyId] = initialFloorId;
+    saveStoryAssignments();
+  }
+  await ensureFloorplanLoaded(initialFloorId, { announce: false });
   pushHistory();
   renderProperties();
   render();
@@ -292,25 +298,45 @@ async function fetchFloorplanList() {
     }
     const payload = await response.json();
     const ids = payload.floorplans || [];
+    const seen = new Set(ids);
+    Object.entries(state.floorplans).forEach(([floorId, fp]) => {
+      if (fp) {
+        seen.add(floorId);
+      }
+    });
+    Object.values(state.storyAssignments).forEach((floorId) => {
+      if (floorId) {
+        seen.add(floorId);
+      }
+    });
+    const mergedIds = Array.from(seen).sort();
     loadSelect.innerHTML = '';
-    ids.forEach((id) => {
+    mergedIds.forEach((id) => {
       const option = document.createElement('option');
       option.value = id;
       option.textContent = id;
       loadSelect.appendChild(option);
     });
-    if (!ids.includes(state.floorId)) {
+    if (state.floorId && !mergedIds.includes(state.floorId)) {
       const fallback = document.createElement('option');
       fallback.value = state.floorId;
       fallback.textContent = state.floorId;
       loadSelect.appendChild(fallback);
     }
+    if (!loadSelect.options.length) {
+      const emptyOption = document.createElement('option');
+      emptyOption.value = '';
+      emptyOption.textContent = 'No floorplans found';
+      loadSelect.appendChild(emptyOption);
+    }
     loadSelect.value = state.floorId;
     setStatus('Floorplan list loaded.');
     updateStatusMeta();
+    return mergedIds;
   } catch (error) {
     setStatus(error.message || 'Unable to load floorplans.', true);
     showToast(error.message || 'Unable to load floorplans.', 'error');
+    return [];
   }
 }
 

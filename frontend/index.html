@@ -91,6 +91,7 @@
         display: flex;
         flex-direction: column;
         gap: 8px;
+        overflow-x: hidden;
         overflow-y: hidden;
       }
       .tool-button {
@@ -114,9 +115,15 @@
         display: flex;
         gap: 6px;
         align-items: center;
+        max-width: 100%;
+      }
+      .toolbar label.toolbar-grid {
+        flex-direction: column;
+        align-items: flex-start;
       }
       .toolbar label input[type="number"] {
-        width: 64px;
+        width: 100%;
+        min-width: 0;
       }
       .canvas-wrap {
         position: relative;
@@ -237,7 +244,7 @@
           <hr />
           <label><input type="checkbox" id="snapToggle" checked /> Snap</label>
           <label><input type="checkbox" id="orthoToggle" checked /> Ortho</label>
-          <label>
+          <label class="toolbar-grid">
             Grid
             <input type="number" id="gridSizeInput" min="5" max="200" step="5" />
           </label>
