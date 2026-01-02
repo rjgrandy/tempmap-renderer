@@ -575,8 +575,19 @@ def render_floorplan(floor_id: str) -> Image.Image:
         if not floorplans:
             raise HTTPException(status_code=404, detail="Floorplans not found")
         grids, metadata = solve_all_floorplans(floorplans)
-        images = []
+        ranges = []
         for floor_key in sorted(floorplans.keys()):
+            grid = grids.get(floor_key)
+            if grid is None:
+                continue
+            fp = FloorplanV1.parse_obj(floorplans[floor_key])
+            ranges.append(resolve_temperature_range(fp, grid))
+        if not ranges:
+            raise HTTPException(status_code=404, detail="Floorplans not found")
+        min_f = min(range_pair[0] for range_pair in ranges)
+        max_f = max(range_pair[1] for range_pair in ranges)
+        images = []
+        for idx, floor_key in enumerate(sorted(floorplans.keys())):
             grid = grids.get(floor_key)
             if grid is None:
                 continue
@@ -588,6 +599,8 @@ def render_floorplan(floor_id: str) -> Image.Image:
                         floorplans[floor_key],
                         grid,
                         metadata.get(floor_key, {}),
+                        render_info=idx == 0,
+                        range_override=(min_f, max_f),
                     ),
                 )
             )
@@ -1186,10 +1199,17 @@ def point_in_polygon(x: float, y: float, xs: List[float], ys: List[float]) -> bo
     return inside
 
 
-def render_floorplan_image(floor_id: str, payload: Dict, grid: np.ndarray, metadata: Dict) -> Image.Image:
+def render_floorplan_image(
+    floor_id: str,
+    payload: Dict,
+    grid: np.ndarray,
+    metadata: Dict,
+    render_info: bool = True,
+    range_override: Optional[Tuple[float, float]] = None,
+) -> Image.Image:
     fp = FloorplanV1.parse_obj(payload)
     canvas = Image.new("RGBA", (fp.canvas.width, fp.canvas.height), (20, 20, 20, 255))
-    min_f, max_f = resolve_temperature_range(fp, grid)
+    min_f, max_f = range_override or resolve_temperature_range(fp, grid)
     palette = resolve_legend_palette(fp)
     
     # Use Flood Fill mask instead of convex hull to handle concave yards properly
@@ -1210,27 +1230,22 @@ def render_floorplan_image(floor_id: str, payload: Dict, grid: np.ndarray, metad
             draw = ImageDraw.Draw(canvas) # Update draw object for cropped canvas if needed
             # Actually we just crop at the end, that's fine.
     
-    # Legend/Timestamp margin
-    if fp.render.show_legend or fp.render.show_timestamp or fp.render.show_outside_temp:
-        top_padding = fp.render.exterior_margin + compute_text_block_height(fp) if (fp.render.show_timestamp or fp.render.show_outside_temp) else 0
+    if render_info and any([
+        fp.render.show_legend,
+        fp.render.show_timestamp,
+        fp.render.show_outside_temp,
+        fp.render.show_chart,
+    ]):
+        info_height = compute_info_panel_height(fp)
+        top_padding = fp.render.exterior_margin + info_height
         canvas = add_exterior_margin(
             canvas,
             fp.render.exterior_margin,
             top_padding,
-            fp.render.show_legend,
+            fp.render.exterior_margin // 2,
         )
         draw = ImageDraw.Draw(canvas)
-    
-    timestamp_height = 0
-    if fp.render.show_timestamp:
-        timestamp_height = draw_timestamp(draw, fp, fp.render.exterior_margin)
-    if fp.render.show_outside_temp:
-        outside_offset = fp.render.exterior_margin + (timestamp_height + 4 if timestamp_height else 0)
-        draw_outside_temperature(draw, fp, canvas.size, min_f, max_f, outside_offset)
-    if fp.render.show_legend:
-        draw_legend(draw, min_f, max_f, canvas.size, fp.render.exterior_margin, fp, palette)
-    if fp.render.show_chart:
-        draw_temperature_chart(draw, fp, canvas.size, min_f, max_f)
+        draw_info_panel(draw, fp, canvas.size, min_f, max_f, palette)
     return canvas.convert("RGB")
 
 def build_floorplan_mask_floodfill(fp: FloorplanV1) -> np.ndarray:
@@ -1375,10 +1390,10 @@ def add_exterior_margin(
     image: Image.Image,
     margin: int,
     top_padding: int,
-    show_legend: bool,
+    bottom_padding: int,
 ) -> Image.Image:
     top = top_padding if top_padding > 0 else margin // 2
-    bottom = margin + 60 if show_legend else margin // 2
+    bottom = bottom_padding if bottom_padding > 0 else margin // 2
     new_width = image.width + margin * 2
     new_height = image.height + top + bottom
     canvas = Image.new("RGBA", (new_width, new_height), (20, 20, 20, 255))
@@ -1508,36 +1523,41 @@ def draw_room_labels(draw: ImageDraw.ImageDraw, fp: FloorplanV1) -> None:
         font, _font_size = resolve_font(fp, label.font_size)
         draw.text((x + label.label_offset_x, y + label.label_offset_y), label.label, fill=(255, 255, 255), font=font)
 
-def draw_outside_temperature(
-    draw: ImageDraw.ImageDraw,
-    fp: FloorplanV1,
-    size: Tuple[int, int],
-    min_f: float,
-    max_f: float,
-    top_offset: int,
-) -> None:
+def resolve_outside_temperature(fp: FloorplanV1) -> Optional[Tuple[float, str]]:
     outside_temp_value = None
     if fp.render.outside_temp_entity:
         outside_temp_value = read_entity_temperature_value(fp.render.outside_temp_entity)
     elif fp.render.outside_temp_f is not None:
         outside_temp_value = fp.render.outside_temp_f
     if outside_temp_value is None:
-        return
+        return None
     outside_temp = f"{outside_temp_value:.1f}F"
-    font, font_size = resolve_font(fp, 12)
     label = fp.render.outside_temp_label.strip() or "Outside"
     text = f"{label}: {outside_temp}"
-    margin = fp.render.exterior_margin
+    return outside_temp_value, text
+
+def draw_outside_temperature(
+    draw: ImageDraw.ImageDraw,
+    fp: FloorplanV1,
+    min_f: float,
+    max_f: float,
+    top_offset: int,
+    left_offset: int,
+    outside_temp_value: float,
+    text: str,
+) -> int:
+    font, font_size = resolve_font(fp, 12)
     box_size = max(16, int(font_size * 1.4))
     box_y = top_offset + max(0, (font_size - box_size) // 2)
     color = color_for_temperature(outside_temp_value, min_f, max_f, resolve_legend_palette(fp))
     draw.rectangle(
-        (margin, box_y, margin + box_size, box_y + box_size),
+        (left_offset, box_y, left_offset + box_size, box_y + box_size),
         fill=color,
         outline=(255, 255, 255),
         width=1,
     )
-    draw.text((margin + box_size + 6, top_offset), text, fill=(255, 255, 255), font=font)
+    draw.text((left_offset + box_size + 6, top_offset), text, fill=(255, 255, 255), font=font)
+    return max(box_size, font_size)
 
 def fetch_history_series(entity_id: Optional[str], hours: float) -> List[Tuple[datetime, float]]:
     if not entity_id or not config.ha_base_url or not config.ha_token or hours <= 0:
@@ -1610,26 +1630,27 @@ def draw_temperature_chart(
     size: Tuple[int, int],
     min_f: float,
     max_f: float,
-) -> None:
+    origin: Optional[Tuple[int, int]] = None,
+) -> int:
     entity_id = fp.render.chart_temp_entity or fp.render.outside_temp_entity
     if not entity_id:
-        return
+        return 0
     history_hours = max(fp.render.chart_history_hours, 0.0)
     forecast_hours = max(fp.render.chart_forecast_hours, 0.0)
     if history_hours == 0 and forecast_hours == 0:
-        return
+        return 0
     now = datetime.now(timezone.utc)
     history = fetch_history_series(entity_id, history_hours)
     forecast = fetch_forecast_series(fp.render.chart_forecast_entity) if fp.render.chart_forecast_entity else []
     start = now - timedelta(hours=history_hours)
     end = now + timedelta(hours=forecast_hours)
     if not history and not forecast:
-        return
+        return 0
 
     data_points = [(ts, temp) for ts, temp in history if start <= ts <= end]
     data_points += [(ts, temp) for ts, temp in forecast if start <= ts <= end]
     if not data_points:
-        return
+        return 0
 
     temps = [temp for _ts, temp in data_points]
     chart_min = min(min(temps), min_f)
@@ -1637,14 +1658,23 @@ def draw_temperature_chart(
     if chart_min >= chart_max:
         chart_max = chart_min + 0.1
 
+    font, font_size = resolve_font(fp, 11)
     margin = fp.render.exterior_margin
-    width = max(120, fp.render.chart_width)
-    height = max(60, fp.render.chart_height)
-    x1 = size[0] - margin
-    x0 = max(margin, x1 - width)
-    y1 = size[1] - margin
-    y0 = max(margin, y1 - height)
+    width = max(160, fp.render.chart_width)
+    height = max(90, fp.render.chart_height)
+    origin_x = origin[0] if origin else max(margin, size[0] - margin - width)
+    origin_y = origin[1] if origin else max(margin, size[1] - margin - height)
+    title = "Temperature"
+    title_height = font_size + 2
+    y_axis_label_width = measure_text_width(font, f"{chart_max:.1f}F") + 6
+    bottom_label_height = font_size + 6
+    right_pad = 6
+    x0 = origin_x + y_axis_label_width
+    y0 = origin_y + title_height + 4
+    x1 = origin_x + width - right_pad
+    y1 = origin_y + height - bottom_label_height
 
+    draw.text((origin_x, origin_y), title, fill=(255, 255, 255), font=font)
     draw.rectangle((x0, y0, x1, y1), outline=(255, 255, 255), width=1)
 
     total_seconds = (end - start).total_seconds() or 1.0
@@ -1666,18 +1696,51 @@ def draw_temperature_chart(
             draw.rectangle((x_start, y0, x_end, y1), fill=(80, 80, 80, 60))
         hour_cursor = next_hour
 
-    history_points = [to_xy(ts, temp) for ts, temp in history if start <= ts <= now]
-    if len(history_points) > 1:
-        draw.line(history_points, fill=(255, 255, 255), width=2)
+    palette = resolve_legend_palette(fp)
+    history_points = [(ts, *to_xy(ts, temp), temp) for ts, temp in history if start <= ts <= now]
+    for idx in range(len(history_points) - 1):
+        _ts, x_start, y_start, temp_start = history_points[idx]
+        _ts2, x_end, y_end, temp_end = history_points[idx + 1]
+        segment_temp = (temp_start + temp_end) / 2
+        color = color_for_temperature(segment_temp, min_f, max_f, palette)
+        draw.line([(x_start, y_start), (x_end, y_end)], fill=color, width=2)
 
-    forecast_points = [to_xy(ts, temp) for ts, temp in forecast if now <= ts <= end]
-    if len(forecast_points) > 1:
-        draw.line(forecast_points, fill=(180, 180, 180), width=2)
+    forecast_points = [(ts, *to_xy(ts, temp), temp) for ts, temp in forecast if now <= ts <= end]
+    for idx in range(len(forecast_points) - 1):
+        _ts, x_start, y_start, temp_start = forecast_points[idx]
+        _ts2, x_end, y_end, temp_end = forecast_points[idx + 1]
+        segment_temp = (temp_start + temp_end) / 2
+        color = color_for_temperature(segment_temp, min_f, max_f, palette)
+        draw.line([(x_start, y_start), (x_end, y_end)], fill=color, width=2)
 
     current_temp = read_entity_temperature_value(entity_id)
     if current_temp is not None:
         cx, cy = to_xy(now, current_temp)
         draw.ellipse((cx - 3, cy - 3, cx + 3, cy + 3), fill=(255, 255, 255))
+
+    y_ticks = [chart_min, (chart_min + chart_max) / 2, chart_max]
+    for tick in y_ticks:
+        _, y = to_xy(start, tick)
+        draw.line([(x0 - 4, y), (x0, y)], fill=(255, 255, 255), width=1)
+        label = f"{tick:.1f}F"
+        label_width = measure_text_width(font, label)
+        draw.text((x0 - 6 - label_width, y - (font_size / 2)), label, fill=(255, 255, 255), font=font)
+
+    def format_tick_time(ts: datetime) -> str:
+        return ts.astimezone().strftime("%I%p").lstrip("0")
+
+    tick_positions = [start, now, end]
+    if not (start <= now <= end):
+        mid = start + (end - start) / 2
+        tick_positions = [start, mid, end]
+    for ts in tick_positions:
+        x, _ = to_xy(ts, chart_min)
+        draw.line([(x, y1), (x, y1 + 4)], fill=(255, 255, 255), width=1)
+        label = "Now" if abs((ts - now).total_seconds()) < 900 else format_tick_time(ts)
+        label_width = measure_text_width(font, label)
+        draw.text((x - label_width / 2, y1 + 4), label, fill=(255, 255, 255), font=font)
+
+    return height
 
 def get_font(size: int, font_path: Optional[str] = None) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     """Tries to load a scalable font. Falls back to default if unavailable."""
@@ -1722,23 +1785,38 @@ def format_entity_temperature(entity_id: Optional[str]) -> str:
     try: return f"{float(state):.1f}F"
     except ValueError: return ""
 
-def draw_legend(draw: ImageDraw.ImageDraw, min_f: float, max_f: float, size: Tuple[int, int], margin: int, fp: FloorplanV1, palette: List[Tuple[int, int, int]]) -> None:
+def draw_legend(
+    draw: ImageDraw.ImageDraw,
+    min_f: float,
+    max_f: float,
+    origin: Tuple[int, int],
+    fp: FloorplanV1,
+    palette: List[Tuple[int, int, int]],
+) -> int:
     font, font_size = resolve_font(fp, 12)
-    x0, y0 = margin, size[1] - 80
-    x1, y1 = x0 + 200, size[1] - 40
+    title = "Legend"
+    title_height = font_size + 2
+    x0 = origin[0]
+    y0 = origin[1] + title_height + 2
+    x1 = x0 + 200
+    gradient_height = 18
+    label_offset = font_size + 2
+    y1 = y0 + gradient_height
+    draw.text((origin[0], origin[1]), title, fill=(255, 255, 255), font=font)
     for i in range(x0, x1):
         t = (i - x0) / (x1 - x0)
         r, g, b = gradient_rgb(np.array([t]), palette)
         draw.line([(i, y0), (i, y1)], fill=(int(r[0]), int(g[0]), int(b[0])))
     draw.rectangle((x0, y0, x1, y1), outline=(255, 255, 255), width=1)
-    label_offset = font_size + 4
     draw.text((x0, y0 - label_offset), f"{min_f:.1f}F", fill=(255, 255, 255), font=font)
-    draw.text((x1 - 48, y0 - label_offset), f"{max_f:.1f}F", fill=(255, 255, 255), font=font)
+    max_label = f"{max_f:.1f}F"
+    max_label_width = measure_text_width(font, max_label)
+    draw.text((x1 - max_label_width, y0 - label_offset), max_label, fill=(255, 255, 255), font=font)
+    return title_height + 2 + label_offset + gradient_height
 
 def build_timestamp_lines(now: datetime) -> List[str]:
-    date_line = f"{now:%a}, {now:%b} {now.day}, {now:%Y}"
     time_line = now.strftime("%I:%M%p").lstrip("0")
-    return [date_line, time_line]
+    return [time_line]
 
 def measure_multiline_height(line_count: int, font_size: int, spacing: int) -> int:
     if line_count <= 0:
@@ -1770,7 +1848,7 @@ def compute_text_block_height(fp: FloorplanV1) -> int:
     spacing = max(2, int(font_size * 0.2))
     height = 0
     if fp.render.show_timestamp:
-        timestamp_height = measure_multiline_height(2, font_size, spacing)
+        timestamp_height = measure_multiline_height(1, font_size, spacing)
         clock_height = clock_radius_for_font(font_size) * 2
         height += max(timestamp_height, clock_height)
     if fp.render.show_outside_temp:
@@ -1778,6 +1856,108 @@ def compute_text_block_height(fp: FloorplanV1) -> int:
             height += 4
         height += font_size
     return height
+
+def compute_timestamp_block_height(fp: FloorplanV1) -> int:
+    font_size = fp.render.text_font_size or 12
+    spacing = max(2, int(font_size * 0.2))
+    timestamp_height = measure_multiline_height(1, font_size, spacing)
+    clock_height = clock_radius_for_font(font_size) * 2
+    return max(timestamp_height, clock_height)
+
+def compute_timestamp_block_width(fp: FloorplanV1) -> int:
+    font, _font_size = resolve_font(fp, 12)
+    now = datetime.now()
+    text_width = max((measure_text_width(font, line) for line in build_timestamp_lines(now)), default=0)
+    clock_radius = clock_radius_for_font(fp.render.text_font_size or 12)
+    return int(text_width + clock_radius * 2 + 12)
+
+def compute_legend_height(fp: FloorplanV1) -> int:
+    font_size = fp.render.text_font_size or 12
+    title_height = font_size + 2
+    label_offset = font_size + 2
+    gradient_height = 18
+    return title_height + 2 + label_offset + gradient_height
+
+def compute_chart_height(fp: FloorplanV1) -> int:
+    return max(90, fp.render.chart_height)
+
+def compute_info_panel_height(fp: FloorplanV1) -> int:
+    font_size = fp.render.text_font_size or 12
+    box_size = max(16, int(font_size * 1.4))
+    height = 0
+    if fp.render.show_timestamp:
+        height += compute_timestamp_block_height(fp)
+    if fp.render.show_outside_temp:
+        if resolve_outside_temperature(fp) is not None:
+            if height:
+                height += 4
+            height += max(box_size, font_size)
+    if fp.render.show_legend:
+        if height:
+            height += 8
+        height += compute_legend_height(fp)
+    if fp.render.show_chart:
+        if height:
+            height += 8
+        height += compute_chart_height(fp)
+    return height
+
+def draw_info_panel(
+    draw: ImageDraw.ImageDraw,
+    fp: FloorplanV1,
+    size: Tuple[int, int],
+    min_f: float,
+    max_f: float,
+    palette: List[Tuple[int, int, int]],
+) -> None:
+    margin = fp.render.exterior_margin
+    y_cursor = 0
+    has_content = False
+    center_x = size[0] / 2
+    if fp.render.show_timestamp:
+        timestamp_width = compute_timestamp_block_width(fp)
+        draw_timestamp(
+            draw,
+            fp,
+            (int(center_x - (timestamp_width / 2)), y_cursor + margin),
+        )
+        y_cursor += compute_timestamp_block_height(fp)
+        has_content = True
+    if fp.render.show_outside_temp:
+        if has_content:
+            y_cursor += 4
+        outside_info = resolve_outside_temperature(fp)
+        if outside_info:
+            outside_temp_value, outside_text = outside_info
+            font, font_size = resolve_font(fp, 12)
+            box_size = max(16, int(font_size * 1.4))
+            outside_width = box_size + 6 + measure_text_width(font, outside_text)
+            left = int(center_x - (outside_width / 2))
+            outside_height = draw_outside_temperature(
+                draw,
+                fp,
+                min_f,
+                max_f,
+                y_cursor + margin,
+                left,
+                outside_temp_value,
+                outside_text,
+            )
+            y_cursor += outside_height
+            has_content = True
+    if fp.render.show_legend:
+        if has_content:
+            y_cursor += 8
+        legend_width = 200
+        left = int(center_x - (legend_width / 2))
+        y_cursor += draw_legend(draw, min_f, max_f, (left, y_cursor + margin), fp, palette)
+        has_content = True
+    if fp.render.show_chart:
+        if has_content:
+            y_cursor += 8
+        chart_width = max(160, fp.render.chart_width)
+        left = int(center_x - (chart_width / 2))
+        draw_temperature_chart(draw, fp, size, min_f, max_f, (left, y_cursor + margin))
 
 def draw_analog_clock(
     draw: ImageDraw.ImageDraw,
@@ -1805,13 +1985,13 @@ def draw_analog_clock(
         draw.line((cx, cy, x, y), fill=(255, 255, 255), width=width)
     draw.ellipse((cx - 2, cy - 2, cx + 2, cy + 2), fill=(255, 255, 255))
 
-def draw_timestamp(draw: ImageDraw.ImageDraw, fp: FloorplanV1, margin: int) -> int:
+def draw_timestamp(draw: ImageDraw.ImageDraw, fp: FloorplanV1, origin: Tuple[int, int]) -> int:
     font, font_size = resolve_font(fp, 12)
     spacing = max(2, int(font_size * 0.2))
     now = datetime.now()
     lines = build_timestamp_lines(now)
     draw.multiline_text(
-        (margin, margin),
+        origin,
         "\n".join(lines),
         fill=(255, 255, 255),
         font=font,
@@ -1820,8 +2000,8 @@ def draw_timestamp(draw: ImageDraw.ImageDraw, fp: FloorplanV1, margin: int) -> i
     text_width = max((measure_text_width(font, line) for line in lines), default=0)
     clock_radius = clock_radius_for_font(font_size)
     clock_center = (
-        margin + text_width + clock_radius + 12,
-        margin + font_size + spacing + (font_size / 2),
+        origin[0] + text_width + clock_radius + 12,
+        origin[1] + font_size / 2,
     )
     draw_analog_clock(draw, clock_center, clock_radius, now)
     return measure_multiline_height(len(lines), font_size, spacing)
