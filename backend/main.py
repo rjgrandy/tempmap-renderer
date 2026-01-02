@@ -1589,7 +1589,9 @@ def fetch_forecast_series(entity_id: Optional[str]) -> List[Tuple[datetime, floa
     forecast = payload.get("attributes", {}).get("forecast") or []
     series = []
     for entry in forecast:
-        temp = entry.get("temperature") or entry.get("temp")
+        temp = entry.get("temperature")
+        if temp is None and "temp" in entry:
+            temp = entry.get("temp")
         if temp is None:
             continue
         ts_raw = entry.get("datetime") or entry.get("time")
