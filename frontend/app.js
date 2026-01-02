@@ -346,6 +346,19 @@ async function loadFloorplan(floorId, { allowCreate = false, announce = true } =
     }
     refreshHaStates();
   } catch (error) {
+    if (allowCreate) {
+      state.floorId = floorId;
+      setFloorplan(createDefaultFloorplan(floorId));
+      updateFloorTabs();
+      loadSelect.value = floorId;
+      setStatus(`Unable to load ${floorId}. Started a new floorplan instead.`, true);
+      updateStatusMeta();
+      if (announce) {
+        showToast(`Unable to load ${floorId}. Started a new floorplan instead.`, 'error');
+      }
+      refreshHaStates();
+      return;
+    }
     setStatus(error.message || `Unable to load ${floorId}.`, true);
     showToast(error.message || `Unable to load ${floorId}.`, 'error');
   }
