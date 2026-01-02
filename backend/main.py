@@ -307,6 +307,7 @@ def rename_floorplan(floor_id: str, payload: RenameFloorplanRequest) -> Dict:
     validated = parse_floorplan(payload_data)
     save_floorplan_file(new_id, validated)
     old_path.unlink(missing_ok=True)
+    update_floorplan_links(floor_id, new_id)
     return validated
 
 
@@ -444,6 +445,22 @@ def load_all_floorplans() -> Dict[str, Dict]:
         with path.open("r", encoding="utf-8") as handle:
             floorplans[path.stem] = json.load(handle)
     return floorplans
+
+
+def update_floorplan_links(old_id: str, new_id: str) -> None:
+    floor_dir = Path(config.data_path) / "floorplans"
+    for path in floor_dir.glob("*.json"):
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        stairwells = payload.get("stairwells", [])
+        updated = False
+        for stair in stairwells:
+            if stair.get("link_to_floor_id") == old_id:
+                stair["link_to_floor_id"] = new_id
+                updated = True
+        if updated:
+            validated = parse_floorplan(payload)
+            save_floorplan_file(path.stem, validated)
 
 def gather_entities(floorplans: Dict[str, Dict]) -> List[str]:
     entities = []
