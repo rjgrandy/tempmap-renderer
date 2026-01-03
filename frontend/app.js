@@ -724,8 +724,8 @@ function labelHitTest(point) {
     const baseFontSize = sensor.font_size || 12;
     const fontSizeWorld = baseFontSize / state.view.scale;
     const align = getLabelAlignment(sensor);
-    const offX = (sensor.label_offset_x || 10) / state.view.scale;
-    const offY = (sensor.label_offset_y || -8) / state.view.scale;
+    const offX = (sensor.label_offset_x ?? 10) / state.view.scale;
+    const offY = (sensor.label_offset_y ?? -8) / state.view.scale;
     const lineHeight = (baseFontSize + 2) / state.view.scale;
     for (let i = 0; i < lines.length; i += 1) {
       const y = sensor.pos[1] + offY + i * lineHeight;
@@ -741,8 +741,8 @@ function labelHitTest(point) {
     const baseFontSize = thermo.font_size || 12;
     const fontSizeWorld = baseFontSize / state.view.scale;
     const align = getLabelAlignment(thermo);
-    const offX = (thermo.label_offset_x || 12) / state.view.scale;
-    const offY = (thermo.label_offset_y || -8) / state.view.scale;
+    const offX = (thermo.label_offset_x ?? 12) / state.view.scale;
+    const offY = (thermo.label_offset_y ?? -8) / state.view.scale;
     const lineHeight = (baseFontSize + 2) / state.view.scale;
     for (let i = 0; i < lines.length; i += 1) {
       const y = thermo.pos[1] + offY + i * lineHeight;
@@ -756,8 +756,8 @@ function labelHitTest(point) {
     if (!label.label) continue;
     const fontSizeWorld = (label.font_size || 16) / state.view.scale;
     const align = getLabelAlignment(label);
-    const offX = (label.label_offset_x || 0) / state.view.scale;
-    const offY = (label.label_offset_y || 0) / state.view.scale;
+    const offX = (label.label_offset_x ?? 0) / state.view.scale;
+    const offY = (label.label_offset_y ?? 0) / state.view.scale;
     const x = label.pos[0] + offX;
     const y = label.pos[1] + offY;
     if (pointInTextBounds(point, label.label, fontSizeWorld, align, x, y)) {
@@ -1003,52 +1003,29 @@ function getThermostatLabelLines(thermo) {
   const modeState = readHaState(thermo.mode_entity);
   const modeLower = modeState ? modeState.toLowerCase() : '';
 
-  let tempLine = '';
-  let modeLabel = modeState;
   let setpointLine = '';
-  const hasEntityData = tempValue || setpointValue || setpointLow || setpointHigh || modeState;
-
-  if (hasEntityData) {
-    if (['heat_cool', 'auto'].includes(modeLower)) {
-      if (setpointLow && setpointHigh) {
-        setpointLine = `${setpointLow} / ${setpointHigh}`;
-      } else {
-        setpointLine = setpointLow || setpointHigh || setpointValue;
-      }
-    } else if (modeLower === 'heat') {
-      setpointLine = setpointValue || setpointLow;
-    } else if (modeLower === 'cool') {
-      setpointLine = setpointValue || setpointHigh;
-    } else {
-      setpointLine = setpointValue || setpointLow || setpointHigh;
-    }
-
-    const detailParts = [];
-    if (tempValue) {
-      detailParts.push(tempValue);
-    }
-    if (setpointLine) {
-      detailParts.push(setpointLine);
-    }
-    tempLine = detailParts.join(' / ');
+  if (setpointLow && setpointHigh) {
+    setpointLine = `${setpointLow} / ${setpointHigh}`;
+  } else if (['heat_cool', 'auto'].includes(modeLower)) {
+    setpointLine = setpointLow || setpointHigh || setpointValue;
+  } else if (modeLower === 'heat') {
+    setpointLine = setpointValue || setpointLow;
+  } else if (modeLower === 'cool') {
+    setpointLine = setpointValue || setpointHigh;
   } else {
-    const previewMode = (thermo.preview_mode || 'heat_cool').toLowerCase();
-    modeLabel = previewMode;
-    const previewTemp = '72.0F';
-    const previewSetpoint = previewMode === 'heat'
-      ? '68.0F'
-      : previewMode === 'cool'
-        ? '74.0F'
-        : '68.0F / 74.0F';
-    tempLine = `${previewTemp} / ${previewSetpoint}`;
+    setpointLine = setpointValue || setpointLow || setpointHigh;
   }
 
-  let detailLine = tempLine;
-  if (modeLabel) {
-    detailLine = detailLine ? `${detailLine} (${modeLabel})` : modeLabel;
+  let actionLine = '';
+  if (modeState) {
+    actionLine = modeState.replace(/_/g, ' ').replace(/\b\w/g, (char) => char.toUpperCase());
   }
 
-  return [label, detailLine].filter(Boolean);
+  const lines = [label];
+  if (tempValue) lines.push(tempValue);
+  if (setpointLine) lines.push(setpointLine);
+  if (actionLine) lines.push(actionLine);
+  return lines.filter(Boolean);
 }
 
 function renderSensors(fp) {
@@ -1063,8 +1040,8 @@ function renderSensors(fp) {
     if (fp.render.show_labels) {
       const labelLines = getSensorLabelLines(sensor);
       ctx.textAlign = getLabelAlignment(sensor);
-      const offX = (sensor.label_offset_x || 10) / state.view.scale;
-      const offY = (sensor.label_offset_y || -8) / state.view.scale;
+      const offX = (sensor.label_offset_x ?? 10) / state.view.scale;
+      const offY = (sensor.label_offset_y ?? -8) / state.view.scale;
 
       labelLines.forEach((line, index) => {
         const lineOffset = index * ((baseFontSize + 2) / state.view.scale);
@@ -1087,8 +1064,8 @@ function renderThermostats(fp) {
       ctx.fillStyle = '#f5c542';
       const labelLines = getThermostatLabelLines(thermo);
       ctx.textAlign = getLabelAlignment(thermo);
-      const offX = (thermo.label_offset_x || 12) / state.view.scale;
-      const offY = (thermo.label_offset_y || -8) / state.view.scale;
+      const offX = (thermo.label_offset_x ?? 12) / state.view.scale;
+      const offY = (thermo.label_offset_y ?? -8) / state.view.scale;
 
       labelLines.forEach((line, index) => {
         const lineOffset = index * ((baseFontSize + 2) / state.view.scale);
@@ -1110,8 +1087,8 @@ function renderRoomLabels(fp) {
     const fontSize = (label.font_size || 16) / state.view.scale;
     ctx.font = `${fontSize}px sans-serif`;
     ctx.textAlign = getLabelAlignment(label);
-    const offX = (label.label_offset_x || 0) / state.view.scale;
-    const offY = (label.label_offset_y || 0) / state.view.scale;
+    const offX = (label.label_offset_x ?? 0) / state.view.scale;
+    const offY = (label.label_offset_y ?? 0) / state.view.scale;
     ctx.fillText(label.label, label.pos[0] + offX, label.pos[1] + offY);
   });
   ctx.textAlign = 'left';
@@ -1529,11 +1506,11 @@ function renderProperties() {
       pushHistory();
       item.font_size = parseInt(val) || 12;
     }));
-    detailSection.body.appendChild(renderField('Label Offset X', item.label_offset_x || 10, (val) => {
+    detailSection.body.appendChild(renderField('Label Offset X', item.label_offset_x ?? 10, (val) => {
       pushHistory();
       item.label_offset_x = parseInt(val) || 0;
     }));
-    detailSection.body.appendChild(renderField('Label Offset Y', item.label_offset_y || -8, (val) => {
+    detailSection.body.appendChild(renderField('Label Offset Y', item.label_offset_y ?? -8, (val) => {
       pushHistory();
       item.label_offset_y = parseInt(val) || 0;
     }));
@@ -1584,11 +1561,11 @@ function renderProperties() {
       pushHistory();
       item.font_size = parseInt(val) || 12;
     }));
-    detailSection.body.appendChild(renderField('Label Offset X', item.label_offset_x || 12, (val) => {
+    detailSection.body.appendChild(renderField('Label Offset X', item.label_offset_x ?? 12, (val) => {
       pushHistory();
       item.label_offset_x = parseInt(val) || 0;
     }));
-    detailSection.body.appendChild(renderField('Label Offset Y', item.label_offset_y || -8, (val) => {
+    detailSection.body.appendChild(renderField('Label Offset Y', item.label_offset_y ?? -8, (val) => {
       pushHistory();
       item.label_offset_y = parseInt(val) || 0;
     }));
@@ -1610,11 +1587,11 @@ function renderProperties() {
       pushHistory();
       item.font_size = parseInt(val) || 16;
     }));
-    detailSection.body.appendChild(renderField('Label Offset X', item.label_offset_x || 0, (val) => {
+    detailSection.body.appendChild(renderField('Label Offset X', item.label_offset_x ?? 0, (val) => {
       pushHistory();
       item.label_offset_x = parseInt(val) || 0;
     }));
-    detailSection.body.appendChild(renderField('Label Offset Y', item.label_offset_y || 0, (val) => {
+    detailSection.body.appendChild(renderField('Label Offset Y', item.label_offset_y ?? 0, (val) => {
       pushHistory();
       item.label_offset_y = parseInt(val) || 0;
     }));
@@ -1887,8 +1864,8 @@ function beginMoveDrag(hit, startWorld, options = {}) {
     dragState.original = { pos: [...item.pos] };
     if (dragType === 'label_offset') {
       dragState.original.offset = {
-        x: item.label_offset_x || 0,
-        y: item.label_offset_y || 0,
+        x: item.label_offset_x ?? 0,
+        y: item.label_offset_y ?? 0,
       };
     }
   } else if (resolvedType === 'door') {
