@@ -1643,14 +1643,46 @@ def fetch_state_history(entity_id: Optional[str], hours: float) -> List[Tuple[da
     return series
 
 def order_thermostats_for_charts(thermostats: List[Thermostat]) -> List[Thermostat]:
-    def sort_key(thermo: Thermostat) -> Tuple[int, str]:
-        label = (thermo.device_label or "").lower()
+    preferred_labels = ("living room", "loft")
+
+    def sort_key(thermo: Thermostat) -> Tuple[int, int, str]:
+        label = (thermo.device_label or thermo.id or "").lower()
+        for idx, preferred in enumerate(preferred_labels):
+            if preferred in label:
+                return (0, idx, label)
         if "up" in label:
-            return (0, label)
+            return (1, 0, label)
         if "down" in label:
-            return (1, label)
-        return (2, label)
+            return (1, 1, label)
+        return (2, 0, label)
+
     return sorted(thermostats, key=sort_key)
+
+def format_time_tick(ts: datetime) -> str:
+    return ts.astimezone().strftime("%I%p").lstrip("0")
+
+def draw_time_axis(
+    draw: ImageDraw.ImageDraw,
+    font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+    font_size: int,
+    start: datetime,
+    end: datetime,
+    x0: float,
+    x1: float,
+    y_axis: float,
+    label_y: float,
+) -> None:
+    total_seconds = (end - start).total_seconds() or 1.0
+    def to_x(ts: datetime) -> float:
+        return x0 + ((ts - start).total_seconds() / total_seconds) * (x1 - x0)
+
+    midpoint = start + (end - start) / 2
+    for ts in (start, midpoint, end):
+        x = to_x(ts)
+        draw.line([(x, y_axis), (x, y_axis + 4)], fill=(255, 255, 255), width=1)
+        label = format_time_tick(ts)
+        label_width = measure_text_width(font, label)
+        draw.text((x - label_width / 2, label_y), label, fill=(255, 255, 255), font=font)
 
 def fetch_forecast_series(entity_id: Optional[str]) -> List[Tuple[datetime, float]]:
     if not entity_id or not config.ha_base_url or not config.ha_token:
@@ -1882,18 +1914,20 @@ def draw_thermostat_action_chart(
     origin_y = origin[1] if origin else max(margin, size[1] - margin - height)
     title = "Thermostat Action (24h)"
     title_height = font_size + 2
-    bottom_pad = 6
+    bottom_pad = font_size + 10
     y0 = origin_y + title_height + 4
     y1 = origin_y + height - bottom_pad
 
     labels = [thermo.device_label or thermo.id for thermo in thermostats]
     label_width = max((measure_text_width(font, label) for label in labels), default=0)
-    x0 = origin_x + label_width + 8
+    axis_label_width = measure_text_width(font, "°F") + 6
+    x0 = origin_x + axis_label_width + label_width + 8
     x1 = origin_x + width - 6
     if x1 <= x0:
         return 0
 
     draw.text((origin_x, origin_y), title, fill=(255, 255, 255), font=font)
+    draw.text((origin_x, (y0 + y1) / 2 - font_size / 2), "°F", fill=(255, 255, 255), font=font)
     draw.rectangle((x0, y0, x1, y1), outline=(255, 255, 255), width=1)
 
     row_count = len(thermostats)
@@ -1908,7 +1942,7 @@ def draw_thermostat_action_chart(
         row_bottom = row_top + row_height
         row_center = (row_top + row_bottom) / 2
         label = labels[idx]
-        draw.text((origin_x, row_center - font_size / 2), label, fill=(255, 255, 255), font=font)
+        draw.text((origin_x + axis_label_width, row_center - font_size / 2), label, fill=(255, 255, 255), font=font)
         if idx > 0:
             draw.line([(x0, row_top), (x1, row_top)], fill=(80, 80, 80), width=1)
 
@@ -1926,6 +1960,21 @@ def draw_thermostat_action_chart(
             y_value = high_y if action in {"heat", "cool"} else low_y
             color = (220, 80, 80) if action == "heat" else (80, 160, 255) if action == "cool" else (140, 140, 140)
             draw.line([(to_x(ts_start), y_value), (to_x(ts_end), y_value)], fill=color, width=2)
+
+    draw_time_axis(
+        draw,
+        font,
+        font_size,
+        start,
+        end,
+        x0,
+        x1,
+        y1,
+        y1 + 4,
+    )
+    time_label = "Time"
+    time_label_width = measure_text_width(font, time_label)
+    draw.text(((x0 + x1) / 2 - time_label_width / 2, y1 + 4), time_label, fill=(255, 255, 255), font=font)
 
     return height
 
@@ -1960,18 +2009,20 @@ def draw_thermostat_setpoint_chart(
     origin_y = origin[1] if origin else max(margin, size[1] - margin - height)
     title = "Thermostat Setpoints (24h)"
     title_height = font_size + 2
-    bottom_pad = 6
+    bottom_pad = font_size + 10
     y0 = origin_y + title_height + 4
     y1 = origin_y + height - bottom_pad
 
     labels = [thermo.device_label or thermo.id for thermo in thermostats]
     label_width = max((measure_text_width(font, label) for label in labels), default=0)
-    x0 = origin_x + label_width + 8
+    axis_label_width = measure_text_width(font, "°F") + 6
+    x0 = origin_x + axis_label_width + label_width + 8
     x1 = origin_x + width - 6
     if x1 <= x0:
         return 0
 
     draw.text((origin_x, origin_y), title, fill=(255, 255, 255), font=font)
+    draw.text((origin_x, (y0 + y1) / 2 - font_size / 2), "°F", fill=(255, 255, 255), font=font)
     draw.rectangle((x0, y0, x1, y1), outline=(255, 255, 255), width=1)
 
     row_count = len(thermostats)
@@ -2007,7 +2058,7 @@ def draw_thermostat_setpoint_chart(
         row_bottom = row_top + row_height
         row_center = (row_top + row_bottom) / 2
         label = labels[idx]
-        draw.text((origin_x, row_center - font_size / 2), label, fill=(255, 255, 255), font=font)
+        draw.text((origin_x + axis_label_width, row_center - font_size / 2), label, fill=(255, 255, 255), font=font)
         if idx > 0:
             draw.line([(x0, row_top), (x1, row_top)], fill=(80, 80, 80), width=1)
 
@@ -2030,6 +2081,21 @@ def draw_thermostat_setpoint_chart(
                 draw.ellipse((x - 2, y - 2, x + 2, y + 2), fill=color)
             elif len(points) > 1:
                 draw_dashed_line(draw, points, color, width=2)
+
+    draw_time_axis(
+        draw,
+        font,
+        font_size,
+        start,
+        end,
+        x0,
+        x1,
+        y1,
+        y1 + 4,
+    )
+    time_label = "Time"
+    time_label_width = measure_text_width(font, time_label)
+    draw.text(((x0 + x1) / 2 - time_label_width / 2, y1 + 4), time_label, fill=(255, 255, 255), font=font)
 
     return height
 
