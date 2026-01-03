@@ -928,22 +928,22 @@ def generate_single_floor_frames(
     frames = frames_by_floor.get(floor_id, [])
     if not frames:
         return
-    base_size = None
-    with Image.open(frames[0][1]) as image:
-        base_size = image.size
-    sidebar_image = None
-    if sidebar_context and base_size:
-        sidebar_image = render_sidebar_image(sidebar_context, align="top", target_height=base_size[1])
     idx = 0
     for sample_time in sample_times:
         frame_path = resolve_frame_for_time(frames, sample_time)
         if frame_path is None:
             continue
         target = temp_dir / f"frame_{idx:05d}.png"
-        if sidebar_image is None:
+        if sidebar_context is None:
             target.write_bytes(frame_path.read_bytes())
         else:
             with Image.open(frame_path) as image:
+                sidebar_image = render_sidebar_image(
+                    sidebar_context,
+                    align="top",
+                    target_height=image.height,
+                    now=datetime.fromtimestamp(sample_time, tz=timezone.utc),
+                )
                 combined = attach_sidebar_to_floorplan(image.convert("RGB"), sidebar_image)
                 combined.save(target)
         idx += 1
@@ -966,9 +966,6 @@ def generate_stitched_frames(
             break
     if base_size is None:
         return
-    sidebar_image = None
-    if sidebar_context:
-        sidebar_image = render_sidebar_image(sidebar_context, align="center", target_height=base_size[1])
     fallback_images = {}
     for floor_id in floor_ids:
         frames = frames_by_floor.get(floor_id, [])
@@ -990,6 +987,15 @@ def generate_stitched_frames(
                 image = Image.open(frame_path)
                 images.append((floor_id, image))
                 opened_images.append(image)
+            sidebar_image = None
+            if sidebar_context and images:
+                max_height = max(image.height for _label, image in images)
+                sidebar_image = render_sidebar_image(
+                    sidebar_context,
+                    align="center",
+                    target_height=max_height,
+                    now=datetime.fromtimestamp(sample_time, tz=timezone.utc),
+                )
             stitched_images: List[Tuple[Optional[str], Image.Image]] = []
             for idx, (label, image) in enumerate(images):
                 stitched_images.append((label, image))
@@ -1685,13 +1691,22 @@ def draw_outside_temperature(
     draw.text((left_offset + box_size + 6, top_offset), text, fill=(255, 255, 255), font=font)
     return max(box_size, font_size)
 
-def fetch_history_series(entity_id: Optional[str], hours: float) -> List[Tuple[datetime, float]]:
+def fetch_history_series(
+    entity_id: Optional[str],
+    hours: float,
+    end_time: Optional[datetime] = None,
+) -> List[Tuple[datetime, float]]:
     if not entity_id or not config.ha_base_url or not config.ha_token or hours <= 0:
         return []
-    start = datetime.now(timezone.utc) - timedelta(hours=hours)
+    end_time = end_time or datetime.now(timezone.utc)
+    start = end_time - timedelta(hours=hours)
     url = f"{config.ha_base_url.rstrip('/')}/api/history/period/{start.isoformat()}"
     headers = {"Authorization": f"Bearer {config.ha_token}"}
-    params = {"filter_entity_id": entity_id, "minimal_response": "1"}
+    params = {
+        "filter_entity_id": entity_id,
+        "minimal_response": "1",
+        "end_time": end_time.isoformat(),
+    }
     try:
         response = requests.get(url, headers=headers, params=params, timeout=10)
     except requests.RequestException:
@@ -1720,13 +1735,22 @@ def fetch_history_series(entity_id: Optional[str], hours: float) -> List[Tuple[d
         series.append((ts, temp))
     return series
 
-def fetch_state_history(entity_id: Optional[str], hours: float) -> List[Tuple[datetime, str]]:
+def fetch_state_history(
+    entity_id: Optional[str],
+    hours: float,
+    end_time: Optional[datetime] = None,
+) -> List[Tuple[datetime, str]]:
     if not entity_id or not config.ha_base_url or not config.ha_token or hours <= 0:
         return []
-    start = datetime.now(timezone.utc) - timedelta(hours=hours)
+    end_time = end_time or datetime.now(timezone.utc)
+    start = end_time - timedelta(hours=hours)
     url = f"{config.ha_base_url.rstrip('/')}/api/history/period/{start.isoformat()}"
     headers = {"Authorization": f"Bearer {config.ha_token}"}
-    params = {"filter_entity_id": entity_id, "minimal_response": "1"}
+    params = {
+        "filter_entity_id": entity_id,
+        "minimal_response": "1",
+        "end_time": end_time.isoformat(),
+    }
     try:
         response = requests.get(url, headers=headers, params=params, timeout=10)
     except requests.RequestException:
@@ -1836,6 +1860,7 @@ def draw_temperature_chart(
     forecast_hours: Optional[float] = None,
     temp_entity: Optional[str] = None,
     forecast_entity: Optional[str] = None,
+    now: Optional[datetime] = None,
 ) -> int:
     entity_id = temp_entity or fp.render.chart_temp_entity or fp.render.outside_temp_entity
     if not entity_id:
@@ -1844,10 +1869,13 @@ def draw_temperature_chart(
     forecast_hours = max(forecast_hours if forecast_hours is not None else fp.render.chart_forecast_hours, 0.0)
     if history_hours == 0 and forecast_hours == 0:
         return 0
-    now = datetime.now(timezone.utc)
-    history = fetch_history_series(entity_id, history_hours)
+    now = now or datetime.now(timezone.utc)
+    history = fetch_history_series(entity_id, history_hours, end_time=now)
     forecast_source = forecast_entity if forecast_entity is not None else fp.render.chart_forecast_entity
-    forecast = fetch_forecast_series(forecast_source) if forecast_source else []
+    forecast = []
+    if forecast_source:
+        if abs((datetime.now(timezone.utc) - now).total_seconds()) < 900:
+            forecast = fetch_forecast_series(forecast_source)
     start = now - timedelta(hours=history_hours)
     end = now + timedelta(hours=forecast_hours)
     if not history and not forecast:
@@ -2040,8 +2068,9 @@ def draw_time_ticks(
     x1: float,
     y_axis: float,
     label_y: float,
+    now: Optional[datetime] = None,
 ) -> None:
-    now = datetime.now(timezone.utc)
+    now = now or datetime.now(timezone.utc)
     total_seconds = (end - start).total_seconds() or 1.0
 
     def to_x(ts: datetime) -> float:
@@ -2099,6 +2128,7 @@ def draw_thermostat_action_chart(
     history_hours: Optional[float] = None,
     chart_width: Optional[int] = None,
     chart_height: Optional[int] = None,
+    now: Optional[datetime] = None,
 ) -> int:
     history_hours = max(history_hours if history_hours is not None else fp.render.thermostat_chart_history_hours, 0.0)
     if history_hours == 0:
@@ -2107,7 +2137,7 @@ def draw_thermostat_action_chart(
     thermostats = order_thermostats_for_charts([thermo for thermo in available if thermo.mode_entity])
     if not thermostats:
         return 0
-    now = datetime.now(timezone.utc)
+    now = now or datetime.now(timezone.utc)
     start = now - timedelta(hours=history_hours)
     end = now
 
@@ -2136,7 +2166,7 @@ def draw_thermostat_action_chart(
         draw.text((origin_x, chart_origin_y), title, fill=(255, 255, 255), font=font)
         draw.rectangle((x0, y0, x1, y1), outline=(255, 255, 255), width=1)
 
-        history = fetch_state_history(thermo.mode_entity, history_hours)
+        history = fetch_state_history(thermo.mode_entity, history_hours, end_time=now)
         fallback_state = read_entity_state(thermo.mode_entity) if thermo.mode_entity else None
         timeline = build_state_timeline(history, start, end, fallback_state)
         if not timeline:
@@ -2176,7 +2206,7 @@ def draw_thermostat_action_chart(
             label_width = measure_text_width(font, label)
             draw.text((x0 - 6 - label_width, y - (font_size / 2)), label, fill=(255, 255, 255), font=font)
 
-        draw_time_ticks(draw, font, font_size, start, end, x0, x1, y1, y1 + 4)
+        draw_time_ticks(draw, font, font_size, start, end, x0, x1, y1, y1 + 4, now=now)
 
     return total_height
 
@@ -2189,6 +2219,7 @@ def draw_thermostat_setpoint_chart(
     history_hours: Optional[float] = None,
     chart_width: Optional[int] = None,
     chart_height: Optional[int] = None,
+    now: Optional[datetime] = None,
 ) -> int:
     history_hours = max(history_hours if history_hours is not None else fp.render.thermostat_chart_history_hours, 0.0)
     if history_hours == 0:
@@ -2203,7 +2234,7 @@ def draw_thermostat_setpoint_chart(
     )
     if not thermostats:
         return 0
-    now = datetime.now(timezone.utc)
+    now = now or datetime.now(timezone.utc)
     start = now - timedelta(hours=history_hours)
     end = now
 
@@ -2232,9 +2263,9 @@ def draw_thermostat_setpoint_chart(
         draw.text((origin_x, chart_origin_y), title, fill=(255, 255, 255), font=font)
         draw.rectangle((x0, y0, x1, y1), outline=(255, 255, 255), width=1)
 
-        low_series = fetch_history_series(thermo.setpoint_low_entity, history_hours)
-        high_series = fetch_history_series(thermo.setpoint_high_entity, history_hours)
-        setpoint_series = fetch_history_series(thermo.setpoint_entity, history_hours)
+        low_series = fetch_history_series(thermo.setpoint_low_entity, history_hours, end_time=now)
+        high_series = fetch_history_series(thermo.setpoint_high_entity, history_hours, end_time=now)
+        setpoint_series = fetch_history_series(thermo.setpoint_entity, history_hours, end_time=now)
         if not low_series and setpoint_series:
             low_series = setpoint_series
         if not high_series and setpoint_series:
@@ -2276,7 +2307,7 @@ def draw_thermostat_setpoint_chart(
                 width=2,
             )
 
-        draw_time_ticks(draw, font, font_size, start, end, x0, x1, y1, y1 + 4)
+        draw_time_ticks(draw, font, font_size, start, end, x0, x1, y1, y1 + 4, now=now)
 
     return total_height
 
@@ -2537,6 +2568,7 @@ def draw_info_panel(
     context: SidebarContext,
     size: Tuple[int, int],
     align: str = "top",
+    now: Optional[datetime] = None,
 ) -> None:
     fp = context.primary_floorplan
     components = resolve_sidebar_components()
@@ -2554,7 +2586,7 @@ def draw_info_panel(
     left = margin
     for component in components:
         if component.type == "timestamp":
-            draw_timestamp(draw, fp, (left, y_cursor + margin))
+            draw_timestamp(draw, fp, (left, y_cursor + margin), now=now)
             y_cursor += compute_timestamp_block_height(fp)
         elif component.type == "outside_temp":
             outside_info = resolve_outside_temperature_for_floorplans(context.floorplans)
@@ -2593,6 +2625,7 @@ def draw_info_panel(
                 forecast_hours=component.forecast_hours,
                 temp_entity=component.temp_entity,
                 forecast_entity=component.forecast_entity,
+                now=now,
             )
             y_cursor += max(90, component.height or fp.render.chart_height)
         elif component.type == "legend":
@@ -2608,6 +2641,7 @@ def draw_info_panel(
                 history_hours=component.history_hours,
                 chart_width=component.width,
                 chart_height=component.height,
+                now=now,
             )
             y_cursor += action_height
         elif component.type == "thermostat_setpoint_chart":
@@ -2625,6 +2659,7 @@ def draw_info_panel(
                 history_hours=component.history_hours,
                 chart_width=component.width,
                 chart_height=component.height,
+                now=now,
             )
             y_cursor += setpoint_height
 
@@ -2633,6 +2668,7 @@ def render_sidebar_image(
     context: SidebarContext,
     align: str = "top",
     target_height: Optional[int] = None,
+    now: Optional[datetime] = None,
 ) -> Optional[Image.Image]:
     if not config.render_sidebar.enabled:
         return None
@@ -2650,7 +2686,7 @@ def render_sidebar_image(
         height = max(height, target_height)
     canvas = Image.new("RGBA", (width, height), (20, 20, 20, 255))
     draw = ImageDraw.Draw(canvas)
-    draw_info_panel(draw, context, canvas.size, align=align)
+    draw_info_panel(draw, context, canvas.size, align=align, now=now)
     return canvas.convert("RGB")
 
 
@@ -2693,10 +2729,15 @@ def draw_analog_clock(
         draw.line((cx, cy, x, y), fill=(255, 255, 255), width=width)
     draw.ellipse((cx - 2, cy - 2, cx + 2, cy + 2), fill=(255, 255, 255))
 
-def draw_timestamp(draw: ImageDraw.ImageDraw, fp: FloorplanV1, origin: Tuple[int, int]) -> int:
+def draw_timestamp(
+    draw: ImageDraw.ImageDraw,
+    fp: FloorplanV1,
+    origin: Tuple[int, int],
+    now: Optional[datetime] = None,
+) -> int:
     font, font_size = resolve_font(fp, 12)
     spacing = max(2, int(font_size * 0.2))
-    now = datetime.now()
+    now = now or datetime.now()
     lines = build_timestamp_lines(now)
     draw.multiline_text(
         origin,
