@@ -1914,7 +1914,7 @@ def draw_thermostat_action_chart(
     origin_y = origin[1] if origin else max(margin, size[1] - margin - height)
     title = "Thermostat Action (24h)"
     title_height = font_size + 2
-    bottom_pad = font_size + 18
+    bottom_pad = font_size + 10
     y0 = origin_y + title_height + 4
     y1 = origin_y + height - bottom_pad
 
@@ -1974,7 +1974,7 @@ def draw_thermostat_action_chart(
     )
     time_label = "Time"
     time_label_width = measure_text_width(font, time_label)
-    draw.text(((x0 + x1) / 2 - time_label_width / 2, y1 + font_size + 6), time_label, fill=(255, 255, 255), font=font)
+    draw.text(((x0 + x1) / 2 - time_label_width / 2, y1 + 4), time_label, fill=(255, 255, 255), font=font)
 
     return height
 
@@ -2009,7 +2009,7 @@ def draw_thermostat_setpoint_chart(
     origin_y = origin[1] if origin else max(margin, size[1] - margin - height)
     title = "Thermostat Setpoints (24h)"
     title_height = font_size + 2
-    bottom_pad = font_size + 18
+    bottom_pad = font_size + 10
     y0 = origin_y + title_height + 4
     y1 = origin_y + height - bottom_pad
 
@@ -2095,7 +2095,7 @@ def draw_thermostat_setpoint_chart(
     )
     time_label = "Time"
     time_label_width = measure_text_width(font, time_label)
-    draw.text(((x0 + x1) / 2 - time_label_width / 2, y1 + font_size + 6), time_label, fill=(255, 255, 255), font=font)
+    draw.text(((x0 + x1) / 2 - time_label_width / 2, y1 + 4), time_label, fill=(255, 255, 255), font=font)
 
     return height
 
