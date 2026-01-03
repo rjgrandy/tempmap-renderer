@@ -93,6 +93,7 @@ class Thermostat(BaseModel):
     setpoint_low_entity: Optional[str] = None
     setpoint_high_entity: Optional[str] = None
     mode_entity: Optional[str] = None
+    fan_entity: Optional[str] = None
     device_label: str = ""
     # Customization
     label_offset_x: int = 12
@@ -152,6 +153,29 @@ class RenderParams(BaseModel):
     text_font_path: Optional[str] = None
 
 
+class SidebarComponentConfig(BaseModel):
+    type: Literal[
+        "timestamp",
+        "outside_temp",
+        "temperature_chart",
+        "legend",
+        "thermostat_action_chart",
+        "thermostat_setpoint_chart",
+    ]
+    enabled: bool = True
+    height: Optional[int] = None
+    width: Optional[int] = None
+    history_hours: Optional[float] = None
+    forecast_hours: Optional[float] = None
+    temp_entity: Optional[str] = None
+    forecast_entity: Optional[str] = None
+
+
+class SidebarConfig(BaseModel):
+    enabled: bool = True
+    components: List[SidebarComponentConfig] = Field(default_factory=list)
+
+
 class RoomLabel(BaseModel):
     id: str
     pos: Point
@@ -201,6 +225,7 @@ class AppConfig(BaseModel):
     timelapse_stitch_multi_floor: bool
     timelapse_border_px: int
     timelapse_label_font_size: int
+    render_sidebar: SidebarConfig
 
 
 @dataclass
@@ -208,6 +233,16 @@ class EntityState:
     state: str
     last_updated: str
     last_changed: str
+
+
+@dataclass
+class SidebarContext:
+    floorplans: List[FloorplanV1]
+    thermostats: List[Thermostat]
+    min_f: float
+    max_f: float
+    palette: List[Tuple[int, int, int]]
+    primary_floorplan: FloorplanV1
 
 
 app = FastAPI()
@@ -230,6 +265,17 @@ timelapse_last_roll: Optional[float] = None
 timelapse_is_running = False
 
 
+def default_sidebar_components() -> List[SidebarComponentConfig]:
+    return [
+        SidebarComponentConfig(type="timestamp"),
+        SidebarComponentConfig(type="outside_temp"),
+        SidebarComponentConfig(type="temperature_chart"),
+        SidebarComponentConfig(type="legend"),
+        SidebarComponentConfig(type="thermostat_action_chart"),
+        SidebarComponentConfig(type="thermostat_setpoint_chart"),
+    ]
+
+
 def load_config() -> AppConfig:
     config_data = {}
     if CONFIG_PATH.exists():
@@ -240,6 +286,16 @@ def load_config() -> AppConfig:
     ha_config = config_data.get("home_assistant", {})
     render_config = config_data.get("render", {})
     timelapse_config = config_data.get("timelapse", {})
+    sidebar_config = render_config.get("sidebar", {}) or {}
+    raw_components = sidebar_config.get("components", [])
+    if not raw_components:
+        sidebar_components = default_sidebar_components()
+    else:
+        sidebar_components = [
+            SidebarComponentConfig.parse_obj(component)
+            for component in raw_components
+            if isinstance(component, dict)
+        ]
     data_path = Path(data_path)
     timelapse_output_path = timelapse_config.get("output_path", str(data_path / "timelapses"))
     return AppConfig(
@@ -266,6 +322,10 @@ def load_config() -> AppConfig:
         timelapse_stitch_multi_floor=bool(timelapse_config.get("stitch_multi_floor", True)),
         timelapse_border_px=int(timelapse_config.get("border_px", 12)),
         timelapse_label_font_size=int(timelapse_config.get("label_font_size", 18)),
+        render_sidebar=SidebarConfig(
+            enabled=bool(sidebar_config.get("enabled", True)),
+            components=sidebar_components,
+        ),
     )
 
 
@@ -498,9 +558,17 @@ def gather_entities(floorplans: Dict[str, Dict]) -> List[str]:
             entities.append(thermo.get("setpoint_high_entity"))
             if thermo.get("mode_entity"):
                 entities.append(thermo.get("mode_entity"))
+            if thermo.get("fan_entity"):
+                entities.append(thermo.get("fan_entity"))
         render_cfg = floorplan.get("render", {})
         entities.append(render_cfg.get("outside_temp_entity"))
         entities.append(render_cfg.get("chart_temp_entity"))
+    for component in config.render_sidebar.components:
+        if not component.enabled:
+            continue
+        if component.type == "temperature_chart":
+            entities.append(component.temp_entity)
+            entities.append(component.forecast_entity)
     return sorted({e for e in entities if e})
 
 def poll_home_assistant(entities: List[str]) -> None:
@@ -542,17 +610,15 @@ def poll_home_assistant(entities: List[str]) -> None:
 
 def render_frames_for_floorplans(floorplans: Dict[str, Dict]) -> None:
     grids, metadata = solve_all_floorplans(floorplans)
-    info_align = "center" if len(floorplans) > 1 else "top"
     for floor_id, floorplan in floorplans.items():
         grid = grids.get(floor_id)
         if grid is None:
             continue
-        image = render_floorplan_image(
+        image = render_floorplan_base_image(
             floor_id,
             floorplan,
             grid,
             metadata.get(floor_id, {}),
-            info_panel_align=info_align,
         )
         save_frame(floor_id, image)
     cleanup_frames()
@@ -597,28 +663,38 @@ def render_floorplan(floor_id: str) -> Image.Image:
         min_f = min(range_pair[0] for range_pair in ranges)
         max_f = max(range_pair[1] for range_pair in ranges)
         images = []
-        for idx, floor_key in enumerate(sorted(floorplans.keys())):
+        ordered_floor_ids = sorted(floorplans.keys())
+        parsed_floorplans: List[FloorplanV1] = []
+        for floor_key in ordered_floor_ids:
+            parsed_floorplans.append(FloorplanV1.parse_obj(floorplans[floor_key]))
+        for floor_key in ordered_floor_ids:
             grid = grids.get(floor_key)
             if grid is None:
                 continue
             images.append(
                 (
                     floor_key,
-                    render_floorplan_image(
+                    render_floorplan_base_image(
                         floor_key,
                         floorplans[floor_key],
                         grid,
                         metadata.get(floor_key, {}),
-                        render_info=idx == 0,
                         range_override=(min_f, max_f),
-                        info_panel_align="center" if idx == 0 else "top",
                     ),
                 )
             )
         if not images:
             raise HTTPException(status_code=404, detail="Floorplans not found")
+        max_height = max(image.height for _floor, image in images)
+        sidebar_context = resolve_sidebar_context(parsed_floorplans, min_f, max_f)
+        sidebar_image = render_sidebar_image(sidebar_context, align="center", target_height=max_height)
+        stitched_images: List[Tuple[Optional[str], Image.Image]] = []
+        for idx, (floor_key, image) in enumerate(images):
+            stitched_images.append((floor_key, image))
+            if idx == 0 and sidebar_image is not None:
+                stitched_images.append((None, sidebar_image))
         return stitch_images_horizontally(
-            images,
+            stitched_images,
             config.timelapse_border_px,
             config.timelapse_label_font_size,
         )
@@ -628,7 +704,12 @@ def render_floorplan(floor_id: str) -> Image.Image:
     grid = grids.get(floor_id)
     if grid is None:
         raise HTTPException(status_code=404, detail="Floorplan not found")
-    return render_floorplan_image(floor_id, floorplans[floor_id], grid, metadata.get(floor_id, {}))
+    base_image = render_floorplan_base_image(floor_id, floorplans[floor_id], grid, metadata.get(floor_id, {}))
+    fp = FloorplanV1.parse_obj(floorplans[floor_id])
+    min_f, max_f = resolve_temperature_range(fp, grid)
+    sidebar_context = resolve_sidebar_context([fp], min_f, max_f)
+    sidebar_image = render_sidebar_image(sidebar_context, align="top", target_height=base_image.height)
+    return attach_sidebar_to_floorplan(base_image, sidebar_image)
 
 
 def maybe_render_rolling_timelapses(floorplans: Dict[str, Dict]) -> None:
@@ -759,6 +840,24 @@ def build_timelapse_video(
     sample_times = build_sample_times(start_ts, now, sampling_seconds)
     if not sample_times:
         raise HTTPException(status_code=404, detail="No frames found in requested window")
+    sidebar_context = None
+    if config.render_sidebar.enabled and available_floor_ids:
+        grids, _metadata = solve_all_floorplans(floorplans)
+        parsed_floorplans: List[FloorplanV1] = []
+        ranges: List[Tuple[float, float]] = []
+        for fid in available_floor_ids:
+            payload = floorplans.get(fid)
+            if not payload:
+                continue
+            fp = FloorplanV1.parse_obj(payload)
+            parsed_floorplans.append(fp)
+            grid = grids.get(fid)
+            if grid is not None:
+                ranges.append(resolve_temperature_range(fp, grid))
+        if parsed_floorplans and ranges:
+            min_f = min(range_pair[0] for range_pair in ranges)
+            max_f = max(range_pair[1] for range_pair in ranges)
+            sidebar_context = resolve_sidebar_context(parsed_floorplans, min_f, max_f)
     with tempfile.TemporaryDirectory() as tmp_dir:
         temp_dir = Path(tmp_dir)
         if stitch and len(available_floor_ids) > 1:
@@ -767,6 +866,7 @@ def build_timelapse_video(
                 sample_times=sample_times,
                 frames_by_floor=frames_by_floor,
                 floor_ids=available_floor_ids,
+                sidebar_context=sidebar_context,
             )
         else:
             generate_single_floor_frames(
@@ -774,6 +874,7 @@ def build_timelapse_video(
                 sample_times=sample_times,
                 frames_by_floor=frames_by_floor,
                 floor_id=available_floor_ids[0],
+                sidebar_context=sidebar_context,
             )
         frame_paths = sorted(temp_dir.glob("frame_*.png"))
         if not frame_paths:
@@ -822,6 +923,7 @@ def generate_single_floor_frames(
     sample_times: List[int],
     frames_by_floor: Dict[str, List[Tuple[int, Path]]],
     floor_id: str,
+    sidebar_context: Optional[SidebarContext],
 ) -> None:
     frames = frames_by_floor.get(floor_id, [])
     if not frames:
@@ -832,7 +934,18 @@ def generate_single_floor_frames(
         if frame_path is None:
             continue
         target = temp_dir / f"frame_{idx:05d}.png"
-        target.write_bytes(frame_path.read_bytes())
+        if sidebar_context is None:
+            target.write_bytes(frame_path.read_bytes())
+        else:
+            with Image.open(frame_path) as image:
+                sidebar_image = render_sidebar_image(
+                    sidebar_context,
+                    align="top",
+                    target_height=image.height,
+                    now=datetime.fromtimestamp(sample_time, tz=timezone.utc),
+                )
+                combined = attach_sidebar_to_floorplan(image.convert("RGB"), sidebar_image)
+                combined.save(target)
         idx += 1
 
 
@@ -841,6 +954,7 @@ def generate_stitched_frames(
     sample_times: List[int],
     frames_by_floor: Dict[str, List[Tuple[int, Path]]],
     floor_ids: List[str],
+    sidebar_context: Optional[SidebarContext],
 ) -> None:
     base_size = None
     for floor_id in floor_ids:
@@ -862,7 +976,7 @@ def generate_stitched_frames(
     idx = 0
     try:
         for sample_time in sample_times:
-            images = []
+            images: List[Tuple[Optional[str], Image.Image]] = []
             opened_images = []
             for floor_id in floor_ids:
                 frames = frames_by_floor.get(floor_id, [])
@@ -873,8 +987,22 @@ def generate_stitched_frames(
                 image = Image.open(frame_path)
                 images.append((floor_id, image))
                 opened_images.append(image)
+            sidebar_image = None
+            if sidebar_context and images:
+                max_height = max(image.height for _label, image in images)
+                sidebar_image = render_sidebar_image(
+                    sidebar_context,
+                    align="center",
+                    target_height=max_height,
+                    now=datetime.fromtimestamp(sample_time, tz=timezone.utc),
+                )
+            stitched_images: List[Tuple[Optional[str], Image.Image]] = []
+            for idx, (label, image) in enumerate(images):
+                stitched_images.append((label, image))
+                if idx == 0 and sidebar_image is not None:
+                    stitched_images.append((None, sidebar_image))
             stitched = stitch_images_horizontally(
-                images,
+                stitched_images,
                 config.timelapse_border_px,
                 config.timelapse_label_font_size,
             )
@@ -899,20 +1027,20 @@ def resolve_frame_for_time(frames: List[Tuple[int, Path]], sample_time: int) -> 
 
 
 def stitch_images_horizontally(
-    images: List[Tuple[str, Image.Image]],
+    images: List[Tuple[Optional[str], Image.Image]],
     border_px: int,
     label_font_size: int,
 ) -> Image.Image:
-    font = get_font(label_font_size)
+    font = get_font(label_font_size) if label_font_size > 0 else None
     widths = []
     heights = []
     label_heights = []
-    for floor_id, image in images:
+    for label, image in images:
         widths.append(image.width)
         heights.append(image.height)
-        label_text = floor_id
-        text_width, text_height = measure_text_size(font, label_text)
-        label_heights.append(text_height)
+        if label and font:
+            text_width, text_height = measure_text_size(font, label)
+            label_heights.append(text_height)
     max_height = max(heights)
     label_height = max(label_heights) if label_heights else 0
     total_width = sum(widths) + border_px * (len(images) - 1)
@@ -920,13 +1048,13 @@ def stitch_images_horizontally(
     stitched = Image.new("RGBA", (total_width, stitched_height), (0, 0, 0, 255))
     draw = ImageDraw.Draw(stitched)
     x_cursor = 0
-    for (floor_id, image), image_height in zip(images, heights):
+    for (label, image), image_height in zip(images, heights):
         y_offset = label_height + border_px
         stitched.paste(image, (x_cursor, y_offset))
-        label_text = floor_id
-        text_width, text_height = measure_text_size(font, label_text)
-        text_x = x_cursor + max(0, (image.width - text_width) // 2)
-        draw.text((text_x, 0), label_text, font=font, fill=(255, 255, 255, 255))
+        if label and font:
+            text_width, text_height = measure_text_size(font, label)
+            text_x = x_cursor + max(0, (image.width - text_width) // 2)
+            draw.text((text_x, 0), label, font=font, fill=(255, 255, 255, 255))
         x_cursor += image.width + border_px
     return stitched.convert("RGB")
 
@@ -1212,14 +1340,12 @@ def point_in_polygon(x: float, y: float, xs: List[float], ys: List[float]) -> bo
     return inside
 
 
-def render_floorplan_image(
+def render_floorplan_base_image(
     floor_id: str,
     payload: Dict,
     grid: np.ndarray,
     metadata: Dict,
-    render_info: bool = True,
     range_override: Optional[Tuple[float, float]] = None,
-    info_panel_align: str = "top",
 ) -> Image.Image:
     fp = FloorplanV1.parse_obj(payload)
     canvas = Image.new("RGBA", (fp.canvas.width, fp.canvas.height), (20, 20, 20, 255))
@@ -1243,24 +1369,6 @@ def render_floorplan_image(
             canvas = canvas.crop(crop_box)
             draw = ImageDraw.Draw(canvas) # Update draw object for cropped canvas if needed
             # Actually we just crop at the end, that's fine.
-    
-    if render_info and any([
-        fp.render.show_legend,
-        fp.render.show_timestamp,
-        fp.render.show_outside_temp,
-        fp.render.show_chart,
-    ]):
-        info_width = compute_info_panel_width(fp, min_f, max_f)
-        left_padding = fp.render.exterior_margin + info_width
-        canvas = add_exterior_margin(
-            canvas,
-            fp.render.exterior_margin,
-            fp.render.exterior_margin,
-            fp.render.exterior_margin // 2,
-            left_padding=left_padding,
-        )
-        draw = ImageDraw.Draw(canvas)
-        draw_info_panel(draw, fp, canvas.size, min_f, max_f, palette, info_panel_align)
     return canvas.convert("RGB")
 
 def build_floorplan_mask_floodfill(fp: FloorplanV1) -> np.ndarray:
@@ -1514,6 +1622,13 @@ def draw_thermostats(draw: ImageDraw.ImageDraw, fp: FloorplanV1) -> None:
             action_line = ""
             if mode:
                 action_line = mode.replace("_", " ").title()
+            fan_state = ""
+            if thermo.fan_entity:
+                fan_raw = read_entity_state(thermo.fan_entity)
+                if fan_raw.lower() in {"on", "true", "1", "enabled"}:
+                    fan_state = "Fan On"
+            if fan_state:
+                action_line = f"{action_line} • {fan_state}" if action_line else fan_state
 
             font, font_size = resolve_font(fp, thermo.font_size)
 
@@ -1576,13 +1691,22 @@ def draw_outside_temperature(
     draw.text((left_offset + box_size + 6, top_offset), text, fill=(255, 255, 255), font=font)
     return max(box_size, font_size)
 
-def fetch_history_series(entity_id: Optional[str], hours: float) -> List[Tuple[datetime, float]]:
+def fetch_history_series(
+    entity_id: Optional[str],
+    hours: float,
+    end_time: Optional[datetime] = None,
+) -> List[Tuple[datetime, float]]:
     if not entity_id or not config.ha_base_url or not config.ha_token or hours <= 0:
         return []
-    start = datetime.now(timezone.utc) - timedelta(hours=hours)
+    end_time = end_time or datetime.now(timezone.utc)
+    start = end_time - timedelta(hours=hours)
     url = f"{config.ha_base_url.rstrip('/')}/api/history/period/{start.isoformat()}"
     headers = {"Authorization": f"Bearer {config.ha_token}"}
-    params = {"filter_entity_id": entity_id, "minimal_response": "1"}
+    params = {
+        "filter_entity_id": entity_id,
+        "minimal_response": "1",
+        "end_time": end_time.isoformat(),
+    }
     try:
         response = requests.get(url, headers=headers, params=params, timeout=10)
     except requests.RequestException:
@@ -1611,13 +1735,22 @@ def fetch_history_series(entity_id: Optional[str], hours: float) -> List[Tuple[d
         series.append((ts, temp))
     return series
 
-def fetch_state_history(entity_id: Optional[str], hours: float) -> List[Tuple[datetime, str]]:
+def fetch_state_history(
+    entity_id: Optional[str],
+    hours: float,
+    end_time: Optional[datetime] = None,
+) -> List[Tuple[datetime, str]]:
     if not entity_id or not config.ha_base_url or not config.ha_token or hours <= 0:
         return []
-    start = datetime.now(timezone.utc) - timedelta(hours=hours)
+    end_time = end_time or datetime.now(timezone.utc)
+    start = end_time - timedelta(hours=hours)
     url = f"{config.ha_base_url.rstrip('/')}/api/history/period/{start.isoformat()}"
     headers = {"Authorization": f"Bearer {config.ha_token}"}
-    params = {"filter_entity_id": entity_id, "minimal_response": "1"}
+    params = {
+        "filter_entity_id": entity_id,
+        "minimal_response": "1",
+        "end_time": end_time.isoformat(),
+    }
     try:
         response = requests.get(url, headers=headers, params=params, timeout=10)
     except requests.RequestException:
@@ -1721,17 +1854,28 @@ def draw_temperature_chart(
     min_f: float,
     max_f: float,
     origin: Optional[Tuple[int, int]] = None,
+    chart_width: Optional[int] = None,
+    chart_height: Optional[int] = None,
+    history_hours: Optional[float] = None,
+    forecast_hours: Optional[float] = None,
+    temp_entity: Optional[str] = None,
+    forecast_entity: Optional[str] = None,
+    now: Optional[datetime] = None,
 ) -> int:
-    entity_id = fp.render.chart_temp_entity or fp.render.outside_temp_entity
+    entity_id = temp_entity or fp.render.chart_temp_entity or fp.render.outside_temp_entity
     if not entity_id:
         return 0
-    history_hours = max(fp.render.chart_history_hours, 0.0)
-    forecast_hours = max(fp.render.chart_forecast_hours, 0.0)
+    history_hours = max(history_hours if history_hours is not None else fp.render.chart_history_hours, 0.0)
+    forecast_hours = max(forecast_hours if forecast_hours is not None else fp.render.chart_forecast_hours, 0.0)
     if history_hours == 0 and forecast_hours == 0:
         return 0
-    now = datetime.now(timezone.utc)
-    history = fetch_history_series(entity_id, history_hours)
-    forecast = fetch_forecast_series(fp.render.chart_forecast_entity) if fp.render.chart_forecast_entity else []
+    now = now or datetime.now(timezone.utc)
+    history = fetch_history_series(entity_id, history_hours, end_time=now)
+    forecast_source = forecast_entity if forecast_entity is not None else fp.render.chart_forecast_entity
+    forecast = []
+    if forecast_source:
+        if abs((datetime.now(timezone.utc) - now).total_seconds()) < 900:
+            forecast = fetch_forecast_series(forecast_source)
     start = now - timedelta(hours=history_hours)
     end = now + timedelta(hours=forecast_hours)
     if not history and not forecast:
@@ -1750,8 +1894,8 @@ def draw_temperature_chart(
 
     font, font_size = resolve_font(fp, 11)
     margin = fp.render.exterior_margin
-    width = max(160, fp.render.chart_width)
-    height = max(90, fp.render.chart_height)
+    width = max(160, chart_width if chart_width is not None else fp.render.chart_width)
+    height = max(90, chart_height if chart_height is not None else fp.render.chart_height)
     origin_x = origin[0] if origin else max(margin, size[0] - margin - width)
     origin_y = origin[1] if origin else max(margin, size[1] - margin - height)
     title = "Temperature"
@@ -1887,217 +2031,285 @@ def build_state_timeline(
         points.append((end, points[-1][1]))
     return points
 
-def draw_thermostat_action_chart(
+def build_step_points(series: List[Tuple[datetime, float]]) -> List[Tuple[datetime, float]]:
+    if not series:
+        return []
+    points = [(series[0][0], series[0][1])]
+    for (prev_ts, prev_val), (ts, val) in zip(series, series[1:]):
+        if ts <= prev_ts:
+            continue
+        points.append((ts, prev_val))
+        points.append((ts, val))
+    return points
+
+
+def extend_series_to_range(
+    series: List[Tuple[datetime, float]],
+    start: datetime,
+    end: datetime,
+) -> List[Tuple[datetime, float]]:
+    if not series:
+        return []
+    series = sorted(series, key=lambda entry: entry[0])
+    if series[0][0] > start:
+        series.insert(0, (start, series[0][1]))
+    if series[-1][0] < end:
+        series.append((end, series[-1][1]))
+    return series
+
+
+def draw_time_ticks(
     draw: ImageDraw.ImageDraw,
-    fp: FloorplanV1,
-    size: Tuple[int, int],
-    origin: Optional[Tuple[int, int]] = None,
-) -> int:
-    history_hours = max(fp.render.thermostat_chart_history_hours, 0.0)
-    if history_hours == 0:
-        return 0
-    thermostats = order_thermostats_for_charts(
-        [thermo for thermo in fp.thermostats if thermo.mode_entity]
-    )
-    if not thermostats:
-        return 0
-    thermostats = thermostats[:2]
-    now = datetime.now(timezone.utc)
-    start = now - timedelta(hours=history_hours)
-    end = now
-
-    font, font_size = resolve_font(fp, 11)
-    margin = fp.render.exterior_margin
-    width = max(180, fp.render.thermostat_chart_width)
-    height = max(120, fp.render.thermostat_chart_height)
-    origin_x = origin[0] if origin else max(margin, size[0] - margin - width)
-    origin_y = origin[1] if origin else max(margin, size[1] - margin - height)
-    title = "Thermostat Action (24h)"
-    title_height = font_size + 2
-    bottom_pad = font_size + 10
-    y0 = origin_y + title_height + 4
-    y1 = origin_y + height - bottom_pad
-
-    labels = [thermo.device_label or thermo.id for thermo in thermostats]
-    label_width = max((measure_text_width(font, label) for label in labels), default=0)
-    axis_label_width = measure_text_width(font, "°F") + 6
-    x0 = origin_x + axis_label_width + label_width + 8
-    x1 = origin_x + width - 6
-    if x1 <= x0:
-        return 0
-
-    draw.text((origin_x, origin_y), title, fill=(255, 255, 255), font=font)
-    draw.text((origin_x, (y0 + y1) / 2 - font_size / 2), "°F", fill=(255, 255, 255), font=font)
-    draw.rectangle((x0, y0, x1, y1), outline=(255, 255, 255), width=1)
-
-    row_count = len(thermostats)
-    row_height = (y1 - y0) / row_count
+    font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+    font_size: int,
+    start: datetime,
+    end: datetime,
+    x0: float,
+    x1: float,
+    y_axis: float,
+    label_y: float,
+    now: Optional[datetime] = None,
+) -> None:
+    now = now or datetime.now(timezone.utc)
     total_seconds = (end - start).total_seconds() or 1.0
 
     def to_x(ts: datetime) -> float:
         return x0 + ((ts - start).total_seconds() / total_seconds) * (x1 - x0)
 
-    for idx, thermo in enumerate(thermostats):
-        row_top = y0 + idx * row_height
-        row_bottom = row_top + row_height
-        row_center = (row_top + row_bottom) / 2
-        label = labels[idx]
-        draw.text((origin_x + axis_label_width, row_center - font_size / 2), label, fill=(255, 255, 255), font=font)
-        if idx > 0:
-            draw.line([(x0, row_top), (x1, row_top)], fill=(80, 80, 80), width=1)
+    tick_positions = [start, now, end]
+    if not (start <= now <= end):
+        mid = start + (end - start) / 2
+        tick_positions = [start, mid, end]
+    for ts in tick_positions:
+        x = to_x(ts)
+        draw.line([(x, y_axis), (x, y_axis + 4)], fill=(255, 255, 255), width=1)
+        label = "Now" if abs((ts - now).total_seconds()) < 900 else format_time_tick(ts)
+        label_width = measure_text_width(font, label)
+        draw.text((x - label_width / 2, label_y), label, fill=(255, 255, 255), font=font)
 
-        history = fetch_state_history(thermo.mode_entity, history_hours)
+
+def lighten_color(color: Tuple[int, int, int], factor: float = 0.4) -> Tuple[int, int, int]:
+    r, g, b = color
+    return (
+        int(r + (255 - r) * factor),
+        int(g + (255 - g) * factor),
+        int(b + (255 - b) * factor),
+    )
+
+
+def compute_action_percentages(
+    timeline: List[Tuple[datetime, str]],
+    start: datetime,
+    end: datetime,
+) -> Tuple[int, int]:
+    if len(timeline) < 2:
+        return 0, 0
+    heat_seconds = 0.0
+    cool_seconds = 0.0
+    total_seconds = (end - start).total_seconds() or 1.0
+    for (ts_start, state_start), (ts_end, _state_end) in zip(timeline, timeline[1:]):
+        duration = max(0.0, (ts_end - ts_start).total_seconds())
+        action = thermostat_action_from_state(state_start)
+        if action == "heat":
+            heat_seconds += duration
+        elif action == "cool":
+            cool_seconds += duration
+    heat_pct = int(round((heat_seconds / total_seconds) * 100))
+    cool_pct = int(round((cool_seconds / total_seconds) * 100))
+    return heat_pct, cool_pct
+
+
+def draw_thermostat_action_chart(
+    draw: ImageDraw.ImageDraw,
+    fp: FloorplanV1,
+    size: Tuple[int, int],
+    origin: Optional[Tuple[int, int]] = None,
+    thermostats: Optional[List[Thermostat]] = None,
+    history_hours: Optional[float] = None,
+    chart_width: Optional[int] = None,
+    chart_height: Optional[int] = None,
+    now: Optional[datetime] = None,
+) -> int:
+    history_hours = max(history_hours if history_hours is not None else fp.render.thermostat_chart_history_hours, 0.0)
+    if history_hours == 0:
+        return 0
+    available = thermostats if thermostats is not None else fp.thermostats
+    thermostats = order_thermostats_for_charts([thermo for thermo in available if thermo.mode_entity])
+    if not thermostats:
+        return 0
+    now = now or datetime.now(timezone.utc)
+    start = now - timedelta(hours=history_hours)
+    end = now
+
+    font, font_size = resolve_font(fp, 11)
+    margin = fp.render.exterior_margin
+    width = max(180, chart_width if chart_width is not None else fp.render.thermostat_chart_width)
+    height = max(120, chart_height if chart_height is not None else fp.render.thermostat_chart_height)
+    chart_gap = 10
+    origin_x = origin[0] if origin else max(margin, size[0] - margin - width)
+    origin_y = origin[1] if origin else max(margin, size[1] - margin - height)
+
+    total_height = (height * len(thermostats)) + (chart_gap * (len(thermostats) - 1))
+    for idx, thermo in enumerate(thermostats):
+        chart_origin_y = origin_y + idx * (height + chart_gap)
+        title = f"{thermo.device_label or thermo.id} Action (24h)"
+        title_height = font_size + 2
+        bottom_label_height = font_size + 6
+        axis_label_width = measure_text_width(font, "Off") + 6
+        x0 = origin_x + axis_label_width
+        y0 = chart_origin_y + title_height + 4
+        x1 = origin_x + width - 6
+        y1 = chart_origin_y + height - bottom_label_height
+        if x1 <= x0 or y1 <= y0:
+            continue
+
+        draw.text((origin_x, chart_origin_y), title, fill=(255, 255, 255), font=font)
+        draw.rectangle((x0, y0, x1, y1), outline=(255, 255, 255), width=1)
+
+        history = fetch_state_history(thermo.mode_entity, history_hours, end_time=now)
         fallback_state = read_entity_state(thermo.mode_entity) if thermo.mode_entity else None
         timeline = build_state_timeline(history, start, end, fallback_state)
         if not timeline:
             continue
 
-        row_pad = 6
-        high_y = row_top + row_pad
-        low_y = row_bottom - row_pad
-        for (ts_start, state_start), (ts_end, state_end) in zip(timeline, timeline[1:]):
-            action = thermostat_action_from_state(state_start)
-            y_value = high_y if action in {"heat", "cool"} else low_y
-            color = (220, 80, 80) if action == "heat" else (80, 160, 255) if action == "cool" else (140, 140, 140)
-            draw.line([(to_x(ts_start), y_value), (to_x(ts_end), y_value)], fill=color, width=2)
+        heat_pct, cool_pct = compute_action_percentages(timeline, start, end)
+        stats_text = f"Heat {heat_pct}% • Cool {cool_pct}%"
+        stats_width = measure_text_width(font, stats_text)
+        draw.text((origin_x + width - stats_width, chart_origin_y), stats_text, fill=(180, 180, 180), font=font)
 
-    draw_time_axis(
-        draw,
-        font,
-        font_size,
-        start,
-        end,
-        x0,
-        x1,
-        y1,
-        y1 + 4,
-    )
-    time_label = "Time"
-    time_label_width = measure_text_width(font, time_label)
-    draw.text(((x0 + x1) / 2 - time_label_width / 2, y1 + 4), time_label, fill=(255, 255, 255), font=font)
+        total_seconds = (end - start).total_seconds() or 1.0
 
-    return height
+        def to_x(ts: datetime) -> float:
+            return x0 + ((ts - start).total_seconds() / total_seconds) * (x1 - x0)
+
+        def to_y(value: float) -> float:
+            return y1 - value * (y1 - y0)
+
+        heat_color = (220, 80, 80)
+        cool_color = (80, 160, 255)
+        for action, color in [("heat", heat_color), ("cool", cool_color)]:
+            series = [(ts, 1.0 if thermostat_action_from_state(state) == action else 0.0) for ts, state in timeline]
+            points = build_step_points(series)
+            for (ts_start, value_start), (ts_end, _value_end) in zip(series, series[1:]):
+                if value_start <= 0:
+                    continue
+                x_start = to_x(ts_start)
+                x_end = to_x(ts_end)
+                fill_color = (*lighten_color(color, 0.5), 80)
+                draw.rectangle((x_start, y0, x_end, y1), fill=fill_color)
+            if len(points) > 1:
+                draw.line([(to_x(ts), to_y(value)) for ts, value in points], fill=color, width=2)
+
+        for label, value in [("Off", 0.0), ("On", 1.0)]:
+            y = to_y(value)
+            draw.line([(x0 - 4, y), (x0, y)], fill=(255, 255, 255), width=1)
+            label_width = measure_text_width(font, label)
+            draw.text((x0 - 6 - label_width, y - (font_size / 2)), label, fill=(255, 255, 255), font=font)
+
+        draw_time_ticks(draw, font, font_size, start, end, x0, x1, y1, y1 + 4, now=now)
+
+    return total_height
 
 def draw_thermostat_setpoint_chart(
     draw: ImageDraw.ImageDraw,
     fp: FloorplanV1,
     size: Tuple[int, int],
     origin: Optional[Tuple[int, int]] = None,
+    thermostats: Optional[List[Thermostat]] = None,
+    history_hours: Optional[float] = None,
+    chart_width: Optional[int] = None,
+    chart_height: Optional[int] = None,
+    now: Optional[datetime] = None,
 ) -> int:
-    history_hours = max(fp.render.thermostat_chart_history_hours, 0.0)
+    history_hours = max(history_hours if history_hours is not None else fp.render.thermostat_chart_history_hours, 0.0)
     if history_hours == 0:
         return 0
+    available = thermostats if thermostats is not None else fp.thermostats
     thermostats = order_thermostats_for_charts(
         [
             thermo
-            for thermo in fp.thermostats
+            for thermo in available
             if thermo.setpoint_low_entity or thermo.setpoint_high_entity or thermo.setpoint_entity
         ]
     )
     if not thermostats:
         return 0
-    thermostats = thermostats[:2]
-    now = datetime.now(timezone.utc)
+    now = now or datetime.now(timezone.utc)
     start = now - timedelta(hours=history_hours)
     end = now
 
     font, font_size = resolve_font(fp, 11)
     margin = fp.render.exterior_margin
-    width = max(180, fp.render.thermostat_chart_width)
-    height = max(120, fp.render.thermostat_chart_height)
+    width = max(180, chart_width if chart_width is not None else fp.render.thermostat_chart_width)
+    height = max(120, chart_height if chart_height is not None else fp.render.thermostat_chart_height)
+    chart_gap = 10
     origin_x = origin[0] if origin else max(margin, size[0] - margin - width)
     origin_y = origin[1] if origin else max(margin, size[1] - margin - height)
-    title = "Thermostat Setpoints (24h)"
-    title_height = font_size + 2
-    bottom_pad = font_size + 10
-    y0 = origin_y + title_height + 4
-    y1 = origin_y + height - bottom_pad
 
-    labels = [thermo.device_label or thermo.id for thermo in thermostats]
-    label_width = max((measure_text_width(font, label) for label in labels), default=0)
-    axis_label_width = measure_text_width(font, "°F") + 6
-    x0 = origin_x + axis_label_width + label_width + 8
-    x1 = origin_x + width - 6
-    if x1 <= x0:
-        return 0
+    total_height = (height * len(thermostats)) + (chart_gap * (len(thermostats) - 1))
+    for idx, thermo in enumerate(thermostats):
+        chart_origin_y = origin_y + idx * (height + chart_gap)
+        title = f"{thermo.device_label or thermo.id} Setpoints (24h)"
+        title_height = font_size + 2
+        bottom_pad = font_size + 6
+        y_axis_label_width = measure_text_width(font, "88.8F") + 6
+        x0 = origin_x + y_axis_label_width
+        y0 = chart_origin_y + title_height + 4
+        x1 = origin_x + width - 6
+        y1 = chart_origin_y + height - bottom_pad
+        if x1 <= x0 or y1 <= y0:
+            continue
 
-    draw.text((origin_x, origin_y), title, fill=(255, 255, 255), font=font)
-    draw.text((origin_x, (y0 + y1) / 2 - font_size / 2), "°F", fill=(255, 255, 255), font=font)
-    draw.rectangle((x0, y0, x1, y1), outline=(255, 255, 255), width=1)
+        draw.text((origin_x, chart_origin_y), title, fill=(255, 255, 255), font=font)
+        draw.rectangle((x0, y0, x1, y1), outline=(255, 255, 255), width=1)
 
-    row_count = len(thermostats)
-    row_height = (y1 - y0) / row_count
-    total_seconds = (end - start).total_seconds() or 1.0
-
-    def to_x(ts: datetime) -> float:
-        return x0 + ((ts - start).total_seconds() / total_seconds) * (x1 - x0)
-
-    # Collect all temps to build a shared scale.
-    all_values: List[float] = []
-    history_by_thermo: List[Dict[str, List[Tuple[datetime, float]]]] = []
-    for thermo in thermostats:
-        low_series = fetch_history_series(thermo.setpoint_low_entity, history_hours)
-        high_series = fetch_history_series(thermo.setpoint_high_entity, history_hours)
-        setpoint_series = fetch_history_series(thermo.setpoint_entity, history_hours)
+        low_series = fetch_history_series(thermo.setpoint_low_entity, history_hours, end_time=now)
+        high_series = fetch_history_series(thermo.setpoint_high_entity, history_hours, end_time=now)
+        setpoint_series = fetch_history_series(thermo.setpoint_entity, history_hours, end_time=now)
         if not low_series and setpoint_series:
             low_series = setpoint_series
         if not high_series and setpoint_series:
             high_series = setpoint_series
-        history_by_thermo.append({"low": low_series, "high": high_series})
-        for series in (low_series, high_series):
-            all_values.extend([temp for _ts, temp in series if start <= _ts <= end])
-    if not all_values:
-        return 0
-    chart_min = min(all_values)
-    chart_max = max(all_values)
-    if chart_min >= chart_max:
-        chart_max = chart_min + 0.1
+        low_series = extend_series_to_range(low_series, start, end)
+        high_series = extend_series_to_range(high_series, start, end)
+        all_values = [temp for _ts, temp in (low_series + high_series)]
+        if not all_values:
+            continue
+        chart_min = min(all_values)
+        chart_max = max(all_values)
+        if chart_min >= chart_max:
+            chart_max = chart_min + 0.1
 
-    for idx, thermo in enumerate(thermostats):
-        row_top = y0 + idx * row_height
-        row_bottom = row_top + row_height
-        row_center = (row_top + row_bottom) / 2
-        label = labels[idx]
-        draw.text((origin_x + axis_label_width, row_center - font_size / 2), label, fill=(255, 255, 255), font=font)
-        if idx > 0:
-            draw.line([(x0, row_top), (x1, row_top)], fill=(80, 80, 80), width=1)
+        total_seconds = (end - start).total_seconds() or 1.0
 
-        row_pad = 6
-        row_top += row_pad
-        row_bottom -= row_pad
+        def to_x(ts: datetime) -> float:
+            return x0 + ((ts - start).total_seconds() / total_seconds) * (x1 - x0)
+
         def to_y(temp: float) -> float:
             ratio = (temp - chart_min) / (chart_max - chart_min)
-            return row_bottom - ratio * (row_bottom - row_top)
+            return y1 - ratio * (y1 - y0)
 
-        series = history_by_thermo[idx]
-        for key, color in [("high", (220, 80, 80)), ("low", (80, 160, 255))]:
-            points = [
-                (to_x(ts), to_y(temp))
-                for ts, temp in series[key]
-                if start <= ts <= end
-            ]
-            if len(points) == 1:
-                x, y = points[0]
-                draw.ellipse((x - 2, y - 2, x + 2, y + 2), fill=color)
-            elif len(points) > 1:
-                draw_dashed_line(draw, points, color, width=2)
+        for tick in [chart_min, (chart_min + chart_max) / 2, chart_max]:
+            y = to_y(tick)
+            draw.line([(x0 - 4, y), (x0, y)], fill=(255, 255, 255), width=1)
+            label = f"{tick:.1f}F"
+            label_width = measure_text_width(font, label)
+            draw.text((x0 - 6 - label_width, y - (font_size / 2)), label, fill=(255, 255, 255), font=font)
 
-    draw_time_axis(
-        draw,
-        font,
-        font_size,
-        start,
-        end,
-        x0,
-        x1,
-        y1,
-        y1 + 4,
-    )
-    time_label = "Time"
-    time_label_width = measure_text_width(font, time_label)
-    draw.text(((x0 + x1) / 2 - time_label_width / 2, y1 + 4), time_label, fill=(255, 255, 255), font=font)
+        for series, color in [(high_series, (220, 80, 80)), (low_series, (80, 160, 255))]:
+            if len(series) < 2:
+                continue
+            points = build_step_points(series)
+            draw_dashed_line(
+                draw,
+                [(to_x(ts), to_y(temp)) for ts, temp in points],
+                color,
+                width=2,
+            )
 
-    return height
+        draw_time_ticks(draw, font, font_size, start, end, x0, x1, y1, y1 + 4, now=now)
+
+    return total_height
 
 def get_font(size: int, font_path: Optional[str] = None) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     """Tries to load a scalable font. Falls back to default if unavailable."""
@@ -2243,137 +2455,253 @@ def compute_thermostat_chart_height(fp: FloorplanV1) -> int:
 def should_render_thermostat_charts(fp: FloorplanV1) -> bool:
     return fp.render.thermostat_chart_history_hours > 0
 
-def compute_info_panel_height(fp: FloorplanV1) -> int:
+def resolve_sidebar_components() -> List[SidebarComponentConfig]:
+    return [component for component in config.render_sidebar.components if component.enabled]
+
+
+def resolve_primary_floorplan(floorplans: List[FloorplanV1]) -> FloorplanV1:
+    return floorplans[0]
+
+
+def resolve_outside_temperature_for_floorplans(
+    floorplans: List[FloorplanV1],
+) -> Optional[Tuple[float, str, FloorplanV1]]:
+    for fp in floorplans:
+        outside_info = resolve_outside_temperature(fp)
+        if outside_info:
+            outside_temp_value, outside_text = outside_info
+            return outside_temp_value, outside_text, fp
+    return None
+
+
+def resolve_sidebar_context(
+    floorplans: List[FloorplanV1],
+    min_f: float,
+    max_f: float,
+) -> SidebarContext:
+    primary = resolve_primary_floorplan(floorplans)
+    thermostats: List[Thermostat] = []
+    for fp in floorplans:
+        thermostats.extend(fp.thermostats)
+    return SidebarContext(
+        floorplans=floorplans,
+        thermostats=thermostats,
+        min_f=min_f,
+        max_f=max_f,
+        palette=resolve_legend_palette(primary),
+        primary_floorplan=primary,
+    )
+
+
+def compute_sidebar_panel_height(context: SidebarContext, components: List[SidebarComponentConfig]) -> int:
+    fp = context.primary_floorplan
     font_size = fp.render.text_font_size or 12
     box_size = max(16, int(font_size * 1.4))
     section_gap = 12
     item_gap = 6
     height = 0
-    if fp.render.show_timestamp:
-        height += compute_timestamp_block_height(fp)
-    if fp.render.show_outside_temp:
-        if resolve_outside_temperature(fp) is not None:
-            if height:
-                height += item_gap
-            height += max(box_size, font_size)
-    if fp.render.show_chart:
+    for component in components:
+        component_height = 0
+        if component.type == "timestamp":
+            component_height = compute_timestamp_block_height(fp)
+        elif component.type == "outside_temp":
+            outside_info = resolve_outside_temperature_for_floorplans(context.floorplans)
+            if outside_info:
+                component_height = max(box_size, font_size)
+        elif component.type == "temperature_chart":
+            component_height = max(90, component.height or fp.render.chart_height)
+        elif component.type == "legend":
+            component_height = compute_legend_height(fp)
+        elif component.type == "thermostat_action_chart":
+            thermostats = [thermo for thermo in context.thermostats if thermo.mode_entity]
+            if thermostats:
+                per_height = max(120, component.height or fp.render.thermostat_chart_height)
+                component_height = per_height * len(thermostats) + max(0, (len(thermostats) - 1) * 10)
+        elif component.type == "thermostat_setpoint_chart":
+            thermostats = [
+                thermo
+                for thermo in context.thermostats
+                if thermo.setpoint_low_entity or thermo.setpoint_high_entity or thermo.setpoint_entity
+            ]
+            if thermostats:
+                per_height = max(120, component.height or fp.render.thermostat_chart_height)
+                component_height = per_height * len(thermostats) + max(0, (len(thermostats) - 1) * 10)
+        if component_height <= 0:
+            continue
         if height:
-            height += section_gap
-        height += compute_chart_height(fp)
-    if fp.render.show_legend:
-        if height:
-            height += section_gap
-        height += compute_legend_height(fp)
-    if should_render_thermostat_charts(fp) and any(thermo.mode_entity for thermo in fp.thermostats):
-        if height:
-            height += section_gap
-        height += compute_thermostat_chart_height(fp)
-    if should_render_thermostat_charts(fp) and any(
-        thermo.setpoint_low_entity or thermo.setpoint_high_entity or thermo.setpoint_entity
-        for thermo in fp.thermostats
-    ):
-        if height:
-            height += section_gap
-        height += compute_thermostat_chart_height(fp)
+            height += item_gap if component.type in {"timestamp", "outside_temp"} else section_gap
+        height += component_height
     return height
 
-def compute_info_panel_width(fp: FloorplanV1, min_f: float, max_f: float) -> int:
+
+def compute_sidebar_panel_width(
+    context: SidebarContext,
+    components: List[SidebarComponentConfig],
+) -> int:
+    fp = context.primary_floorplan
     font, font_size = resolve_font(fp, 12)
     width = 0
-    if fp.render.show_timestamp:
-        width = max(width, compute_timestamp_block_width(fp))
-    if fp.render.show_outside_temp:
-        outside_info = resolve_outside_temperature(fp)
-        if outside_info:
-            _outside_temp_value, outside_text = outside_info
-            box_size = max(16, int(font_size * 1.4))
-            width = max(width, box_size + 6 + measure_text_width(font, outside_text))
-    if fp.render.show_chart:
-        width = max(width, max(160, fp.render.chart_width))
-    if fp.render.show_legend:
-        width = max(width, 200)
-    if should_render_thermostat_charts(fp) and any(thermo.mode_entity for thermo in fp.thermostats):
-        width = max(width, max(180, fp.render.thermostat_chart_width))
-    if should_render_thermostat_charts(fp) and any(
-        thermo.setpoint_low_entity or thermo.setpoint_high_entity or thermo.setpoint_entity
-        for thermo in fp.thermostats
-    ):
-        width = max(width, max(180, fp.render.thermostat_chart_width))
+    for component in components:
+        component_width = 0
+        if component.type == "timestamp":
+            component_width = compute_timestamp_block_width(fp)
+        elif component.type == "outside_temp":
+            outside_info = resolve_outside_temperature_for_floorplans(context.floorplans)
+            if outside_info:
+                _outside_temp_value, outside_text, outside_fp = outside_info
+                box_size = max(16, int((outside_fp.render.text_font_size or 12) * 1.4))
+                component_width = box_size + 6 + measure_text_width(font, outside_text)
+        elif component.type == "temperature_chart":
+            component_width = max(160, component.width or fp.render.chart_width)
+        elif component.type == "legend":
+            component_width = 200
+        elif component.type == "thermostat_action_chart":
+            component_width = max(180, component.width or fp.render.thermostat_chart_width)
+        elif component.type == "thermostat_setpoint_chart":
+            component_width = max(180, component.width or fp.render.thermostat_chart_width)
+        width = max(width, component_width)
     return int(width)
+
 
 def draw_info_panel(
     draw: ImageDraw.ImageDraw,
-    fp: FloorplanV1,
+    context: SidebarContext,
     size: Tuple[int, int],
-    min_f: float,
-    max_f: float,
-    palette: List[Tuple[int, int, int]],
     align: str = "top",
+    now: Optional[datetime] = None,
 ) -> None:
+    fp = context.primary_floorplan
+    components = resolve_sidebar_components()
     margin = fp.render.exterior_margin
-    panel_height = compute_info_panel_height(fp)
+    panel_height = compute_sidebar_panel_height(context, components)
+    if panel_height <= 0:
+        return
     if align == "center":
         start_y = max(margin, int((size[1] - panel_height) / 2))
     else:
         start_y = margin
     y_cursor = start_y - margin
-    has_content = False
     section_gap = 12
     item_gap = 6
     left = margin
-    if fp.render.show_timestamp:
-        draw_timestamp(
-            draw,
-            fp,
-            (left, y_cursor + margin),
-        )
-        y_cursor += compute_timestamp_block_height(fp)
-        has_content = True
-    if fp.render.show_outside_temp:
-        if has_content:
-            y_cursor += item_gap
-        outside_info = resolve_outside_temperature(fp)
-        if outside_info:
-            outside_temp_value, outside_text = outside_info
-            font, font_size = resolve_font(fp, 12)
-            box_size = max(16, int(font_size * 1.4))
-            outside_height = draw_outside_temperature(
+    for component in components:
+        if component.type == "timestamp":
+            draw_timestamp(draw, fp, (left, y_cursor + margin), now=now)
+            y_cursor += compute_timestamp_block_height(fp)
+        elif component.type == "outside_temp":
+            outside_info = resolve_outside_temperature_for_floorplans(context.floorplans)
+            if outside_info:
+                outside_temp_value, outside_text, outside_fp = outside_info
+                font, font_size = resolve_font(outside_fp, 12)
+                box_size = max(16, int(font_size * 1.4))
+                if y_cursor > start_y - margin:
+                    y_cursor += item_gap
+                outside_height = draw_outside_temperature(
+                    draw,
+                    outside_fp,
+                    context.min_f,
+                    context.max_f,
+                    y_cursor + margin,
+                    left,
+                    outside_temp_value,
+                    outside_text,
+                )
+                y_cursor += outside_height
+            continue
+        else:
+            if y_cursor > start_y - margin:
+                y_cursor += section_gap
+        if component.type == "temperature_chart":
+            draw_temperature_chart(
                 draw,
                 fp,
-                min_f,
-                max_f,
-                y_cursor + margin,
-                left,
-                outside_temp_value,
-                outside_text,
+                size,
+                context.min_f,
+                context.max_f,
+                (left, y_cursor + margin),
+                chart_width=component.width,
+                chart_height=component.height,
+                history_hours=component.history_hours,
+                forecast_hours=component.forecast_hours,
+                temp_entity=component.temp_entity,
+                forecast_entity=component.forecast_entity,
+                now=now,
             )
-            y_cursor += outside_height
-            has_content = True
-    if fp.render.show_chart:
-        if has_content:
-            y_cursor += section_gap
-        draw_temperature_chart(draw, fp, size, min_f, max_f, (left, y_cursor + margin))
-        y_cursor += compute_chart_height(fp)
-    if fp.render.show_legend:
-        if has_content:
-            y_cursor += section_gap
-        y_cursor += draw_legend(draw, min_f, max_f, (left, y_cursor + margin), fp, palette)
-        has_content = True
-    if should_render_thermostat_charts(fp) and any(thermo.mode_entity for thermo in fp.thermostats):
-        if has_content:
-            y_cursor += section_gap
-        action_height = draw_thermostat_action_chart(draw, fp, size, (left, y_cursor + margin))
-        y_cursor += action_height
-        has_content = has_content or action_height > 0
-    if should_render_thermostat_charts(fp) and any(
-        thermo.setpoint_low_entity or thermo.setpoint_high_entity or thermo.setpoint_entity
-        for thermo in fp.thermostats
-    ):
-        if has_content:
-            y_cursor += section_gap
-        setpoint_height = draw_thermostat_setpoint_chart(draw, fp, size, (left, y_cursor + margin))
-        y_cursor += setpoint_height
-        has_content = has_content or setpoint_height > 0
+            y_cursor += max(90, component.height or fp.render.chart_height)
+        elif component.type == "legend":
+            y_cursor += draw_legend(draw, context.min_f, context.max_f, (left, y_cursor + margin), fp, context.palette)
+        elif component.type == "thermostat_action_chart":
+            thermostats = [thermo for thermo in context.thermostats if thermo.mode_entity]
+            action_height = draw_thermostat_action_chart(
+                draw,
+                fp,
+                size,
+                (left, y_cursor + margin),
+                thermostats=thermostats,
+                history_hours=component.history_hours,
+                chart_width=component.width,
+                chart_height=component.height,
+                now=now,
+            )
+            y_cursor += action_height
+        elif component.type == "thermostat_setpoint_chart":
+            thermostats = [
+                thermo
+                for thermo in context.thermostats
+                if thermo.setpoint_low_entity or thermo.setpoint_high_entity or thermo.setpoint_entity
+            ]
+            setpoint_height = draw_thermostat_setpoint_chart(
+                draw,
+                fp,
+                size,
+                (left, y_cursor + margin),
+                thermostats=thermostats,
+                history_hours=component.history_hours,
+                chart_width=component.width,
+                chart_height=component.height,
+                now=now,
+            )
+            y_cursor += setpoint_height
+
+
+def render_sidebar_image(
+    context: SidebarContext,
+    align: str = "top",
+    target_height: Optional[int] = None,
+    now: Optional[datetime] = None,
+) -> Optional[Image.Image]:
+    if not config.render_sidebar.enabled:
+        return None
+    components = resolve_sidebar_components()
+    if not components:
+        return None
+    panel_height = compute_sidebar_panel_height(context, components)
+    panel_width = compute_sidebar_panel_width(context, components)
+    if panel_height <= 0 or panel_width <= 0:
+        return None
+    margin = context.primary_floorplan.render.exterior_margin
+    width = panel_width + margin
+    height = panel_height + (margin * 2)
+    if target_height is not None:
+        height = max(height, target_height)
+    canvas = Image.new("RGBA", (width, height), (20, 20, 20, 255))
+    draw = ImageDraw.Draw(canvas)
+    draw_info_panel(draw, context, canvas.size, align=align, now=now)
+    return canvas.convert("RGB")
+
+
+def attach_sidebar_to_floorplan(
+    floorplan_image: Image.Image,
+    sidebar_image: Optional[Image.Image],
+    gap: int = 0,
+) -> Image.Image:
+    if sidebar_image is None:
+        return floorplan_image
+    return stitch_images_horizontally(
+        [(None, sidebar_image), (None, floorplan_image)],
+        gap,
+        label_font_size=0,
+    )
 
 def draw_analog_clock(
     draw: ImageDraw.ImageDraw,
@@ -2401,10 +2729,15 @@ def draw_analog_clock(
         draw.line((cx, cy, x, y), fill=(255, 255, 255), width=width)
     draw.ellipse((cx - 2, cy - 2, cx + 2, cy + 2), fill=(255, 255, 255))
 
-def draw_timestamp(draw: ImageDraw.ImageDraw, fp: FloorplanV1, origin: Tuple[int, int]) -> int:
+def draw_timestamp(
+    draw: ImageDraw.ImageDraw,
+    fp: FloorplanV1,
+    origin: Tuple[int, int],
+    now: Optional[datetime] = None,
+) -> int:
     font, font_size = resolve_font(fp, 12)
     spacing = max(2, int(font_size * 0.2))
-    now = datetime.now()
+    now = now or datetime.now()
     lines = build_timestamp_lines(now)
     draw.multiline_text(
         origin,

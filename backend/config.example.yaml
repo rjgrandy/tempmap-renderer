@@ -17,6 +17,25 @@ render:
   default_legend:
     min_f: 60
     max_f: 80
+  sidebar:
+    enabled: true
+    components:
+      - type: timestamp
+      - type: outside_temp
+      - type: temperature_chart
+        width: 260
+        height: 160
+        history_hours: 12
+        forecast_hours: 12
+      - type: legend
+      - type: thermostat_action_chart
+        width: 260
+        height: 140
+        history_hours: 24
+      - type: thermostat_setpoint_chart
+        width: 260
+        height: 140
+        history_hours: 24
 
 timelapse:
   frame_retention_hours: 48
