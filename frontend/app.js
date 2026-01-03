@@ -231,6 +231,9 @@ function collectHaEntities(fp) {
     if (thermo.mode_entity) {
       entities.add(thermo.mode_entity);
     }
+    if (thermo.fan_entity) {
+      entities.add(thermo.fan_entity);
+    }
   });
   if (fp.render?.outside_temp_entity) {
     entities.add(fp.render.outside_temp_entity);
@@ -1553,6 +1556,11 @@ function renderProperties() {
       item.mode_entity = val;
       refreshHaStates();
     }));
+    detailSection.body.appendChild(renderField('Fan Entity', item.fan_entity || '', (val) => {
+      pushHistory();
+      item.fan_entity = val;
+      refreshHaStates();
+    }));
     detailSection.body.appendChild(renderField('Preview Mode (editor only)', item.preview_mode || 'heat_cool', (val) => {
       pushHistory();
       item.preview_mode = val;
@@ -1797,6 +1805,7 @@ function createThermostat(point) {
     setpoint_low_entity: '',
     setpoint_high_entity: '',
     mode_entity: '',
+    fan_entity: '',
     device_label: '',
     label_offset_x: 12,
     label_offset_y: -8,
