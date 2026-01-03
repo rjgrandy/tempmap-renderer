@@ -2174,6 +2174,9 @@ def compute_chart_height(fp: FloorplanV1) -> int:
 def compute_thermostat_chart_height(fp: FloorplanV1) -> int:
     return max(120, fp.render.thermostat_chart_height)
 
+def should_render_thermostat_charts(fp: FloorplanV1) -> bool:
+    return fp.render.thermostat_chart_history_hours > 0
+
 def compute_info_panel_height(fp: FloorplanV1) -> int:
     font_size = fp.render.text_font_size or 12
     box_size = max(16, int(font_size * 1.4))
@@ -2195,11 +2198,14 @@ def compute_info_panel_height(fp: FloorplanV1) -> int:
         if height:
             height += section_gap
         height += compute_legend_height(fp)
-    if any(thermo.mode_entity for thermo in fp.thermostats):
+    if should_render_thermostat_charts(fp) and any(thermo.mode_entity for thermo in fp.thermostats):
         if height:
             height += section_gap
         height += compute_thermostat_chart_height(fp)
-    if any(thermo.setpoint_low_entity or thermo.setpoint_high_entity or thermo.setpoint_entity for thermo in fp.thermostats):
+    if should_render_thermostat_charts(fp) and any(
+        thermo.setpoint_low_entity or thermo.setpoint_high_entity or thermo.setpoint_entity
+        for thermo in fp.thermostats
+    ):
         if height:
             height += section_gap
         height += compute_thermostat_chart_height(fp)
@@ -2220,9 +2226,12 @@ def compute_info_panel_width(fp: FloorplanV1, min_f: float, max_f: float) -> int
         width = max(width, max(160, fp.render.chart_width))
     if fp.render.show_legend:
         width = max(width, 200)
-    if any(thermo.mode_entity for thermo in fp.thermostats):
+    if should_render_thermostat_charts(fp) and any(thermo.mode_entity for thermo in fp.thermostats):
         width = max(width, max(180, fp.render.thermostat_chart_width))
-    if any(thermo.setpoint_low_entity or thermo.setpoint_high_entity or thermo.setpoint_entity for thermo in fp.thermostats):
+    if should_render_thermostat_charts(fp) and any(
+        thermo.setpoint_low_entity or thermo.setpoint_high_entity or thermo.setpoint_entity
+        for thermo in fp.thermostats
+    ):
         width = max(width, max(180, fp.render.thermostat_chart_width))
     return int(width)
 
@@ -2284,13 +2293,16 @@ def draw_info_panel(
             y_cursor += section_gap
         y_cursor += draw_legend(draw, min_f, max_f, (left, y_cursor + margin), fp, palette)
         has_content = True
-    if any(thermo.mode_entity for thermo in fp.thermostats):
+    if should_render_thermostat_charts(fp) and any(thermo.mode_entity for thermo in fp.thermostats):
         if has_content:
             y_cursor += section_gap
         action_height = draw_thermostat_action_chart(draw, fp, size, (left, y_cursor + margin))
         y_cursor += action_height
         has_content = has_content or action_height > 0
-    if any(thermo.setpoint_low_entity or thermo.setpoint_high_entity or thermo.setpoint_entity for thermo in fp.thermostats):
+    if should_render_thermostat_charts(fp) and any(
+        thermo.setpoint_low_entity or thermo.setpoint_high_entity or thermo.setpoint_entity
+        for thermo in fp.thermostats
+    ):
         if has_content:
             y_cursor += section_gap
         setpoint_height = draw_thermostat_setpoint_chart(draw, fp, size, (left, y_cursor + margin))
