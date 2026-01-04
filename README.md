@@ -1,20 +1,22 @@
 # TempMap Renderer
 
-A FastAPI service and lightweight canvas editor for building multi-floor temperature maps and rendering live heatmap PNGs for Home Assistant dashboards.
+TempMap Renderer is a FastAPI service plus a lightweight browser editor for building multi-floor temperature maps and rendering live heatmap images for Home Assistant dashboards.
 
-## Highlights
+It runs as a single service, stores floorplans on disk, polls Home Assistant for sensor states, and renders PNGs (and timelapses) on demand.
 
-- **Live heatmap rendering** from Home Assistant sensor states.
-- **Floorplan editor** served at `/editor` (no frontend framework).
-- **Unraid-friendly Docker image** with `/data` volume persistence.
-- **Configurable scaling** (absolute vs. relative min/max) and **auto-cropping** to reduce blank space around the floorplan.
+---
 
-## Repository layout
+## What it does (in plain English)
 
-- `backend/` — FastAPI app, rendering logic, configuration.
-- `frontend/` — Vanilla JS canvas editor.
-- `docker/` — Dockerfile for container builds.
-- `unraid/` — Unraid template.
+1. **You draw your floorplan** in a simple canvas editor (`/editor`).
+2. **You bind sensors** to spots on the floorplan.
+3. **The backend polls Home Assistant** for those sensor values.
+4. **The renderer solves a heatmap** and serves it as an image (`/render/live/{floor_id}.png`).
+5. **Home Assistant displays the image** on your dashboard.
+
+Everything is stored on disk (defaults to `/data`) so you can restart the container without losing your work.
+
+---
 
 ## Quick start (local)
 
@@ -26,30 +28,130 @@ pip install -r backend/requirements.txt
 uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-Open the editor at http://localhost:8000/editor.
+Open the editor at:
 
-Floorplans are stored under `/data/floorplans/{floor_id}.json`.
+```
+http://localhost:8000/editor
+```
 
-## Docker
+Floorplans are stored under:
+
+```
+/data/floorplans/{floor_id}.json
+```
+
+---
+
+## Docker (recommended)
 
 ```bash
 docker build -f docker/Dockerfile -t tempmap-renderer .
 docker run --rm -p 8000:8000 -v $(pwd)/data:/data tempmap-renderer
 ```
 
-Then visit http://localhost:8000/editor.
+Then visit:
 
-## Unraid template
+```
+http://localhost:8000/editor
+```
 
-Import the template in Unraid via **Unraid > Docker > Add Container > Template**.
-
-> **Note:** The container reads config from `/app/backend/config.yaml` at runtime. If you keep your config under Unraid appdata, bind-mount that file directly to `/app/backend/config.yaml`.
+> **Note:** In the container, the config path is `/app/backend/config.yaml` and the data path is `/data`.
 
 ---
 
-# Configuration file (`backend/config.yaml`)
+## Unraid
 
-The backend reads its configuration once at startup from `backend/config.yaml` (in the container: `/app/backend/config.yaml`). Use `backend/config.example.yaml` as a starting point.
+Import the template in **Unraid → Docker → Add Container → Template**.
+
+If you keep `config.yaml` in Unraid appdata, bind-mount it to:
+
+```
+/app/backend/config.yaml
+```
+
+---
+
+## How to use the editor (step by step)
+
+1. **Open the editor** at `/editor`.
+2. **Create a floor** (top-left menu).
+3. **Draw walls and doors** using the toolbar.
+4. **Drop sensors** where your physical sensors live.
+5. **Name each sensor** and assign a Home Assistant entity ID.
+6. **Save the floorplan**.
+
+When saved, the floorplan becomes a JSON file at `/data/floorplans/{floor_id}.json`.
+
+---
+
+## Configure Home Assistant access
+
+Copy the example config and edit the Home Assistant section:
+
+```yaml
+home_assistant:
+  base_url: http://homeassistant.local:8123
+  token: YOUR_LONG_LIVED_TOKEN
+  refresh_seconds: 15
+```
+
+**Tips:**
+- `base_url` must be reachable from the renderer (container → HA).
+- Use a **long‑lived access token** from your Home Assistant profile.
+- `refresh_seconds` controls how often sensor states are pulled.
+
+---
+
+## Render a live heatmap
+
+Once you have a floorplan, the live image URL is:
+
+```
+GET /render/live/{floor_id}.png
+```
+
+Example (floor id = `floor1`):
+
+```
+http://YOUR_HOST:8000/render/live/floor1.png
+```
+
+The renderer recalculates the heatmap each time the image is requested (using cached sensor values).
+
+---
+
+## Home Assistant usage examples
+
+### Picture entity
+
+```yaml
+type: picture-entity
+entity: sensor.living_room_temperature
+image: http://YOUR_HOST:8000/render/live/floor1.png
+name: Floor 1 Heatmap
+```
+
+### Markdown card (force refresh)
+
+```yaml
+type: markdown
+content: >-
+  ![Heatmap](http://YOUR_HOST:8000/render/live/floor1.png?ts={{ now().timestamp() }})
+```
+
+### Timelapse GIF
+
+```yaml
+type: markdown
+content: >-
+  ![Timelapse](http://YOUR_HOST:8000/render/timelapse.gif?floor=floor1&window=86400&step=900&width=800)
+```
+
+---
+
+## Configuration reference (backend/config.yaml)
+
+The backend reads config once at startup. Use `backend/config.example.yaml` as a base.
 
 ```yaml
 server:
@@ -86,48 +188,37 @@ timelapse:
   label_font_size: 18
 ```
 
-## `server`
+### `data`
 
-- **host**: informational only; the app is started via `uvicorn` (CLI).  
-- **port**: informational only; the app is started via `uvicorn` (CLI).
+- `path`: base directory for floorplans, frames, and timelapses. Defaults to `/data`.
+- Override with `TEMP_MAP_DATA_PATH` if you need a different path.
 
-## `data`
+### `render`
 
-- **path**: base directory for persisted data (floorplans, frames).  
-  - Default: `/data`
-  - Override with `TEMP_MAP_DATA_PATH` environment variable if needed.
+Defaults used for **new** floorplans created in the editor.
 
-## `home_assistant`
+- `default_grid`: solver grid size (lower = faster, higher = smoother).
+- `default_legend`: default min/max temperature range for the legend.
 
-- **base_url**: Home Assistant base URL (e.g., `http://192.168.1.199:8123`).
-- **token**: long‑lived access token from Home Assistant.
-- **refresh_seconds**: polling interval for HA sensor states and frame caching.
+### `timelapse`
 
-## `render`
+Controls rolling timelapse generation and on-demand timelapses.
 
-This section controls **defaults** used when creating new floorplans in the editor.
+- `frame_retention_hours`: how long to keep cached PNG frames.
+- `window_hours`: rolling timelapse time window.
+- `sampling_seconds`: base sampling cadence for frames.
+- `target_duration_seconds`: target output video length.
+- `fps`: frames per second for the output MP4.
+- `output_path`: directory for rendered MP4s.
+- `rolling_enabled`: enable periodic rolling generation.
+- `rolling_interval_seconds`: how often to regenerate rolling timelapses.
+- `stitch_multi_floor`: generate a combined `all/rolling.mp4`.
+- `border_px`: padding between floors in stitched outputs.
+- `label_font_size`: font size for floor labels.
 
-- **default_grid**: default solver grid size used for new floorplans.
-- **default_legend**: default min/max values for the legend in new floorplans.
+---
 
-## `timelapse`
-
-Configure rolling timelapse generation and on-demand timelapses. The backend caches frames under
-`/data/frames/{floor_id}` and writes MP4s to `output_path`.
-
-- **frame_retention_hours**: how long to keep cached PNG frames.
-- **window_hours**: rolling timelapse window length used by background generation.
-- **sampling_seconds**: base sampling cadence for frames before adaptive downsampling.
-- **target_duration_seconds**: target output duration; long sequences are downsampled to fit.
-- **fps**: frames per second for the generated MP4 (H.264).
-- **output_path**: directory to store rendered MP4s.
-- **rolling_enabled**: enable periodic rolling generation.
-- **rolling_interval_seconds**: how often to regenerate rolling timelapses.
-- **stitch_multi_floor**: build a stitched `all/rolling.mp4` when multiple floors exist.
-- **border_px**: border size between stitched floors.
-- **label_font_size**: font size for floor labels in stitched timelapses.
-
-### Timelapse API
+## Timelapse API
 
 Generate a timelapse on demand:
 
@@ -135,133 +226,18 @@ Generate a timelapse on demand:
 GET /api/timelapse/{floor_id}?window=48h&sampling_seconds=120&target_duration_seconds=60&fps=10&stitch=true
 ```
 
-- **window**: duration string (`30m`, `12h`, `2d`) or hours as a number.
-- **sampling_seconds**: base sampling interval in seconds.
-- **target_duration_seconds**: target length of the output video.
-- **fps**: frames per second.
-- **stitch**: set `true` to stitch all floors when `floor_id=all`.
+Parameters:
+- `window`: duration string (`30m`, `12h`, `2d`) or hours as a number.
+- `sampling_seconds`: base sampling interval in seconds.
+- `target_duration_seconds`: target length of the output video.
+- `fps`: frames per second.
+- `stitch`: set `true` to stitch all floors when `floor_id=all`.
 
 ---
 
-# Floorplan schema
+## API endpoints (quick list)
 
-Floorplans live at `/data/floorplans/{floor_id}.json`.
-
-```json
-{
-  "version": 1,
-  "floor_id": "floor1",
-  "canvas": {"width": 1600, "height": 1000},
-  "scale": {
-    "mode": "calibrated",
-    "px_per_meter": 100,
-    "calibration": {"p1": [0, 0], "p2": [100, 0], "distance_m": 1}
-  },
-  "walls": [
-    {"id": "wall_1", "points": [[20, 20], [200, 20]]}
-  ],
-  "doors": [
-    {
-      "id": "door_1",
-      "segment": [[200, 20], [240, 20]],
-      "entity_id": "binary_sensor.front_door",
-      "mapping": {
-        "open_values": ["on", "open"],
-        "closed_values": ["off", "closed"],
-        "unknown_as": "closed"
-      },
-      "open": false,
-      "open_resistance": 2,
-      "closed_resistance": 500
-    }
-  ],
-  "sensors": [
-    {
-      "id": "sensor_1",
-      "entity": "sensor.living_room_temperature",
-      "pos": [120, 80],
-      "label": "Living",
-      "weight": 1
-    }
-  ],
-  "thermostats": [
-    {
-      "id": "thermo_1",
-      "pos": [300, 140],
-      "temperature_entity": "sensor.living_room_temperature",
-      "setpoint_entity": "input_number.living_setpoint",
-      "mode_entity": "climate.living_room",
-      "device_label": "Living Room"
-    }
-  ],
-  "stairwell": {
-    "id": "stair_1",
-    "polygon": [[500, 400], [600, 400], [600, 520], [500, 520]],
-    "link_to_floor_id": "floor2",
-    "coupling": 0.05
-  },
-  "render": {
-    "temp_range_f": {"min": 60, "max": 80},
-    "overlay_alpha": 0.6,
-    "scale_min_mode": "absolute",
-    "scale_max_mode": "absolute",
-    "auto_crop": true,
-    "crop_padding": 30,
-    "exterior_margin": 20,
-    "show_walls": true,
-    "show_labels": true,
-    "show_legend": true,
-    "show_timestamp": true,
-    "show_outside_temp": true,
-    "outside_temp_label": "Outside",
-    "outside_temp_entity": "sensor.outdoor_temperature",
-    "outside_temp_f": null,
-    "text_font_size": null,
-    "text_font_path": null
-  },
-  "solver": {
-    "grid_w": 400,
-    "grid_h": 250,
-    "iterations": 200,
-    "sensor_pull": 0.15,
-    "wall_resistance": 5000,
-    "default_passage_resistance": 2
-  }
-}
-```
-
-### Render settings (`render`)
-
-- **temp_range_f.min / temp_range_f.max**: absolute temperature range (F).  
-- **scale_min_mode / scale_max_mode**:
-  - `absolute`: use the values from `temp_range_f`.
-  - `relative`: use the live grid’s min/max values.
-  - You can mix modes to clamp just one end of the scale.
-- **overlay_alpha**: transparency of the heatmap overlay (0–1).
-- **auto_crop**: trims extra blank space around the floorplan when rendering.
-- **crop_padding**: extra pixels to keep around the geometry when auto-cropping.
-- **exterior_margin**: padding outside the cropped floorplan used to draw the legend and timestamp.
-- **show_walls / show_labels / show_legend / show_timestamp / show_outside_temp**: toggles for overlay elements.
-- **outside_temp_label**: label to show before the outside temperature.
-- **outside_temp_entity / outside_temp_f**: data source for the outside temperature value.
-- **text_font_size**: override size for all overlay text (uses per-item font sizes when unset).
-- **text_font_path**: optional font file path to use for all overlay text.
-
-> The heatmap is masked to the floorplan hull so areas outside the exterior walls are not colorized.
-> The solver clamps the final grid so values do not fall below the coldest sensor reading on the floor.
-
-### Solver settings (`solver`)
-
-- **grid_w / grid_h**: solver grid resolution. Lower values render faster.
-- **iterations**: diffusion iterations. Higher values look smoother but render slower.
-- **sensor_pull**: strength of sensor influence.
-- **wall_resistance / default_passage_resistance**: resistance values for walls and openings.
-
----
-
-# API endpoints
-
-- `GET /editor` (static frontend)
+- `GET /editor`
 - `GET /api/floorplans`
 - `GET /api/floorplans/{floor_id}`
 - `PUT /api/floorplans/{floor_id}`
@@ -273,29 +249,29 @@ Floorplans live at `/data/floorplans/{floor_id}.json`.
 
 ---
 
-# Home Assistant card examples
+## FAQ
 
-### Picture entity
+### Where are floorplans stored?
 
-```yaml
-type: picture-entity
-entity: sensor.living_room_temperature
-image: http://YOUR_HOST:8000/render/live/floor1.png
-name: Floor 1 Heatmap
+They are stored as JSON files at:
+
+```
+/data/floorplans/{floor_id}.json
 ```
 
-### Markdown (PNG refresh)
+### Does it work without Home Assistant?
 
-```yaml
-type: markdown
-content: >-
-  ![Heatmap](http://YOUR_HOST:8000/render/live/floor1.png?ts={{ now().timestamp() }})
-```
+The editor works without Home Assistant, but live rendering requires sensor values. You can still render if your floorplan defines fallback values.
 
-### Timelapse
+### Why is my heatmap cropped?
 
-```yaml
-type: markdown
-content: >-
-  ![Timelapse](http://YOUR_HOST:8000/render/timelapse.gif?floor=floor1&window=86400&step=900&width=800)
-```
+Auto-cropping trims blank space around your floorplan. You can disable it or adjust padding in each floorplan’s `render` section.
+
+---
+
+## Repository layout
+
+- `backend/` — FastAPI app, rendering logic, configuration
+- `frontend/` — Vanilla JS canvas editor
+- `docker/` — Dockerfile for container builds
+- `unraid/` — Unraid template
