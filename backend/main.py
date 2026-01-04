@@ -1919,16 +1919,7 @@ def draw_temperature_chart(
         y = y1 - ratio_y * (y1 - y0)
         return x, y
 
-    hour_cursor = start.replace(minute=0, second=0, microsecond=0)
-    while hour_cursor < end:
-        next_hour = hour_cursor + timedelta(hours=1)
-        hour_center = hour_cursor + (next_hour - hour_cursor) / 2
-        is_day = 6 <= hour_center.astimezone().hour < 18
-        if not is_day:
-            x_start, _ = to_xy(hour_cursor, chart_min)
-            x_end, _ = to_xy(next_hour, chart_min)
-            draw.rectangle((x_start, y0, x_end, y1), fill=(80, 80, 80, 60))
-        hour_cursor = next_hour
+    draw_day_night_shading(draw, start, end, x0, x1, y0, y1)
 
     palette = resolve_legend_palette(fp)
     history_points = [(ts, *to_xy(ts, temp), temp) for ts, temp in history if start <= ts <= now]
@@ -2088,6 +2079,32 @@ def draw_time_ticks(
         draw.text((x - label_width / 2, label_y), label, fill=(255, 255, 255), font=font)
 
 
+def draw_day_night_shading(
+    draw: ImageDraw.ImageDraw,
+    start: datetime,
+    end: datetime,
+    x0: float,
+    x1: float,
+    y0: float,
+    y1: float,
+) -> None:
+    total_seconds = (end - start).total_seconds() or 1.0
+
+    def to_x(ts: datetime) -> float:
+        return x0 + ((ts - start).total_seconds() / total_seconds) * (x1 - x0)
+
+    hour_cursor = start.replace(minute=0, second=0, microsecond=0)
+    while hour_cursor < end:
+        next_hour = hour_cursor + timedelta(hours=1)
+        hour_center = hour_cursor + (next_hour - hour_cursor) / 2
+        is_day = 6 <= hour_center.astimezone().hour < 18
+        if not is_day:
+            x_start = to_x(hour_cursor)
+            x_end = to_x(next_hour)
+            draw.rectangle((x_start, y0, x_end, y1), fill=(80, 80, 80, 60))
+        hour_cursor = next_hour
+
+
 def lighten_color(color: Tuple[int, int, int], factor: float = 0.4) -> Tuple[int, int, int]:
     r, g, b = color
     return (
@@ -2157,14 +2174,7 @@ def draw_thermostat_action_chart(
         bottom_label_height = font_size + 6
         axis_label_width = measure_text_width(font, "Off") + 6
         x0 = origin_x + axis_label_width
-        y0 = chart_origin_y + title_height + 4
         x1 = origin_x + width - 6
-        y1 = chart_origin_y + height - bottom_label_height
-        if x1 <= x0 or y1 <= y0:
-            continue
-
-        draw.text((origin_x, chart_origin_y), title, fill=(255, 255, 255), font=font)
-        draw.rectangle((x0, y0, x1, y1), outline=(255, 255, 255), width=1)
 
         history = fetch_state_history(thermo.mode_entity, history_hours, end_time=now)
         fallback_state = read_entity_state(thermo.mode_entity) if thermo.mode_entity else None
@@ -2175,7 +2185,22 @@ def draw_thermostat_action_chart(
         heat_pct, cool_pct = compute_action_percentages(timeline, start, end)
         stats_text = f"Heat {heat_pct}% • Cool {cool_pct}%"
         stats_width = measure_text_width(font, stats_text)
-        draw.text((origin_x + width - stats_width, chart_origin_y), stats_text, fill=(180, 180, 180), font=font)
+        title_width = measure_text_width(font, title)
+        stats_y = chart_origin_y
+        title_block_height = title_height
+        if title_width + 8 + stats_width > width:
+            stats_y = chart_origin_y + title_height
+            title_block_height += title_height
+        y0 = chart_origin_y + title_block_height + 4
+        y1 = chart_origin_y + height - bottom_label_height
+        if x1 <= x0 or y1 <= y0:
+            continue
+
+        draw.text((origin_x, chart_origin_y), title, fill=(255, 255, 255), font=font)
+        draw.text((origin_x + width - stats_width, stats_y), stats_text, fill=(180, 180, 180), font=font)
+        draw.rectangle((x0, y0, x1, y1), outline=(255, 255, 255), width=1)
+
+        draw_day_night_shading(draw, start, end, x0, x1, y0, y1)
 
         total_seconds = (end - start).total_seconds() or 1.0
 
@@ -2262,23 +2287,29 @@ def draw_thermostat_setpoint_chart(
 
         draw.text((origin_x, chart_origin_y), title, fill=(255, 255, 255), font=font)
         draw.rectangle((x0, y0, x1, y1), outline=(255, 255, 255), width=1)
+        draw_day_night_shading(draw, start, end, x0, x1, y0, y1)
 
         low_series = fetch_history_series(thermo.setpoint_low_entity, history_hours, end_time=now)
         high_series = fetch_history_series(thermo.setpoint_high_entity, history_hours, end_time=now)
         setpoint_series = fetch_history_series(thermo.setpoint_entity, history_hours, end_time=now)
+        temp_series = fetch_history_series(thermo.temperature_entity, history_hours, end_time=now)
         if not low_series and setpoint_series:
             low_series = setpoint_series
         if not high_series and setpoint_series:
             high_series = setpoint_series
         low_series = extend_series_to_range(low_series, start, end)
         high_series = extend_series_to_range(high_series, start, end)
-        all_values = [temp for _ts, temp in (low_series + high_series)]
+        temp_series = extend_series_to_range(temp_series, start, end)
+        all_values = [temp for _ts, temp in (low_series + high_series + temp_series)]
         if not all_values:
             continue
-        chart_min = min(all_values)
-        chart_max = max(all_values)
+        chart_min = min(all_values) - 1
+        chart_max = max(all_values) + 1
+        chart_min = max(chart_min, 65)
+        chart_max = min(chart_max, 85)
         if chart_min >= chart_max:
-            chart_max = chart_min + 0.1
+            chart_max = min(85, chart_min + 1)
+            chart_min = max(65, chart_max - 1)
 
         total_seconds = (end - start).total_seconds() or 1.0
 
@@ -2306,6 +2337,10 @@ def draw_thermostat_setpoint_chart(
                 color,
                 width=2,
             )
+
+        if len(temp_series) > 1:
+            temp_points = [(to_x(ts), to_y(temp)) for ts, temp in temp_series]
+            draw.line(temp_points, fill=(255, 200, 50), width=2)
 
         draw_time_ticks(draw, font, font_size, start, end, x0, x1, y1, y1 + 4, now=now)
 
@@ -2497,8 +2532,8 @@ def compute_sidebar_panel_height(context: SidebarContext, components: List[Sideb
     fp = context.primary_floorplan
     font_size = fp.render.text_font_size or 12
     box_size = max(16, int(font_size * 1.4))
-    section_gap = 12
-    item_gap = 6
+    section_gap = 18
+    item_gap = 10
     height = 0
     for component in components:
         component_height = 0
@@ -2581,8 +2616,8 @@ def draw_info_panel(
     else:
         start_y = margin
     y_cursor = start_y - margin
-    section_gap = 12
-    item_gap = 6
+    section_gap = 18
+    item_gap = 10
     left = margin
     for component in components:
         if component.type == "timestamp":
@@ -2629,7 +2664,15 @@ def draw_info_panel(
             )
             y_cursor += max(90, component.height or fp.render.chart_height)
         elif component.type == "legend":
-            y_cursor += draw_legend(draw, context.min_f, context.max_f, (left, y_cursor + margin), fp, context.palette)
+            legend_label_offset = (fp.render.text_font_size or 12) + 4
+            y_cursor += draw_legend(
+                draw,
+                context.min_f,
+                context.max_f,
+                (left, y_cursor + margin + legend_label_offset),
+                fp,
+                context.palette,
+            )
         elif component.type == "thermostat_action_chart":
             thermostats = [thermo for thermo in context.thermostats if thermo.mode_entity]
             action_height = draw_thermostat_action_chart(
@@ -2680,7 +2723,7 @@ def render_sidebar_image(
     if panel_height <= 0 or panel_width <= 0:
         return None
     margin = context.primary_floorplan.render.exterior_margin
-    width = panel_width + margin
+    width = panel_width + (margin * 2)
     height = panel_height + (margin * 2)
     if target_height is not None:
         height = max(height, target_height)
