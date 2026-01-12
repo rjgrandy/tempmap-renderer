@@ -328,7 +328,7 @@ def generate_stitched_frames(
             fallback_images[floor_id] = Image.open(frames[0][1])
         else:
             fallback_images[floor_id] = Image.new("RGBA", base_size, (0, 0, 0, 255))
-    idx = 0
+    frame_idx = 0
     try:
         for sample_time in sample_times:
             images: List[Tuple[Optional[str], Image.Image]] = []
@@ -352,18 +352,18 @@ def generate_stitched_frames(
                     now=datetime.fromtimestamp(sample_time, tz=timezone.utc),
                 )
             stitched_images: List[Tuple[Optional[str], Image.Image]] = []
-            for idx, (label, image) in enumerate(images):
+            for image_idx, (label, image) in enumerate(images):
                 stitched_images.append((label, image))
-                if idx == 0 and sidebar_image is not None:
+                if image_idx == 0 and sidebar_image is not None:
                     stitched_images.append((None, sidebar_image))
             stitched = stitch_images_horizontally(
                 stitched_images,
                 config.timelapse_border_px,
                 config.timelapse_label_font_size,
             )
-            target = temp_dir / f"frame_{idx:05d}.png"
+            target = temp_dir / f"frame_{frame_idx:05d}.png"
             stitched.save(target)
-            idx += 1
+            frame_idx += 1
             for image in opened_images:
                 image.close()
     finally:
