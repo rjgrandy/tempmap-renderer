@@ -322,11 +322,25 @@ async function initialize() {
   updateStatusMeta();
   resizeCanvas();
   const availableFloorplans = await fetchFloorplanList();
+  if (availableFloorplans.length) {
+    const assignments = { ...state.storyAssignments };
+    const storyOrder = ['floor1', 'floor2'];
+    storyOrder.forEach((storyKey, index) => {
+      const assigned = assignments[storyKey];
+      if (assigned && availableFloorplans.includes(assigned)) {
+        return;
+      }
+      assignments[storyKey] = availableFloorplans[index] || availableFloorplans[0];
+    });
+    const changed = storyOrder.some((storyKey) => assignments[storyKey] !== state.storyAssignments[storyKey]);
+    if (changed) {
+      state.storyAssignments = assignments;
+      saveStoryAssignments();
+    }
+  }
   let initialFloorId = getAssignedFloorplanId(state.storyId);
   if (availableFloorplans.length && !availableFloorplans.includes(initialFloorId)) {
     initialFloorId = availableFloorplans[0];
-    state.storyAssignments[state.storyId] = initialFloorId;
-    saveStoryAssignments();
   }
   await ensureFloorplanLoaded(initialFloorId, { announce: false });
   pushHistory();
@@ -379,7 +393,14 @@ async function fetchFloorplanList() {
       emptyOption.textContent = 'No floorplans found';
       loadSelect.appendChild(emptyOption);
     }
-    loadSelect.value = state.floorId;
+    const preferredId = getAssignedFloorplanId(state.storyId);
+    if (preferredId && mergedIds.includes(preferredId)) {
+      loadSelect.value = preferredId;
+    } else if (state.floorId) {
+      loadSelect.value = state.floorId;
+    } else if (mergedIds.length) {
+      loadSelect.value = mergedIds[0];
+    }
     setStatus('Floorplan list loaded.');
     updateStatusMeta();
     return mergedIds;
