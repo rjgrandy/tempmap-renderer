@@ -393,7 +393,14 @@ async function fetchFloorplanList() {
       emptyOption.textContent = 'No floorplans found';
       loadSelect.appendChild(emptyOption);
     }
-    loadSelect.value = state.floorId;
+    const preferredId = getAssignedFloorplanId(state.storyId);
+    if (preferredId && mergedIds.includes(preferredId)) {
+      loadSelect.value = preferredId;
+    } else if (state.floorId) {
+      loadSelect.value = state.floorId;
+    } else if (mergedIds.length) {
+      loadSelect.value = mergedIds[0];
+    }
     setStatus('Floorplan list loaded.');
     updateStatusMeta();
     return mergedIds;
