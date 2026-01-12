@@ -9,7 +9,9 @@ import yaml
 from .models import AppConfig, SidebarComponentConfig, SidebarConfig
 
 DATA_ENV = "TEMP_MAP_DATA_PATH"
-CONFIG_PATH = Path(__file__).with_name("config.yaml")
+CONFIG_ENV = "CONFIG_PATH"
+DEFAULT_CONFIG_PATH = Path(__file__).with_name("config.yaml")
+CONFIG_PATH = Path(os.getenv(CONFIG_ENV, str(DEFAULT_CONFIG_PATH)))
 
 
 def default_sidebar_components() -> List[SidebarComponentConfig]:
@@ -25,8 +27,11 @@ def default_sidebar_components() -> List[SidebarComponentConfig]:
 
 def load_config() -> AppConfig:
     config_data = {}
-    if CONFIG_PATH.exists():
-        with CONFIG_PATH.open("r", encoding="utf-8") as handle:
+    config_path = CONFIG_PATH
+    if not config_path.exists() and DEFAULT_CONFIG_PATH.exists():
+        config_path = DEFAULT_CONFIG_PATH
+    if config_path.exists():
+        with config_path.open("r", encoding="utf-8") as handle:
             config_data = yaml.safe_load(handle) or {}
     data_path = config_data.get("data", {}).get("path", "/data")
     data_path = os.getenv(DATA_ENV, data_path)
