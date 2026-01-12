@@ -1257,6 +1257,15 @@ function render() {
 
   renderGrid([worldLeft, worldTop, worldRight, worldBottom]);
   const fp = currentFloorplan();
+
+  if (!fp) {
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '14px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('No floorplan loaded. Select one from the dropdown and click Load.', canvas.width / 2, canvas.height / 2);
+    return;
+  }
   
   if (fp.render.show_walls) {
     renderWalls(fp);
