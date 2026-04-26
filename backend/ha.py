@@ -14,6 +14,7 @@ ha_states: Dict[str, EntityState] = {}
 ha_missing: Dict[str, str] = {}
 ha_unavailable: Dict[str, str] = {}
 ha_last_poll: Optional[str] = None
+ha_state_revision = 0
 
 
 def gather_entities(floorplans: Dict[str, Dict]) -> List[str]:
@@ -72,7 +73,11 @@ def poll_home_assistant(entities: List[str]) -> None:
             last_updated=payload.get("last_updated", ""),
             last_changed=payload.get("last_changed", ""),
         )
+    global ha_state_revision
     with ha_lock:
+        changed = states != ha_states or missing != ha_missing or unavailable != ha_unavailable
+        if changed:
+            ha_state_revision += 1
         ha_states.clear()
         ha_states.update(states)
         ha_missing.clear()
@@ -235,6 +240,11 @@ def get_entity_states(entities: List[str]) -> Dict[str, str]:
             for entity in entities
         }
 
+
+
+def current_state_revision() -> int:
+    with ha_lock:
+        return ha_state_revision
 
 def parse_float(value: str) -> float:
     try:

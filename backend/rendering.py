@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import bisect
+import hashlib
 import heapq
 import io
+import json
 import math
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -24,9 +26,32 @@ from .ha import (
     fetch_state_history,
     ha_lock,
     ha_states,
+    current_state_revision,
 )
 from .models import FloorplanV1, SidebarComponentConfig, SidebarContext, Thermostat
 from .storage import load_all_floorplans
+
+
+_solve_cache_key: Optional[Tuple[str, int]] = None
+_solve_cache_grids: Dict[str, np.ndarray] = {}
+_solve_cache_metadata: Dict[str, Dict] = {}
+
+
+def _floorplans_signature(floorplans: Dict[str, Dict]) -> str:
+    payload = json.dumps(floorplans, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def solve_all_floorplans_cached(floorplans: Dict[str, Dict]) -> Tuple[Dict[str, np.ndarray], Dict[str, Dict]]:
+    global _solve_cache_key, _solve_cache_grids, _solve_cache_metadata
+    key = (_floorplans_signature(floorplans), current_state_revision())
+    if _solve_cache_key == key:
+        return _solve_cache_grids, _solve_cache_metadata
+    grids, metadata = solve_all_floorplans(floorplans)
+    _solve_cache_key = key
+    _solve_cache_grids = grids
+    _solve_cache_metadata = metadata
+    return grids, metadata
 
 
 def point_xy(point: List[float]) -> Tuple[float, float]:
@@ -38,7 +63,7 @@ def render_floorplan(floor_id: str) -> Image.Image:
     if floor_id == "all":
         if not floorplans:
             raise HTTPException(status_code=404, detail="Floorplans not found")
-        grids, metadata = solve_all_floorplans(floorplans)
+        grids, metadata = solve_all_floorplans_cached(floorplans)
         ranges = []
         for floor_key in sorted(floorplans.keys()):
             grid = grids.get(floor_key)
@@ -88,7 +113,7 @@ def render_floorplan(floor_id: str) -> Image.Image:
         )
     if floor_id not in floorplans:
         raise HTTPException(status_code=404, detail="Floorplan not found")
-    grids, metadata = solve_all_floorplans(floorplans)
+    grids, metadata = solve_all_floorplans_cached(floorplans)
     grid = grids.get(floor_id)
     if grid is None:
         raise HTTPException(status_code=404, detail="Floorplan not found")
