@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import shutil
 import subprocess
 import tempfile
@@ -14,6 +16,7 @@ from fastapi import HTTPException
 from PIL import Image
 
 from .config import config
+from .ha import current_state_revision
 from .models import FloorplanV1, SidebarContext
 from .rendering import (
     attach_sidebar_to_floorplan,
@@ -22,7 +25,7 @@ from .rendering import (
     resolve_frame_for_time,
     resolve_sidebar_context,
     resolve_temperature_range,
-    solve_all_floorplans,
+    solve_all_floorplans_cached,
     stitch_images_horizontally,
 )
 from .storage import load_all_floorplans
@@ -31,13 +34,22 @@ from .storage import load_all_floorplans
 timelapse_lock = threading.Lock()
 timelapse_last_roll: Optional[float] = None
 timelapse_is_running = False
+_last_frame_signature_by_floor: Dict[str, str] = {}
+
+
+def floorplan_signature(floorplan: Dict) -> str:
+    payload = json.dumps(floorplan, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def render_frames_for_floorplans(floorplans: Dict[str, Dict]) -> None:
-    grids, metadata = solve_all_floorplans(floorplans)
+    grids, metadata = solve_all_floorplans_cached(floorplans)
     for floor_id, floorplan in floorplans.items():
         grid = grids.get(floor_id)
         if grid is None:
+            continue
+        signature = f"{floorplan_signature(floorplan)}:{current_state_revision()}"
+        if _last_frame_signature_by_floor.get(floor_id) == signature:
             continue
         image = render_floorplan_base_image(
             floor_id,
@@ -46,6 +58,7 @@ def render_frames_for_floorplans(floorplans: Dict[str, Dict]) -> None:
             metadata.get(floor_id, {}),
         )
         save_frame(floor_id, image)
+        _last_frame_signature_by_floor[floor_id] = signature
     cleanup_frames()
 
 
@@ -197,7 +210,7 @@ def build_timelapse_video(
         raise HTTPException(status_code=404, detail="No frames found in requested window")
     sidebar_context = None
     if config.render_sidebar.enabled and available_floor_ids:
-        grids, _metadata = solve_all_floorplans(floorplans)
+        grids, _metadata = solve_all_floorplans_cached(floorplans)
         parsed_floorplans: List[FloorplanV1] = []
         ranges: List[Tuple[float, float]] = []
         for fid in available_floor_ids:
