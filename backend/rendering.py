@@ -6,13 +6,14 @@ import heapq
 import io
 import json
 import math
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from fastapi import HTTPException
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 from .config import config
 from .ha import (
@@ -30,6 +31,116 @@ from .ha import (
 )
 from .models import FloorplanV1, SidebarComponentConfig, SidebarContext, Thermostat
 from .storage import load_all_floorplans
+
+
+# ---------------------------------------------------------------------------
+# Visual style
+# ---------------------------------------------------------------------------
+# A cohesive, modern dark theme. Colors are kept soft and slightly desaturated
+# so the heatmap stays the focal point and overlays read cleanly on top of it.
+
+BG_COLOR = (22, 24, 30, 255)          # app background (soft cool charcoal)
+WALL_COLOR = (214, 219, 230, 255)     # softened off-white walls
+WALL_HIGHLIGHT = (245, 248, 255, 235) # bevel highlight on the raised edge
+WALL_EDGE_SHADOW = (8, 9, 12, 220)    # dark lower-right edge for emboss
+WALL_SHADOW = (0, 0, 0, 130)          # drop shadow beneath walls for depth
+DOOR_COLOR = (120, 190, 255, 255)     # calm blue doorways
+SENSOR_FILL = (255, 255, 255, 255)
+SENSOR_RING = (18, 20, 26, 210)       # subtle dark outline around dots
+SENSOR_HALO = (255, 255, 255, 38)     # soft glow around dots
+THERMO_COLOR = (255, 200, 90, 255)
+THERMO_FILL = (255, 200, 90, 36)
+
+LABEL_COLOR = (245, 247, 251)
+THERMO_LABEL = (255, 206, 105)
+LABEL_CHIP = (16, 18, 24, 140)        # translucent backing behind label text
+MUTED_TEXT = (168, 174, 188)
+AXIS_TEXT = (206, 211, 222)
+
+# NOTE: PIL's ImageDraw overwrites (it does not alpha-blend) when drawing
+# directly on the canvas, so these are opaque colors tuned to read as a soft
+# frosted "card" over BG_COLOR rather than RGBA values.
+PANEL_FILL = (33, 36, 44)             # frosted card background for charts
+PANEL_BORDER = (62, 67, 79)           # muted card border
+GRID_COLOR = (100, 106, 120)          # subtle gridlines / ticks
+NIGHT_SHADE = (26, 28, 35)            # gentle darkening for night hours
+
+TEXT_SHADOW = (0, 0, 0, 150)
+
+# Supersampling factor for crisp, anti-aliased vector overlays (walls, markers,
+# clock). Shapes are drawn large and downscaled with LANCZOS.
+SHAPE_SS = 3
+
+
+def draw_text_with_shadow(
+    draw: "ImageDraw.ImageDraw",
+    pos: Tuple[float, float],
+    text: str,
+    font,
+    fill,
+    shadow: Tuple[int, int, int, int] = TEXT_SHADOW,
+    offset: Tuple[int, int] = (1, 1),
+) -> None:
+    """Draw text with a subtle drop shadow for legibility over the heatmap."""
+    x, y = pos
+    draw.text((x + offset[0], y + offset[1]), text, font=font, fill=shadow)
+    draw.text((x, y), text, font=font, fill=fill)
+
+
+def draw_panel(
+    draw: "ImageDraw.ImageDraw",
+    box: Tuple[float, float, float, float],
+    radius: int = 10,
+    fill=PANEL_FILL,
+    border=PANEL_BORDER,
+    width: int = 1,
+) -> None:
+    """Draw a soft rounded 'card' used as a backdrop for charts."""
+    draw.rounded_rectangle(box, radius=radius, fill=fill, outline=border, width=width)
+
+
+def make_background(size: Tuple[int, int]) -> Image.Image:
+    """A flat, cohesive dark backdrop. Kept flat (no gradient) so stitched
+    multi-floor panels share an identical, seamless background."""
+    return Image.new("RGBA", size, BG_COLOR)
+
+
+def prettify_floor_name(floor_id: str) -> str:
+    """Turn a raw floor id into a friendly display title.
+
+    e.g. "1_first_floor" -> "First Floor", "second-floor" -> "Second Floor".
+    A leading ordering prefix like "1_" or "02-" is stripped.
+    """
+    name = re.sub(r"^\s*\d+\s*[_\-.]\s*", "", floor_id)
+    name = name.replace("_", " ").replace("-", " ").strip()
+    if not name:
+        name = floor_id
+    return name.title()
+
+
+def resolve_shared_range(
+    floorplans: List[Tuple[FloorplanV1, np.ndarray]],
+) -> Tuple[float, float]:
+    """One color scale shared by every floor.
+
+    The scale is static (driven by each floorplan's configured temperature
+    range) rather than auto-fitting the data, so a room that warms or cools
+    visibly changes color over time instead of the whole gradient shifting
+    underneath it. Floors are unified by taking the lowest min and highest max.
+    """
+    mins: List[float] = []
+    maxs: List[float] = []
+    for fp, grid in floorplans:
+        lo, hi = resolve_temperature_range(fp, grid)
+        mins.append(lo)
+        maxs.append(hi)
+    if not mins:
+        return 68.0, 76.0
+    min_f = min(mins)
+    max_f = max(maxs)
+    if min_f >= max_f:
+        max_f = min_f + 0.1
+    return min_f, max_f
 
 
 _solve_cache_key: Optional[Tuple[str, int]] = None
@@ -64,22 +175,20 @@ def render_floorplan(floor_id: str) -> Image.Image:
         if not floorplans:
             raise HTTPException(status_code=404, detail="Floorplans not found")
         grids, metadata = solve_all_floorplans_cached(floorplans)
-        ranges = []
-        for floor_key in sorted(floorplans.keys()):
-            grid = grids.get(floor_key)
-            if grid is None:
-                continue
-            fp = FloorplanV1.parse_obj(floorplans[floor_key])
-            ranges.append(resolve_temperature_range(fp, grid))
-        if not ranges:
-            raise HTTPException(status_code=404, detail="Floorplans not found")
-        min_f = min(range_pair[0] for range_pair in ranges)
-        max_f = max(range_pair[1] for range_pair in ranges)
         images = []
         ordered_floor_ids = sorted(floorplans.keys())
         parsed_floorplans: List[FloorplanV1] = []
         for floor_key in ordered_floor_ids:
             parsed_floorplans.append(FloorplanV1.parse_obj(floorplans[floor_key]))
+        # One robust, outlier-resistant color scale shared by every floor.
+        range_pairs = [
+            (parsed_floorplans[idx], grids[floor_key])
+            for idx, floor_key in enumerate(ordered_floor_ids)
+            if grids.get(floor_key) is not None
+        ]
+        if not range_pairs:
+            raise HTTPException(status_code=404, detail="Floorplans not found")
+        min_f, max_f = resolve_shared_range(range_pairs)
         for floor_key in ordered_floor_ids:
             grid = grids.get(floor_key)
             if grid is None:
@@ -117,9 +226,11 @@ def render_floorplan(floor_id: str) -> Image.Image:
     grid = grids.get(floor_id)
     if grid is None:
         raise HTTPException(status_code=404, detail="Floorplan not found")
-    base_image = render_floorplan_base_image(floor_id, floorplans[floor_id], grid, metadata.get(floor_id, {}))
     fp = FloorplanV1.parse_obj(floorplans[floor_id])
-    min_f, max_f = resolve_temperature_range(fp, grid)
+    min_f, max_f = resolve_shared_range([(fp, grid)])
+    base_image = render_floorplan_base_image(
+        floor_id, floorplans[floor_id], grid, metadata.get(floor_id, {}), range_override=(min_f, max_f)
+    )
     sidebar_context = resolve_sidebar_context([fp], min_f, max_f)
     sidebar_image = render_sidebar_image(sidebar_context, align="top", target_height=base_image.height)
     return attach_sidebar_to_floorplan(base_image, sidebar_image)
@@ -373,29 +484,47 @@ def render_floorplan_base_image(
     range_override: Optional[Tuple[float, float]] = None,
 ) -> Image.Image:
     fp = FloorplanV1.parse_obj(payload)
-    canvas = Image.new("RGBA", (fp.canvas.width, fp.canvas.height), (20, 20, 20, 255))
+    canvas = make_background((fp.canvas.width, fp.canvas.height))
     min_f, max_f = range_override or resolve_temperature_range(fp, grid)
     palette = resolve_legend_palette(fp)
 
     # Use Flood Fill mask instead of convex hull to handle concave yards properly
     heatmap_mask = build_floorplan_mask_floodfill(fp)
 
+    # Drop a soft shadow of the whole house silhouette so the floorplan reads as
+    # a solid form gently raised off the background (a subtle 3D lift).
+    canvas = Image.alpha_composite(canvas, render_house_shadow(heatmap_mask, canvas.size))
+
     heatmap = render_heatmap(grid, min_f, max_f, fp.render.overlay_alpha, canvas.size, heatmap_mask, palette)
     canvas = Image.alpha_composite(canvas, heatmap)
-    draw = ImageDraw.Draw(canvas)
-    if fp.render.show_walls:
-        draw_walls(draw, fp)
-    draw_sensors(draw, fp)
-    draw_thermostats(draw, fp)
-    draw_room_labels(draw, fp)
+    canvas, label_bbox = draw_floorplan_overlay(canvas, fp)
     if fp.render.auto_crop:
-        crop_box = compute_floorplan_crop(fp, canvas.size, fp.render.crop_padding)
+        crop_box = compute_floorplan_crop(fp, canvas.size, fp.render.crop_padding, label_bbox)
         if crop_box:
             canvas, crop_box = expand_canvas_for_crop(canvas, crop_box)
             canvas = canvas.crop(crop_box)
-            draw = ImageDraw.Draw(canvas)  # Update draw object for cropped canvas if needed
-            # Actually we just crop at the end, that's fine.
     return canvas.convert("RGB")
+
+
+def render_house_shadow(mask: np.ndarray, size: Tuple[int, int]) -> Image.Image:
+    """A blurred, downward-offset silhouette of the floorplan footprint, used as
+    a drop shadow beneath the house for a sense of depth."""
+    shadow = Image.new("RGBA", size, (0, 0, 0, 0))
+    if not np.any(mask):
+        return shadow
+    silhouette = Image.fromarray((mask * 150).astype(np.uint8), mode="L")
+    dark = Image.new("RGBA", size, (0, 0, 0, 0))
+    dark.putalpha(silhouette)
+    offset = max(6, int(min(size) / 65))
+    blur = max(8, int(min(size) / 45))
+    dark = dark.transform(
+        size,
+        Image.AFFINE,
+        (1, 0, -offset * 0.4, 0, 1, -offset),
+        resample=Image.Resampling.BILINEAR,
+    )
+    dark = dark.filter(ImageFilter.GaussianBlur(blur))
+    return dark
 
 
 def build_floorplan_mask_floodfill(fp: FloorplanV1) -> np.ndarray:
@@ -490,6 +619,10 @@ def render_heatmap(
         r, g, b, a = image.split()
         # Merge mask with constant alpha
         new_a = Image.eval(mask_img, lambda x: int(x * overlay_alpha))
+        # Feather the mask edges so the heat fades softly at walls instead of
+        # ending in a hard cut. This gives the map a calmer, glowing quality.
+        feather = max(2, int(min(size) / 130))
+        new_a = new_a.filter(ImageFilter.GaussianBlur(feather))
         image = Image.merge("RGBA", (r, g, b, new_a))
 
     return image
@@ -530,12 +663,17 @@ def resolve_legend_palette(fp: FloorplanV1) -> List[Tuple[int, int, int]]:
                 parsed.append(color)
         if len(parsed) >= 2:
             return parsed
+    # A refined cool-to-warm thermal ramp. Softer and more perceptually even
+    # than a pure rainbow: deep indigo through teal and amber to a muted red.
     return [
-        (0, 0, 255),
-        (0, 255, 255),
-        (0, 255, 0),
-        (255, 255, 0),
-        (255, 0, 0),
+        (49, 71, 168),     # deep indigo (coldest)
+        (66, 133, 214),    # blue
+        (84, 188, 214),    # cyan / teal
+        (120, 200, 168),   # soft green
+        (210, 213, 128),   # warm chartreuse
+        (243, 196, 96),    # amber
+        (233, 138, 74),    # orange
+        (208, 78, 70),     # muted red (hottest)
     ]
 
 
@@ -563,7 +701,7 @@ def add_exterior_margin(
     right = right_padding if right_padding is not None else margin
     new_width = image.width + left + right
     new_height = image.height + top + bottom
-    canvas = Image.new("RGBA", (new_width, new_height), (20, 20, 20, 255))
+    canvas = Image.new("RGBA", (new_width, new_height), BG_COLOR)
     canvas.paste(image, (left, top))
     return canvas
 
@@ -581,7 +719,7 @@ def expand_canvas_for_crop(
         return image, crop_box
     new_width = image.width + left_pad + right_pad
     new_height = image.height + top_pad + bottom_pad
-    expanded = Image.new("RGBA", (new_width, new_height), (20, 20, 20, 255))
+    expanded = Image.new("RGBA", (new_width, new_height), BG_COLOR)
     expanded.paste(image, (left_pad, top_pad))
     shifted_crop = (
         min_x + left_pad,
@@ -592,7 +730,12 @@ def expand_canvas_for_crop(
     return expanded, shifted_crop
 
 
-def compute_floorplan_crop(fp: FloorplanV1, canvas_size: Tuple[int, int], padding: int) -> Optional[Tuple[int, int, int, int]]:
+def compute_floorplan_crop(
+    fp: FloorplanV1,
+    canvas_size: Tuple[int, int],
+    padding: int,
+    extra_bbox: Optional[Tuple[int, int, int, int]] = None,
+) -> Optional[Tuple[int, int, int, int]]:
     points = []
     for wall in fp.walls:
         points.extend([point_xy(p) for p in wall.points])
@@ -604,111 +747,259 @@ def compute_floorplan_crop(fp: FloorplanV1, canvas_size: Tuple[int, int], paddin
     min_y = int(min(ys) - padding)
     max_x = int(max(xs) + padding)
     max_y = int(max(ys) + padding)
+    if extra_bbox is not None:
+        # Make sure labels (which can extend past the walls) aren't clipped.
+        label_pad = 6
+        min_x = min(min_x, extra_bbox[0] - label_pad)
+        min_y = min(min_y, extra_bbox[1] - label_pad)
+        max_x = max(max_x, extra_bbox[2] + label_pad)
+        max_y = max(max_y, extra_bbox[3] + label_pad)
     return min_x, min_y, max_x, max_y
 
 
-def draw_walls(draw: ImageDraw.ImageDraw, fp: FloorplanV1) -> None:
-    for wall in fp.walls:
-        points = [point_xy(p) for p in wall.points]
-        draw.line(points, fill=(230, 230, 230), width=3)
-    for door in fp.doors:
-        points = [point_xy(door.segment[0]), point_xy(door.segment[1])]
-        draw.line(points, fill=(120, 200, 255), width=4)
+def draw_floorplan_overlay(
+    canvas: Image.Image, fp: FloorplanV1
+) -> Tuple[Image.Image, Optional[Tuple[int, int, int, int]]]:
+    """Composite the crisp vector layer (walls, doorways, sensor and thermostat
+    markers) onto the heatmap, then the text labels (on chips, de-overlapped).
+    Returns the canvas plus the bounding box of all drawn labels so the caller
+    can keep them from being clipped when cropping."""
+    shapes = render_shape_layer(fp, canvas.size)
+    canvas = Image.alpha_composite(canvas, shapes)
+    labels = render_labels_layer(fp, canvas.size)
+    label_bbox = labels.getbbox()
+    canvas = Image.alpha_composite(canvas, labels)
+    return canvas, label_bbox
 
 
-def draw_sensors(draw: ImageDraw.ImageDraw, fp: FloorplanV1) -> None:
+def render_shape_layer(fp: FloorplanV1, size: Tuple[int, int]) -> Image.Image:
+    """Render walls and markers on a supersampled transparent layer for smooth,
+    anti-aliased edges, then downscale with high-quality resampling."""
+    s = SHAPE_SS
+    big = (size[0] * s, size[1] * s)
+    layer = Image.new("RGBA", big, (0, 0, 0, 0))
+
+    # Soft drop shadow beneath the walls so each room reads with a little depth,
+    # as if gently raised off the background.
+    if fp.render.show_walls and fp.walls:
+        shadow = Image.new("RGBA", big, (0, 0, 0, 0))
+        sdraw = ImageDraw.Draw(shadow)
+        offset = int(round(1.6 * s))
+        shadow_w = max(1, int(round(3.4 * s)))
+        for wall in fp.walls:
+            points = [(p[0] * s + offset, p[1] * s + offset) for p in wall.points]
+            if len(points) >= 2:
+                sdraw.line(points, fill=WALL_SHADOW, width=shadow_w, joint="curve")
+        shadow = shadow.filter(ImageFilter.GaussianBlur(2.4 * s))
+        layer = Image.alpha_composite(layer, shadow)
+
+    draw = ImageDraw.Draw(layer)
+
+    if fp.render.show_walls:
+        wall_w = max(1, int(round(2.6 * s)))
+        bevel = max(1, int(round(1.1 * s)))
+        for wall in fp.walls:
+            points = [(p[0] * s, p[1] * s) for p in wall.points]
+            # Emboss: dark lower-right edge + light upper-left edge around a
+            # bright core makes each wall look like a raised ridge.
+            lowlight = [(px + bevel, py + bevel) for px, py in points]
+            highlight = [(px - bevel, py - bevel) for px, py in points]
+            if len(points) >= 2:
+                draw.line(lowlight, fill=WALL_EDGE_SHADOW, width=wall_w, joint="curve")
+                draw.line(highlight, fill=WALL_HIGHLIGHT, width=wall_w, joint="curve")
+                draw.line(points, fill=WALL_COLOR, width=wall_w, joint="curve")
+            # Rounded caps so wall corners and ends look clean.
+            cap = wall_w / 2
+            for px, py in points:
+                draw.ellipse((px - cap, py - cap, px + cap, py + cap), fill=WALL_COLOR)
+        door_w = max(1, int(round(3.4 * s)))
+        for door in fp.doors:
+            a = (door.segment[0][0] * s, door.segment[0][1] * s)
+            b = (door.segment[1][0] * s, door.segment[1][1] * s)
+            draw.line([a, b], fill=DOOR_COLOR, width=door_w)
+
     for sensor in fp.sensors:
         x, y = point_xy(sensor.pos)
-        draw.ellipse((x - 6, y - 6, x + 6, y + 6), fill=(255, 255, 255))
-        if fp.render.show_labels:
+        x *= s
+        y *= s
+        r = 6 * s
+        halo = r * 2.1
+        draw.ellipse((x - halo, y - halo, x + halo, y + halo), fill=SENSOR_HALO)
+        draw.ellipse(
+            (x - r, y - r, x + r, y + r),
+            fill=SENSOR_FILL,
+            outline=SENSOR_RING,
+            width=max(1, int(round(1.4 * s))),
+        )
+
+    for thermo in fp.thermostats:
+        x, y = point_xy(thermo.pos)
+        x *= s
+        y *= s
+        h = 8 * s
+        draw.rounded_rectangle(
+            (x - h, y - h, x + h, y + h),
+            radius=int(3 * s),
+            outline=THERMO_COLOR,
+            fill=THERMO_FILL,
+            width=max(1, int(round(2 * s))),
+        )
+
+    return layer.resize(size, Image.Resampling.LANCZOS)
+
+
+def thermostat_label_lines(fp: FloorplanV1, thermo: Thermostat) -> List[str]:
+    name_line = thermo.device_label or "Thermostat"
+    temp_val = format_entity_temperature(thermo.temperature_entity)
+    setpoint_val = format_entity_temperature(thermo.setpoint_entity)
+    setpoint_low = format_entity_temperature(thermo.setpoint_low_entity)
+    setpoint_high = format_entity_temperature(thermo.setpoint_high_entity)
+    mode = read_entity_state(thermo.mode_entity) if thermo.mode_entity else ""
+    mode_lower = mode.lower() if mode else ""
+
+    setpoint_line = ""
+    if setpoint_low and setpoint_high:
+        setpoint_line = f"{setpoint_low} / {setpoint_high}"
+    elif mode_lower in {"heat_cool", "auto"}:
+        setpoint_line = setpoint_low or setpoint_high or setpoint_val
+    elif mode_lower == "heat":
+        setpoint_line = setpoint_val or setpoint_low
+    elif mode_lower == "cool":
+        setpoint_line = setpoint_val or setpoint_high
+    else:
+        setpoint_line = setpoint_val or setpoint_low or setpoint_high
+
+    action_line = ""
+    if mode:
+        action_line = mode.replace("_", " ").title()
+    fan_state = ""
+    if thermo.fan_entity:
+        fan_raw = read_entity_state(thermo.fan_entity)
+        if fan_raw.lower() in {"on", "true", "1", "enabled"}:
+            fan_state = "Fan On"
+    if fan_state:
+        action_line = f"{action_line} • {fan_state}" if action_line else fan_state
+
+    lines = [name_line]
+    if temp_val:
+        lines.append(temp_val)
+    if setpoint_line:
+        lines.append(setpoint_line)
+    if action_line:
+        lines.append(action_line)
+    return lines
+
+
+def collect_label_specs(fp: FloorplanV1) -> List[Dict]:
+    """Gather every text label (sensors, thermostats, room labels) with its
+    anchor position, lines and styling into a uniform list for layout."""
+    specs: List[Dict] = []
+    if fp.render.show_labels:
+        for sensor in fp.sensors:
+            lines: List[str] = []
             label = sensor.label or sensor.entity or ""
             temp_val = format_entity_temperature(sensor.entity)
-
-            # Helper to get the actual font object (with size)
-            font, font_size = resolve_font(fp, sensor.font_size)
-
-            # New Logic: Multiline
-            lines = []
             if label:
                 lines.append(label)
             if temp_val:
                 lines.append(temp_val)
-
-            off_x = sensor.label_offset_x
-            current_y = y + sensor.label_offset_y
-
-            for line in lines:
-                draw.text((x + off_x, current_y), line, fill=(255, 255, 255), font=font)
-                # Approximate line height = font_size + 2
-                current_y += font_size + 2
-
-
-def draw_thermostats(draw: ImageDraw.ImageDraw, fp: FloorplanV1) -> None:
-    for thermo in fp.thermostats:
-        x, y = point_xy(thermo.pos)
-        draw.rectangle((x - 8, y - 8, x + 8, y + 8), outline=(255, 200, 50), width=2)
-        if fp.render.show_labels:
-            name_line = thermo.device_label or "Thermostat"
-            temp_val = format_entity_temperature(thermo.temperature_entity)
-            setpoint_val = format_entity_temperature(thermo.setpoint_entity)
-            setpoint_low = format_entity_temperature(thermo.setpoint_low_entity)
-            setpoint_high = format_entity_temperature(thermo.setpoint_high_entity)
-            mode = read_entity_state(thermo.mode_entity) if thermo.mode_entity else ""
-            mode_lower = mode.lower() if mode else ""
-
-            setpoint_line = ""
-            if setpoint_low and setpoint_high:
-                setpoint_line = f"{setpoint_low} / {setpoint_high}"
-            elif mode_lower in {"heat_cool", "auto"}:
-                setpoint_line = setpoint_low or setpoint_high or setpoint_val
-            elif mode_lower == "heat":
-                setpoint_line = setpoint_val or setpoint_low
-            elif mode_lower == "cool":
-                setpoint_line = setpoint_val or setpoint_high
-            else:
-                setpoint_line = setpoint_val or setpoint_low or setpoint_high
-
-            action_line = ""
-            if mode:
-                action_line = mode.replace("_", " ").title()
-            fan_state = ""
-            if thermo.fan_entity:
-                fan_raw = read_entity_state(thermo.fan_entity)
-                if fan_raw.lower() in {"on", "true", "1", "enabled"}:
-                    fan_state = "Fan On"
-            if fan_state:
-                action_line = f"{action_line} • {fan_state}" if action_line else fan_state
-
+            if not lines:
+                continue
+            font, font_size = resolve_font(fp, sensor.font_size)
+            x, y = point_xy(sensor.pos)
+            specs.append(
+                {
+                    "lines": lines,
+                    "color": LABEL_COLOR,
+                    "font": font,
+                    "font_size": font_size,
+                    "x": x + sensor.label_offset_x,
+                    "y": y + sensor.label_offset_y,
+                }
+            )
+        for thermo in fp.thermostats:
+            lines = thermostat_label_lines(fp, thermo)
             font, font_size = resolve_font(fp, thermo.font_size)
-
-            lines = [name_line]
-            if temp_val:
-                lines.append(temp_val)
-            if setpoint_line:
-                lines.append(setpoint_line)
-            if action_line:
-                lines.append(action_line)
-
-            off_x = thermo.label_offset_x
-            current_y = y + thermo.label_offset_y
-
-            for line in lines:
-                draw.text((x + off_x, current_y), line, fill=(255, 200, 50), font=font)
-                current_y += font_size + 2
-
-
-def draw_room_labels(draw: ImageDraw.ImageDraw, fp: FloorplanV1) -> None:
+            x, y = point_xy(thermo.pos)
+            specs.append(
+                {
+                    "lines": lines,
+                    "color": THERMO_LABEL,
+                    "font": font,
+                    "font_size": font_size,
+                    "x": x + thermo.label_offset_x,
+                    "y": y + thermo.label_offset_y,
+                }
+            )
     for label in fp.room_labels:
         if not label.label:
             continue
+        font, font_size = resolve_font(fp, label.font_size)
         x, y = point_xy(label.pos)
-        font, _font_size = resolve_font(fp, label.font_size)
-        draw.text(
-            (x + label.label_offset_x, y + label.label_offset_y),
-            label.label,
-            fill=(255, 255, 255),
-            font=font,
+        specs.append(
+            {
+                "lines": [label.label],
+                "color": LABEL_COLOR,
+                "font": font,
+                "font_size": font_size,
+                "x": x + label.label_offset_x,
+                "y": y + label.label_offset_y,
+            }
         )
+    return specs
+
+
+def _label_dimensions(spec: Dict) -> Tuple[int, int]:
+    line_h = spec["font_size"] + 2
+    width = max((measure_text_width(spec["font"], line) for line in spec["lines"]), default=0)
+    height = line_h * len(spec["lines"])
+    return width, height
+
+
+def _boxes_overlap(a, b, pad: int = 4) -> bool:
+    return not (
+        a[2] + pad <= b[0] or a[0] - pad >= b[2] or a[3] + pad <= b[1] or a[1] - pad >= b[3]
+    )
+
+
+def render_labels_layer(fp: FloorplanV1, size: Tuple[int, int]) -> Image.Image:
+    """Draw all labels on chips with a simple vertical de-overlap pass so no two
+    labels sit on top of each other, and everything stays readable over the
+    heatmap."""
+    layer = Image.new("RGBA", size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(layer)
+    specs = collect_label_specs(fp)
+
+    placed: List[Tuple[int, int, int, int]] = []
+    chip_pad_x, chip_pad_y = 5, 3
+    for spec in specs:
+        w, h = _label_dimensions(spec)
+        x, y = int(spec["x"]), int(spec["y"])
+        box = [x - chip_pad_x, y - chip_pad_y, x + w + chip_pad_x, y + h + chip_pad_y]
+        # Nudge downward until it no longer collides with an already-placed label.
+        step = max(2, spec["font_size"] // 3)
+        guard = 0
+        while any(_boxes_overlap(box, other) for other in placed) and guard < 400:
+            box[1] += step
+            box[3] += step
+            y += step
+            guard += 1
+        # Keep the chip on-canvas vertically.
+        if box[3] > size[1]:
+            shift = box[3] - size[1]
+            box[1] -= shift
+            box[3] -= shift
+            y -= shift
+        placed.append(tuple(box))
+
+        # Translucent rounded chip for guaranteed legibility, then the text.
+        draw.rounded_rectangle(tuple(box), radius=7, fill=LABEL_CHIP)
+        line_h = spec["font_size"] + 2
+        cy = y
+        for line in spec["lines"]:
+            draw_text_with_shadow(draw, (x, cy), line, spec["font"], spec["color"])
+            cy += line_h
+    return layer
 
 
 def resolve_outside_temperature(fp: FloorplanV1) -> Optional[Tuple[float, str]]:
@@ -739,13 +1030,14 @@ def draw_outside_temperature(
     box_size = max(16, int(font_size * 1.4))
     box_y = top_offset + max(0, (font_size - box_size) // 2)
     color = color_for_temperature(outside_temp_value, min_f, max_f, resolve_legend_palette(fp))
-    draw.rectangle(
+    draw.rounded_rectangle(
         (left_offset, box_y, left_offset + box_size, box_y + box_size),
+        radius=max(3, box_size // 4),
         fill=color,
-        outline=(255, 255, 255),
+        outline=PANEL_BORDER,
         width=1,
     )
-    draw.text((left_offset + box_size + 6, top_offset), text, fill=(255, 255, 255), font=font)
+    draw_text_with_shadow(draw, (left_offset + box_size + 8, top_offset), text, font, LABEL_COLOR)
     return max(box_size, font_size)
 
 
@@ -789,10 +1081,10 @@ def draw_time_axis(
     midpoint = start + (end - start) / 2
     for ts in (start, midpoint, end):
         x = to_x(ts)
-        draw.line([(x, y_axis), (x, y_axis + 4)], fill=(255, 255, 255), width=1)
+        draw.line([(x, y_axis), (x, y_axis + 4)], fill=GRID_COLOR, width=1)
         label = format_time_tick(ts)
         label_width = measure_text_width(font, label)
-        draw.text((x - label_width / 2, label_y), label, fill=(255, 255, 255), font=font)
+        draw.text((x - label_width / 2, label_y), label, fill=AXIS_TEXT, font=font)
 
 
 def draw_temperature_chart(
@@ -856,8 +1148,8 @@ def draw_temperature_chart(
     x1 = origin_x + width - right_pad
     y1 = origin_y + height - bottom_label_height
 
-    draw.text((origin_x, origin_y), title, fill=(255, 255, 255), font=font)
-    draw.rectangle((x0, y0, x1, y1), outline=(255, 255, 255), width=1)
+    draw.text((origin_x, origin_y), title, fill=AXIS_TEXT, font=font)
+    draw_panel(draw, (x0, y0, x1, y1), radius=8)
 
     total_seconds = (end - start).total_seconds() or 1.0
 
@@ -895,10 +1187,10 @@ def draw_temperature_chart(
     y_ticks = [chart_min, (chart_min + chart_max) / 2, chart_max]
     for tick in y_ticks:
         _, y = to_xy(start, tick)
-        draw.line([(x0 - 4, y), (x0, y)], fill=(255, 255, 255), width=1)
+        draw.line([(x0 - 4, y), (x0, y)], fill=GRID_COLOR, width=1)
         label = f"{tick:.1f}F"
         label_width = measure_text_width(font, label)
-        draw.text((x0 - 6 - label_width, y - (font_size / 2)), label, fill=(255, 255, 255), font=font)
+        draw.text((x0 - 6 - label_width, y - (font_size / 2)), label, fill=AXIS_TEXT, font=font)
 
     def format_tick_time(ts: datetime) -> str:
         return ts.astimezone().strftime("%I%p").lstrip("0")
@@ -909,10 +1201,10 @@ def draw_temperature_chart(
         tick_positions = [start, mid, end]
     for ts in tick_positions:
         x, _ = to_xy(ts, chart_min)
-        draw.line([(x, y1), (x, y1 + 4)], fill=(255, 255, 255), width=1)
+        draw.line([(x, y1), (x, y1 + 4)], fill=GRID_COLOR, width=1)
         label = "Now" if abs((ts - now).total_seconds()) < 900 else format_tick_time(ts)
         label_width = measure_text_width(font, label)
-        draw.text((x - label_width / 2, y1 + 4), label, fill=(255, 255, 255), font=font)
+        draw.text((x - label_width / 2, y1 + 4), label, fill=AXIS_TEXT, font=font)
 
     return height
 
@@ -1026,10 +1318,10 @@ def draw_time_ticks(
         tick_positions = [start, mid, end]
     for ts in tick_positions:
         x = to_x(ts)
-        draw.line([(x, y_axis), (x, y_axis + 4)], fill=(255, 255, 255), width=1)
+        draw.line([(x, y_axis), (x, y_axis + 4)], fill=GRID_COLOR, width=1)
         label = "Now" if abs((ts - now).total_seconds()) < 900 else format_time_tick(ts)
         label_width = measure_text_width(font, label)
-        draw.text((x - label_width / 2, label_y), label, fill=(255, 255, 255), font=font)
+        draw.text((x - label_width / 2, label_y), label, fill=AXIS_TEXT, font=font)
 
 
 def draw_day_night_shading(
@@ -1054,7 +1346,7 @@ def draw_day_night_shading(
         if not is_day:
             x_start = to_x(hour_cursor)
             x_end = to_x(next_hour)
-            draw.rectangle((x_start, y0, x_end, y1), fill=(80, 80, 80, 60))
+            draw.rectangle((x_start, y0, x_end, y1), fill=NIGHT_SHADE)
         hour_cursor = next_hour
 
 
@@ -1149,9 +1441,9 @@ def draw_thermostat_action_chart(
         if x1 <= x0 or y1 <= y0:
             continue
 
-        draw.text((origin_x, chart_origin_y), title, fill=(255, 255, 255), font=font)
-        draw.text((origin_x + width - stats_width, stats_y), stats_text, fill=(180, 180, 180), font=font)
-        draw.rectangle((x0, y0, x1, y1), outline=(255, 255, 255), width=1)
+        draw.text((origin_x, chart_origin_y), title, fill=AXIS_TEXT, font=font)
+        draw.text((origin_x + width - stats_width, stats_y), stats_text, fill=MUTED_TEXT, font=font)
+        draw_panel(draw, (x0, y0, x1, y1), radius=8)
 
         draw_day_night_shading(draw, start, end, x0, x1, y0, y1)
 
@@ -1180,9 +1472,9 @@ def draw_thermostat_action_chart(
 
         for label, value in [("Off", 0.0), ("On", 1.0)]:
             y = to_y(value)
-            draw.line([(x0 - 4, y), (x0, y)], fill=(255, 255, 255), width=1)
+            draw.line([(x0 - 4, y), (x0, y)], fill=GRID_COLOR, width=1)
             label_width = measure_text_width(font, label)
-            draw.text((x0 - 6 - label_width, y - (font_size / 2)), label, fill=(255, 255, 255), font=font)
+            draw.text((x0 - 6 - label_width, y - (font_size / 2)), label, fill=AXIS_TEXT, font=font)
 
         draw_time_ticks(draw, font, font_size, start, end, x0, x1, y1, y1 + 4, now=now)
 
@@ -1239,8 +1531,8 @@ def draw_thermostat_setpoint_chart(
         if x1 <= x0 or y1 <= y0:
             continue
 
-        draw.text((origin_x, chart_origin_y), title, fill=(255, 255, 255), font=font)
-        draw.rectangle((x0, y0, x1, y1), outline=(255, 255, 255), width=1)
+        draw.text((origin_x, chart_origin_y), title, fill=AXIS_TEXT, font=font)
+        draw_panel(draw, (x0, y0, x1, y1), radius=8)
         draw_day_night_shading(draw, start, end, x0, x1, y0, y1)
 
         low_series = fetch_history_series(thermo.setpoint_low_entity, history_hours, end_time=now)
@@ -1276,10 +1568,10 @@ def draw_thermostat_setpoint_chart(
 
         for tick in [chart_min, (chart_min + chart_max) / 2, chart_max]:
             y = to_y(tick)
-            draw.line([(x0 - 4, y), (x0, y)], fill=(255, 255, 255), width=1)
+            draw.line([(x0 - 4, y), (x0, y)], fill=GRID_COLOR, width=1)
             label = f"{tick:.1f}F"
             label_width = measure_text_width(font, label)
-            draw.text((x0 - 6 - label_width, y - (font_size / 2)), label, fill=(255, 255, 255), font=font)
+            draw.text((x0 - 6 - label_width, y - (font_size / 2)), label, fill=AXIS_TEXT, font=font)
 
         for series, color in [(high_series, (220, 80, 80)), (low_series, (80, 160, 255))]:
             if len(series) < 2:
@@ -1339,15 +1631,32 @@ def draw_legend(
     gradient_height = 26
     label_offset = font_size + 4
     y1 = y0 + gradient_height
-    for i in range(x0, x1):
-        t = (i - x0) / (x1 - x0)
-        r, g, b = gradient_rgb(np.array([t]), palette)
-        draw.line([(i, y0), (i, y1)], fill=(int(r[0]), int(g[0]), int(b[0])))
-    draw.rectangle((x0, y0, x1, y1), outline=(255, 255, 255), width=1)
-    draw.text((x0, y0 - label_offset), f"{min_f:.1f}F", fill=(255, 255, 255), font=font)
+    # Build the gradient on a small strip, then mask it into a rounded pill so
+    # the legend reads as a single clean swatch rather than a hard rectangle.
+    width = x1 - x0
+    ramp = np.linspace(0.0, 1.0, width)
+    r, g, b = gradient_rgb(ramp, palette)
+    row = np.stack([r, g, b], axis=1).astype(np.uint8)[None, :, :]
+    strip = Image.fromarray(np.repeat(row, gradient_height, axis=0), mode="RGB").convert("RGBA")
+    radius = gradient_height // 2
+    pill_mask = Image.new("L", (width, gradient_height), 0)
+    ImageDraw.Draw(pill_mask).rounded_rectangle(
+        (0, 0, width - 1, gradient_height - 1), radius=radius, fill=255
+    )
+    strip.putalpha(pill_mask)
+    base = getattr(draw, "_image", None)
+    if base is not None:
+        base.paste(strip, (x0, y0), strip)
+    else:  # Fallback: draw the gradient column by column.
+        for i in range(x0, x1):
+            t = (i - x0) / max(1, (x1 - x0))
+            cr, cg, cb = gradient_rgb(np.array([t]), palette)
+            draw.line([(i, y0), (i, y1)], fill=(int(cr[0]), int(cg[0]), int(cb[0])))
+    draw.rounded_rectangle((x0, y0, x1, y1), radius=radius, outline=PANEL_BORDER, width=1)
+    draw_text_with_shadow(draw, (x0, y0 - label_offset), f"{min_f:.1f}F", font, AXIS_TEXT)
     max_label = f"{max_f:.1f}F"
     max_label_width = measure_text_width(font, max_label)
-    draw.text((x1 - max_label_width, y0 - label_offset), max_label, fill=(255, 255, 255), font=font)
+    draw_text_with_shadow(draw, (x1 - max_label_width, y0 - label_offset), max_label, font, AXIS_TEXT)
     return label_offset + gradient_height
 
 
@@ -1515,32 +1824,40 @@ def compute_sidebar_panel_height(context: SidebarContext, components: List[Sideb
     return height
 
 
+def sidebar_component_width(
+    component: SidebarComponentConfig,
+    context: SidebarContext,
+    font,
+) -> int:
+    """Footprint width of a single sidebar component, used both for sizing the
+    panel and for centering each component within it."""
+    fp = context.primary_floorplan
+    if component.type == "timestamp":
+        return compute_timestamp_block_width(fp)
+    if component.type == "outside_temp":
+        outside_info = resolve_outside_temperature_for_floorplans(context.floorplans)
+        if outside_info:
+            _outside_temp_value, outside_text, outside_fp = outside_info
+            box_size = max(16, int((outside_fp.render.text_font_size or 12) * 1.4))
+            return box_size + 8 + measure_text_width(font, outside_text)
+        return 0
+    if component.type == "temperature_chart":
+        return max(160, component.width or fp.render.chart_width)
+    if component.type == "legend":
+        return 200
+    if component.type in {"thermostat_action_chart", "thermostat_setpoint_chart"}:
+        return max(180, component.width or fp.render.thermostat_chart_width)
+    return 0
+
+
 def compute_sidebar_panel_width(
     context: SidebarContext,
     components: List[SidebarComponentConfig],
 ) -> int:
-    fp = context.primary_floorplan
-    font, font_size = resolve_font(fp, 12)
+    font, _font_size = resolve_font(context.primary_floorplan, 12)
     width = 0
     for component in components:
-        component_width = 0
-        if component.type == "timestamp":
-            component_width = compute_timestamp_block_width(fp)
-        elif component.type == "outside_temp":
-            outside_info = resolve_outside_temperature_for_floorplans(context.floorplans)
-            if outside_info:
-                _outside_temp_value, outside_text, outside_fp = outside_info
-                box_size = max(16, int((outside_fp.render.text_font_size or 12) * 1.4))
-                component_width = box_size + 6 + measure_text_width(font, outside_text)
-        elif component.type == "temperature_chart":
-            component_width = max(160, component.width or fp.render.chart_width)
-        elif component.type == "legend":
-            component_width = 200
-        elif component.type == "thermostat_action_chart":
-            component_width = max(180, component.width or fp.render.thermostat_chart_width)
-        elif component.type == "thermostat_setpoint_chart":
-            component_width = max(180, component.width or fp.render.thermostat_chart_width)
-        width = max(width, component_width)
+        width = max(width, sidebar_component_width(component, context, font))
     return int(width)
 
 
@@ -1564,8 +1881,12 @@ def draw_info_panel(
     y_cursor = start_y - margin
     section_gap = 18
     item_gap = 10
-    left = margin
+    font, _font_size = resolve_font(fp, 12)
+    content_width = compute_sidebar_panel_width(context, components)
     for component in components:
+        # Center each component horizontally within the sidebar column.
+        comp_width = sidebar_component_width(component, context, font)
+        left = margin + max(0, (content_width - comp_width) // 2)
         if component.type == "timestamp":
             draw_timestamp(draw, fp, (left, y_cursor + margin), now=now)
             y_cursor += compute_timestamp_block_height(fp)
@@ -1673,7 +1994,7 @@ def render_sidebar_image(
     height = panel_height + (margin * 2)
     if target_height is not None:
         height = max(height, target_height)
-    canvas = Image.new("RGBA", (width, height), (20, 20, 20, 255))
+    canvas = Image.new("RGBA", (width, height), BG_COLOR)
     draw = ImageDraw.Draw(canvas)
     draw_info_panel(draw, context, canvas.size, align=align, now=now)
     return canvas.convert("RGB")
@@ -1702,22 +2023,42 @@ def draw_analog_clock(
     if radius <= 0:
         return
     cx, cy = center
-    draw.ellipse(
-        (cx - radius, cy - radius, cx + radius, cy + radius),
-        outline=(255, 255, 255),
-        width=2,
-    )
+    # Render the clock supersampled on its own transparent layer for smooth,
+    # anti-aliased edges, then composite it down.
+    s = SHAPE_SS
+    pad = 4 * s
+    box = int(radius * 2 * s) + pad * 2
+    layer = Image.new("RGBA", (box, box), (0, 0, 0, 0))
+    ld = ImageDraw.Draw(layer)
+    lcx = lcy = box / 2
+    r = radius * s
+    face = (255, 255, 255, 255)
+    # Faint inner face for a touch of depth.
+    ld.ellipse((lcx - r, lcy - r, lcx + r, lcy + r), fill=(255, 255, 255, 14))
+    ld.ellipse((lcx - r, lcy - r, lcx + r, lcy + r), outline=face, width=max(1, int(round(1.6 * s))))
     hour_angle = (now.hour % 12 + now.minute / 60.0) * 30.0
     minute_angle = (now.minute + now.second / 60.0) * 6.0
     for angle, length, width in [
-        (hour_angle, radius * 0.55, 3),
-        (minute_angle, radius * 0.8, 2),
+        (hour_angle, r * 0.52, 3),
+        (minute_angle, r * 0.78, 2),
     ]:
         radians = math.radians(angle - 90)
-        x = cx + math.cos(radians) * length
-        y = cy + math.sin(radians) * length
-        draw.line((cx, cy, x, y), fill=(255, 255, 255), width=width)
-    draw.ellipse((cx - 2, cy - 2, cx + 2, cy + 2), fill=(255, 255, 255))
+        x = lcx + math.cos(radians) * length
+        y = lcy + math.sin(radians) * length
+        ld.line((lcx, lcy, x, y), fill=face, width=max(1, int(round(width * s))))
+    hub = 2.2 * s
+    ld.ellipse((lcx - hub, lcy - hub, lcx + hub, lcy + hub), fill=face)
+    layer = layer.resize((int(box / s), int(box / s)), Image.Resampling.LANCZOS)
+    base = getattr(draw, "_image", None)
+    paste_xy = (int(cx - layer.width / 2), int(cy - layer.height / 2))
+    if base is not None:
+        base.paste(layer, paste_xy, layer)
+    else:
+        draw.ellipse(
+            (cx - radius, cy - radius, cx + radius, cy + radius),
+            outline=(255, 255, 255),
+            width=2,
+        )
 
 
 def draw_timestamp(
@@ -1731,9 +2072,16 @@ def draw_timestamp(
     now = now or datetime.now()
     lines = build_timestamp_lines(now)
     draw.multiline_text(
+        (origin[0] + 1, origin[1] + 1),
+        "\n".join(lines),
+        fill=TEXT_SHADOW,
+        font=font,
+        spacing=spacing,
+    )
+    draw.multiline_text(
         origin,
         "\n".join(lines),
-        fill=(255, 255, 255),
+        fill=LABEL_COLOR,
         font=font,
         spacing=spacing,
     )
@@ -1765,35 +2113,60 @@ def image_to_png_bytes(image: Image.Image) -> bytes:
     return output.getvalue()
 
 
+def render_title_pill(text: str, font_size: int) -> Image.Image:
+    """A centered floor title inside a soft rounded 'pill', supersampled for
+    clean edges."""
+    s = SHAPE_SS
+    font = get_font(font_size * s)
+    text_w, text_h = measure_text_size(font, text)
+    pad_x = int(font_size * s * 0.85)
+    pad_y = int(font_size * s * 0.42)
+    w = text_w + pad_x * 2
+    h = text_h + pad_y * 2
+    radius = h // 2
+    layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    ld = ImageDraw.Draw(layer)
+    ld.rounded_rectangle((0, 0, w - 1, h - 1), radius=radius, fill=PANEL_FILL, outline=PANEL_BORDER, width=s)
+    # Center the glyphs using the font bbox so vertical metrics look balanced.
+    bbox = font.getbbox(text)
+    tx = (w - (bbox[2] - bbox[0])) // 2 - bbox[0]
+    ty = (h - (bbox[3] - bbox[1])) // 2 - bbox[1]
+    ld.text((tx + s, ty + s), text, font=font, fill=TEXT_SHADOW)
+    ld.text((tx, ty), text, font=font, fill=LABEL_COLOR)
+    return layer.resize((w // s, h // s), Image.Resampling.LANCZOS)
+
+
 def stitch_images_horizontally(
     images: List[Tuple[Optional[str], Image.Image]],
     border_px: int,
     label_font_size: int,
 ) -> Image.Image:
-    font = get_font(label_font_size) if label_font_size > 0 else None
-    widths = []
-    heights = []
-    label_heights = []
-    for label, image in images:
-        widths.append(image.width)
-        heights.append(image.height)
-        if label and font:
-            text_width, text_height = measure_text_size(font, label)
-            label_heights.append(text_height)
+    # Pre-render a title pill for each labeled panel (floor names prettified).
+    # Titles are rendered noticeably larger than the base label size.
+    title_font_size = max(30, int(label_font_size * 1.7))
+    pills: List[Optional[Image.Image]] = []
+    for label, _image in images:
+        if label and label_font_size > 0:
+            pills.append(render_title_pill(prettify_floor_name(label), title_font_size))
+        else:
+            pills.append(None)
+
+    heights = [image.height for _label, image in images]
+    widths = [image.width for _label, image in images]
     max_height = max(heights)
-    label_height = max(label_heights) if label_heights else 0
+    pill_height = max((p.height for p in pills if p is not None), default=0)
+    title_band = pill_height + (10 if pill_height else 0)
     total_width = sum(widths) + border_px * (len(images) - 1)
-    stitched_height = max_height + border_px + label_height
-    stitched = Image.new("RGBA", (total_width, stitched_height), (0, 0, 0, 255))
-    draw = ImageDraw.Draw(stitched)
+    stitched_height = max_height + border_px + title_band
+    stitched = Image.new("RGBA", (total_width, stitched_height), BG_COLOR)
     x_cursor = 0
-    for (label, image), image_height in zip(images, heights):
-        y_offset = label_height + border_px
+    for (label, image), pill in zip(images, pills):
+        y_offset = title_band + border_px
         stitched.paste(image, (x_cursor, y_offset))
-        if label and font:
-            text_width, text_height = measure_text_size(font, label)
-            text_x = x_cursor + max(0, (image.width - text_width) // 2)
-            draw.text((text_x, 0), label, font=font, fill=(255, 255, 255, 255))
+        if pill is not None:
+            px = x_cursor + max(0, (image.width - pill.width) // 2)
+            py = max(0, (title_band - pill.height) // 2)
+            stitched.paste(pill, (px, py), pill)
         x_cursor += image.width + border_px
     return stitched.convert("RGB")
 
