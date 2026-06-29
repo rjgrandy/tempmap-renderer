@@ -41,6 +41,8 @@ from .storage import load_all_floorplans
 
 BG_COLOR = (22, 24, 30, 255)          # app background (soft cool charcoal)
 WALL_COLOR = (214, 219, 230, 255)     # softened off-white walls
+WALL_HIGHLIGHT = (245, 248, 255, 235) # bevel highlight on the raised edge
+WALL_EDGE_SHADOW = (8, 9, 12, 220)    # dark lower-right edge for emboss
 WALL_SHADOW = (0, 0, 0, 130)          # drop shadow beneath walls for depth
 DOOR_COLOR = (120, 190, 255, 255)     # calm blue doorways
 SENSOR_FILL = (255, 255, 255, 255)
@@ -51,6 +53,7 @@ THERMO_FILL = (255, 200, 90, 36)
 
 LABEL_COLOR = (245, 247, 251)
 THERMO_LABEL = (255, 206, 105)
+LABEL_CHIP = (16, 18, 24, 140)        # translucent backing behind label text
 MUTED_TEXT = (168, 174, 188)
 AXIS_TEXT = (206, 211, 222)
 
@@ -115,50 +118,29 @@ def prettify_floor_name(floor_id: str) -> str:
     return name.title()
 
 
-def grid_interior_values(fp: FloorplanV1, grid: np.ndarray) -> np.ndarray:
-    """Return the heatmap values that fall inside the floorplan (the rooms),
-    used so the auto color scale ignores the empty area around the house."""
-    mask_full = build_floorplan_mask_floodfill(fp)
-    mask_img = Image.fromarray((mask_full * 255).astype(np.uint8), mode="L").resize(
-        (grid.shape[1], grid.shape[0]), Image.Resampling.NEAREST
-    )
-    interior = np.array(mask_img) > 127
-    if not np.any(interior):
-        return grid.reshape(-1)
-    return grid[interior]
-
-
-def compute_shared_auto_range(
+def resolve_shared_range(
     floorplans: List[Tuple[FloorplanV1, np.ndarray]],
-    low_pct: float = 2.0,
-    high_pct: float = 98.0,
 ) -> Tuple[float, float]:
-    """Auto color scale shared across every floor.
+    """One color scale shared by every floor.
 
-    Pools the interior heatmap values from all floors and takes robust
-    percentiles so a room or two that runs far hotter/colder than the rest
-    doesn't stretch the whole gradient. Falls back gracefully to the raw
-    range when there isn't enough data.
+    The scale is static (driven by each floorplan's configured temperature
+    range) rather than auto-fitting the data, so a room that warms or cools
+    visibly changes color over time instead of the whole gradient shifting
+    underneath it. Floors are unified by taking the lowest min and highest max.
     """
-    pooled: List[np.ndarray] = []
+    mins: List[float] = []
+    maxs: List[float] = []
     for fp, grid in floorplans:
-        values = grid_interior_values(fp, grid)
-        if values.size:
-            pooled.append(values)
-    if not pooled:
+        lo, hi = resolve_temperature_range(fp, grid)
+        mins.append(lo)
+        maxs.append(hi)
+    if not mins:
         return 68.0, 76.0
-    allv = np.concatenate(pooled)
-    lo = float(np.percentile(allv, low_pct))
-    hi = float(np.percentile(allv, high_pct))
-    # Small breathing room so the warmest/coolest normal rooms aren't pinned to
-    # the very ends of the scale, then snap to clean half-degree legend values.
-    span = max(hi - lo, 0.5)
-    pad = max(0.2, span * 0.04)
-    lo = math.floor((lo - pad) * 2) / 2
-    hi = math.ceil((hi + pad) * 2) / 2
-    if lo >= hi:
-        hi = lo + 0.5
-    return lo, hi
+    min_f = min(mins)
+    max_f = max(maxs)
+    if min_f >= max_f:
+        max_f = min_f + 0.1
+    return min_f, max_f
 
 
 _solve_cache_key: Optional[Tuple[str, int]] = None
@@ -206,7 +188,7 @@ def render_floorplan(floor_id: str) -> Image.Image:
         ]
         if not range_pairs:
             raise HTTPException(status_code=404, detail="Floorplans not found")
-        min_f, max_f = compute_shared_auto_range(range_pairs)
+        min_f, max_f = resolve_shared_range(range_pairs)
         for floor_key in ordered_floor_ids:
             grid = grids.get(floor_key)
             if grid is None:
@@ -245,7 +227,7 @@ def render_floorplan(floor_id: str) -> Image.Image:
     if grid is None:
         raise HTTPException(status_code=404, detail="Floorplan not found")
     fp = FloorplanV1.parse_obj(floorplans[floor_id])
-    min_f, max_f = compute_shared_auto_range([(fp, grid)])
+    min_f, max_f = resolve_shared_range([(fp, grid)])
     base_image = render_floorplan_base_image(
         floor_id, floorplans[floor_id], grid, metadata.get(floor_id, {}), range_override=(min_f, max_f)
     )
@@ -509,18 +491,40 @@ def render_floorplan_base_image(
     # Use Flood Fill mask instead of convex hull to handle concave yards properly
     heatmap_mask = build_floorplan_mask_floodfill(fp)
 
+    # Drop a soft shadow of the whole house silhouette so the floorplan reads as
+    # a solid form gently raised off the background (a subtle 3D lift).
+    canvas = Image.alpha_composite(canvas, render_house_shadow(heatmap_mask, canvas.size))
+
     heatmap = render_heatmap(grid, min_f, max_f, fp.render.overlay_alpha, canvas.size, heatmap_mask, palette)
     canvas = Image.alpha_composite(canvas, heatmap)
-    canvas = draw_floorplan_overlay(canvas, fp)
-    draw = ImageDraw.Draw(canvas)
+    canvas, label_bbox = draw_floorplan_overlay(canvas, fp)
     if fp.render.auto_crop:
-        crop_box = compute_floorplan_crop(fp, canvas.size, fp.render.crop_padding)
+        crop_box = compute_floorplan_crop(fp, canvas.size, fp.render.crop_padding, label_bbox)
         if crop_box:
             canvas, crop_box = expand_canvas_for_crop(canvas, crop_box)
             canvas = canvas.crop(crop_box)
-            draw = ImageDraw.Draw(canvas)  # Update draw object for cropped canvas if needed
-            # Actually we just crop at the end, that's fine.
     return canvas.convert("RGB")
+
+
+def render_house_shadow(mask: np.ndarray, size: Tuple[int, int]) -> Image.Image:
+    """A blurred, downward-offset silhouette of the floorplan footprint, used as
+    a drop shadow beneath the house for a sense of depth."""
+    shadow = Image.new("RGBA", size, (0, 0, 0, 0))
+    if not np.any(mask):
+        return shadow
+    silhouette = Image.fromarray((mask * 150).astype(np.uint8), mode="L")
+    dark = Image.new("RGBA", size, (0, 0, 0, 0))
+    dark.putalpha(silhouette)
+    offset = max(6, int(min(size) / 65))
+    blur = max(8, int(min(size) / 45))
+    dark = dark.transform(
+        size,
+        Image.AFFINE,
+        (1, 0, -offset * 0.4, 0, 1, -offset),
+        resample=Image.Resampling.BILINEAR,
+    )
+    dark = dark.filter(ImageFilter.GaussianBlur(blur))
+    return dark
 
 
 def build_floorplan_mask_floodfill(fp: FloorplanV1) -> np.ndarray:
@@ -726,7 +730,12 @@ def expand_canvas_for_crop(
     return expanded, shifted_crop
 
 
-def compute_floorplan_crop(fp: FloorplanV1, canvas_size: Tuple[int, int], padding: int) -> Optional[Tuple[int, int, int, int]]:
+def compute_floorplan_crop(
+    fp: FloorplanV1,
+    canvas_size: Tuple[int, int],
+    padding: int,
+    extra_bbox: Optional[Tuple[int, int, int, int]] = None,
+) -> Optional[Tuple[int, int, int, int]]:
     points = []
     for wall in fp.walls:
         points.extend([point_xy(p) for p in wall.points])
@@ -738,19 +747,29 @@ def compute_floorplan_crop(fp: FloorplanV1, canvas_size: Tuple[int, int], paddin
     min_y = int(min(ys) - padding)
     max_x = int(max(xs) + padding)
     max_y = int(max(ys) + padding)
+    if extra_bbox is not None:
+        # Make sure labels (which can extend past the walls) aren't clipped.
+        label_pad = 6
+        min_x = min(min_x, extra_bbox[0] - label_pad)
+        min_y = min(min_y, extra_bbox[1] - label_pad)
+        max_x = max(max_x, extra_bbox[2] + label_pad)
+        max_y = max(max_y, extra_bbox[3] + label_pad)
     return min_x, min_y, max_x, max_y
 
 
-def draw_floorplan_overlay(canvas: Image.Image, fp: FloorplanV1) -> Image.Image:
+def draw_floorplan_overlay(
+    canvas: Image.Image, fp: FloorplanV1
+) -> Tuple[Image.Image, Optional[Tuple[int, int, int, int]]]:
     """Composite the crisp vector layer (walls, doorways, sensor and thermostat
-    markers) onto the heatmap, then draw the text labels with soft shadows."""
+    markers) onto the heatmap, then the text labels (on chips, de-overlapped).
+    Returns the canvas plus the bounding box of all drawn labels so the caller
+    can keep them from being clipped when cropping."""
     shapes = render_shape_layer(fp, canvas.size)
     canvas = Image.alpha_composite(canvas, shapes)
-    draw = ImageDraw.Draw(canvas)
-    draw_sensor_labels(draw, fp)
-    draw_thermostat_labels(draw, fp)
-    draw_room_labels(draw, fp)
-    return canvas
+    labels = render_labels_layer(fp, canvas.size)
+    label_bbox = labels.getbbox()
+    canvas = Image.alpha_composite(canvas, labels)
+    return canvas, label_bbox
 
 
 def render_shape_layer(fp: FloorplanV1, size: Tuple[int, int]) -> Image.Image:
@@ -778,9 +797,16 @@ def render_shape_layer(fp: FloorplanV1, size: Tuple[int, int]) -> Image.Image:
 
     if fp.render.show_walls:
         wall_w = max(1, int(round(2.6 * s)))
+        bevel = max(1, int(round(1.1 * s)))
         for wall in fp.walls:
             points = [(p[0] * s, p[1] * s) for p in wall.points]
+            # Emboss: dark lower-right edge + light upper-left edge around a
+            # bright core makes each wall look like a raised ridge.
+            lowlight = [(px + bevel, py + bevel) for px, py in points]
+            highlight = [(px - bevel, py - bevel) for px, py in points]
             if len(points) >= 2:
+                draw.line(lowlight, fill=WALL_EDGE_SHADOW, width=wall_w, joint="curve")
+                draw.line(highlight, fill=WALL_HIGHLIGHT, width=wall_w, joint="curve")
                 draw.line(points, fill=WALL_COLOR, width=wall_w, joint="curve")
             # Rounded caps so wall corners and ends look clean.
             cap = wall_w / 2
@@ -822,99 +848,158 @@ def render_shape_layer(fp: FloorplanV1, size: Tuple[int, int]) -> Image.Image:
     return layer.resize(size, Image.Resampling.LANCZOS)
 
 
-def draw_sensor_labels(draw: ImageDraw.ImageDraw, fp: FloorplanV1) -> None:
-    if not fp.render.show_labels:
-        return
-    for sensor in fp.sensors:
-        x, y = point_xy(sensor.pos)
-        label = sensor.label or sensor.entity or ""
-        temp_val = format_entity_temperature(sensor.entity)
+def thermostat_label_lines(fp: FloorplanV1, thermo: Thermostat) -> List[str]:
+    name_line = thermo.device_label or "Thermostat"
+    temp_val = format_entity_temperature(thermo.temperature_entity)
+    setpoint_val = format_entity_temperature(thermo.setpoint_entity)
+    setpoint_low = format_entity_temperature(thermo.setpoint_low_entity)
+    setpoint_high = format_entity_temperature(thermo.setpoint_high_entity)
+    mode = read_entity_state(thermo.mode_entity) if thermo.mode_entity else ""
+    mode_lower = mode.lower() if mode else ""
 
-        # Helper to get the actual font object (with size)
-        font, font_size = resolve_font(fp, sensor.font_size)
+    setpoint_line = ""
+    if setpoint_low and setpoint_high:
+        setpoint_line = f"{setpoint_low} / {setpoint_high}"
+    elif mode_lower in {"heat_cool", "auto"}:
+        setpoint_line = setpoint_low or setpoint_high or setpoint_val
+    elif mode_lower == "heat":
+        setpoint_line = setpoint_val or setpoint_low
+    elif mode_lower == "cool":
+        setpoint_line = setpoint_val or setpoint_high
+    else:
+        setpoint_line = setpoint_val or setpoint_low or setpoint_high
 
-        # New Logic: Multiline
-        lines = []
-        if label:
-            lines.append(label)
-        if temp_val:
-            lines.append(temp_val)
+    action_line = ""
+    if mode:
+        action_line = mode.replace("_", " ").title()
+    fan_state = ""
+    if thermo.fan_entity:
+        fan_raw = read_entity_state(thermo.fan_entity)
+        if fan_raw.lower() in {"on", "true", "1", "enabled"}:
+            fan_state = "Fan On"
+    if fan_state:
+        action_line = f"{action_line} • {fan_state}" if action_line else fan_state
 
-        off_x = sensor.label_offset_x
-        current_y = y + sensor.label_offset_y
+    lines = [name_line]
+    if temp_val:
+        lines.append(temp_val)
+    if setpoint_line:
+        lines.append(setpoint_line)
+    if action_line:
+        lines.append(action_line)
+    return lines
 
-        for line in lines:
-            draw_text_with_shadow(draw, (x + off_x, current_y), line, font, LABEL_COLOR)
-            # Approximate line height = font_size + 2
-            current_y += font_size + 2
 
-
-def draw_thermostat_labels(draw: ImageDraw.ImageDraw, fp: FloorplanV1) -> None:
-    for thermo in fp.thermostats:
-        x, y = point_xy(thermo.pos)
-        if fp.render.show_labels:
-            name_line = thermo.device_label or "Thermostat"
-            temp_val = format_entity_temperature(thermo.temperature_entity)
-            setpoint_val = format_entity_temperature(thermo.setpoint_entity)
-            setpoint_low = format_entity_temperature(thermo.setpoint_low_entity)
-            setpoint_high = format_entity_temperature(thermo.setpoint_high_entity)
-            mode = read_entity_state(thermo.mode_entity) if thermo.mode_entity else ""
-            mode_lower = mode.lower() if mode else ""
-
-            setpoint_line = ""
-            if setpoint_low and setpoint_high:
-                setpoint_line = f"{setpoint_low} / {setpoint_high}"
-            elif mode_lower in {"heat_cool", "auto"}:
-                setpoint_line = setpoint_low or setpoint_high or setpoint_val
-            elif mode_lower == "heat":
-                setpoint_line = setpoint_val or setpoint_low
-            elif mode_lower == "cool":
-                setpoint_line = setpoint_val or setpoint_high
-            else:
-                setpoint_line = setpoint_val or setpoint_low or setpoint_high
-
-            action_line = ""
-            if mode:
-                action_line = mode.replace("_", " ").title()
-            fan_state = ""
-            if thermo.fan_entity:
-                fan_raw = read_entity_state(thermo.fan_entity)
-                if fan_raw.lower() in {"on", "true", "1", "enabled"}:
-                    fan_state = "Fan On"
-            if fan_state:
-                action_line = f"{action_line} • {fan_state}" if action_line else fan_state
-
-            font, font_size = resolve_font(fp, thermo.font_size)
-
-            lines = [name_line]
+def collect_label_specs(fp: FloorplanV1) -> List[Dict]:
+    """Gather every text label (sensors, thermostats, room labels) with its
+    anchor position, lines and styling into a uniform list for layout."""
+    specs: List[Dict] = []
+    if fp.render.show_labels:
+        for sensor in fp.sensors:
+            lines: List[str] = []
+            label = sensor.label or sensor.entity or ""
+            temp_val = format_entity_temperature(sensor.entity)
+            if label:
+                lines.append(label)
             if temp_val:
                 lines.append(temp_val)
-            if setpoint_line:
-                lines.append(setpoint_line)
-            if action_line:
-                lines.append(action_line)
-
-            off_x = thermo.label_offset_x
-            current_y = y + thermo.label_offset_y
-
-            for line in lines:
-                draw_text_with_shadow(draw, (x + off_x, current_y), line, font, THERMO_LABEL)
-                current_y += font_size + 2
-
-
-def draw_room_labels(draw: ImageDraw.ImageDraw, fp: FloorplanV1) -> None:
+            if not lines:
+                continue
+            font, font_size = resolve_font(fp, sensor.font_size)
+            x, y = point_xy(sensor.pos)
+            specs.append(
+                {
+                    "lines": lines,
+                    "color": LABEL_COLOR,
+                    "font": font,
+                    "font_size": font_size,
+                    "x": x + sensor.label_offset_x,
+                    "y": y + sensor.label_offset_y,
+                }
+            )
+        for thermo in fp.thermostats:
+            lines = thermostat_label_lines(fp, thermo)
+            font, font_size = resolve_font(fp, thermo.font_size)
+            x, y = point_xy(thermo.pos)
+            specs.append(
+                {
+                    "lines": lines,
+                    "color": THERMO_LABEL,
+                    "font": font,
+                    "font_size": font_size,
+                    "x": x + thermo.label_offset_x,
+                    "y": y + thermo.label_offset_y,
+                }
+            )
     for label in fp.room_labels:
         if not label.label:
             continue
+        font, font_size = resolve_font(fp, label.font_size)
         x, y = point_xy(label.pos)
-        font, _font_size = resolve_font(fp, label.font_size)
-        draw_text_with_shadow(
-            draw,
-            (x + label.label_offset_x, y + label.label_offset_y),
-            label.label,
-            font,
-            LABEL_COLOR,
+        specs.append(
+            {
+                "lines": [label.label],
+                "color": LABEL_COLOR,
+                "font": font,
+                "font_size": font_size,
+                "x": x + label.label_offset_x,
+                "y": y + label.label_offset_y,
+            }
         )
+    return specs
+
+
+def _label_dimensions(spec: Dict) -> Tuple[int, int]:
+    line_h = spec["font_size"] + 2
+    width = max((measure_text_width(spec["font"], line) for line in spec["lines"]), default=0)
+    height = line_h * len(spec["lines"])
+    return width, height
+
+
+def _boxes_overlap(a, b, pad: int = 4) -> bool:
+    return not (
+        a[2] + pad <= b[0] or a[0] - pad >= b[2] or a[3] + pad <= b[1] or a[1] - pad >= b[3]
+    )
+
+
+def render_labels_layer(fp: FloorplanV1, size: Tuple[int, int]) -> Image.Image:
+    """Draw all labels on chips with a simple vertical de-overlap pass so no two
+    labels sit on top of each other, and everything stays readable over the
+    heatmap."""
+    layer = Image.new("RGBA", size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(layer)
+    specs = collect_label_specs(fp)
+
+    placed: List[Tuple[int, int, int, int]] = []
+    chip_pad_x, chip_pad_y = 5, 3
+    for spec in specs:
+        w, h = _label_dimensions(spec)
+        x, y = int(spec["x"]), int(spec["y"])
+        box = [x - chip_pad_x, y - chip_pad_y, x + w + chip_pad_x, y + h + chip_pad_y]
+        # Nudge downward until it no longer collides with an already-placed label.
+        step = max(2, spec["font_size"] // 3)
+        guard = 0
+        while any(_boxes_overlap(box, other) for other in placed) and guard < 400:
+            box[1] += step
+            box[3] += step
+            y += step
+            guard += 1
+        # Keep the chip on-canvas vertically.
+        if box[3] > size[1]:
+            shift = box[3] - size[1]
+            box[1] -= shift
+            box[3] -= shift
+            y -= shift
+        placed.append(tuple(box))
+
+        # Translucent rounded chip for guaranteed legibility, then the text.
+        draw.rounded_rectangle(tuple(box), radius=7, fill=LABEL_CHIP)
+        line_h = spec["font_size"] + 2
+        cy = y
+        for line in spec["lines"]:
+            draw_text_with_shadow(draw, (x, cy), line, spec["font"], spec["color"])
+            cy += line_h
+    return layer
 
 
 def resolve_outside_temperature(fp: FloorplanV1) -> Optional[Tuple[float, str]]:
@@ -2057,10 +2142,12 @@ def stitch_images_horizontally(
     label_font_size: int,
 ) -> Image.Image:
     # Pre-render a title pill for each labeled panel (floor names prettified).
+    # Titles are rendered noticeably larger than the base label size.
+    title_font_size = max(30, int(label_font_size * 1.7))
     pills: List[Optional[Image.Image]] = []
     for label, _image in images:
         if label and label_font_size > 0:
-            pills.append(render_title_pill(prettify_floor_name(label), label_font_size))
+            pills.append(render_title_pill(prettify_floor_name(label), title_font_size))
         else:
             pills.append(None)
 
