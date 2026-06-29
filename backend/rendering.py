@@ -6,6 +6,7 @@ import heapq
 import io
 import json
 import math
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -38,8 +39,9 @@ from .storage import load_all_floorplans
 # A cohesive, modern dark theme. Colors are kept soft and slightly desaturated
 # so the heatmap stays the focal point and overlays read cleanly on top of it.
 
-BG_COLOR = (15, 16, 20, 255)          # app background (cool charcoal)
-WALL_COLOR = (208, 213, 224, 255)     # softened off-white walls
+BG_COLOR = (22, 24, 30, 255)          # app background (soft cool charcoal)
+WALL_COLOR = (214, 219, 230, 255)     # softened off-white walls
+WALL_SHADOW = (0, 0, 0, 130)          # drop shadow beneath walls for depth
 DOOR_COLOR = (120, 190, 255, 255)     # calm blue doorways
 SENSOR_FILL = (255, 255, 255, 255)
 SENSOR_RING = (18, 20, 26, 210)       # subtle dark outline around dots
@@ -55,10 +57,10 @@ AXIS_TEXT = (206, 211, 222)
 # NOTE: PIL's ImageDraw overwrites (it does not alpha-blend) when drawing
 # directly on the canvas, so these are opaque colors tuned to read as a soft
 # frosted "card" over BG_COLOR rather than RGBA values.
-PANEL_FILL = (26, 28, 34)             # frosted card background for charts
-PANEL_BORDER = (60, 64, 74)           # muted card border
-GRID_COLOR = (96, 101, 114)           # subtle gridlines / ticks
-NIGHT_SHADE = (19, 20, 25)            # gentle darkening for night hours
+PANEL_FILL = (33, 36, 44)             # frosted card background for charts
+PANEL_BORDER = (62, 67, 79)           # muted card border
+GRID_COLOR = (100, 106, 120)          # subtle gridlines / ticks
+NIGHT_SHADE = (26, 28, 35)            # gentle darkening for night hours
 
 TEXT_SHADOW = (0, 0, 0, 150)
 
@@ -100,6 +102,65 @@ def make_background(size: Tuple[int, int]) -> Image.Image:
     return Image.new("RGBA", size, BG_COLOR)
 
 
+def prettify_floor_name(floor_id: str) -> str:
+    """Turn a raw floor id into a friendly display title.
+
+    e.g. "1_first_floor" -> "First Floor", "second-floor" -> "Second Floor".
+    A leading ordering prefix like "1_" or "02-" is stripped.
+    """
+    name = re.sub(r"^\s*\d+\s*[_\-.]\s*", "", floor_id)
+    name = name.replace("_", " ").replace("-", " ").strip()
+    if not name:
+        name = floor_id
+    return name.title()
+
+
+def grid_interior_values(fp: FloorplanV1, grid: np.ndarray) -> np.ndarray:
+    """Return the heatmap values that fall inside the floorplan (the rooms),
+    used so the auto color scale ignores the empty area around the house."""
+    mask_full = build_floorplan_mask_floodfill(fp)
+    mask_img = Image.fromarray((mask_full * 255).astype(np.uint8), mode="L").resize(
+        (grid.shape[1], grid.shape[0]), Image.Resampling.NEAREST
+    )
+    interior = np.array(mask_img) > 127
+    if not np.any(interior):
+        return grid.reshape(-1)
+    return grid[interior]
+
+
+def compute_shared_auto_range(
+    floorplans: List[Tuple[FloorplanV1, np.ndarray]],
+    low_pct: float = 2.0,
+    high_pct: float = 98.0,
+) -> Tuple[float, float]:
+    """Auto color scale shared across every floor.
+
+    Pools the interior heatmap values from all floors and takes robust
+    percentiles so a room or two that runs far hotter/colder than the rest
+    doesn't stretch the whole gradient. Falls back gracefully to the raw
+    range when there isn't enough data.
+    """
+    pooled: List[np.ndarray] = []
+    for fp, grid in floorplans:
+        values = grid_interior_values(fp, grid)
+        if values.size:
+            pooled.append(values)
+    if not pooled:
+        return 68.0, 76.0
+    allv = np.concatenate(pooled)
+    lo = float(np.percentile(allv, low_pct))
+    hi = float(np.percentile(allv, high_pct))
+    # Small breathing room so the warmest/coolest normal rooms aren't pinned to
+    # the very ends of the scale, then snap to clean half-degree legend values.
+    span = max(hi - lo, 0.5)
+    pad = max(0.2, span * 0.04)
+    lo = math.floor((lo - pad) * 2) / 2
+    hi = math.ceil((hi + pad) * 2) / 2
+    if lo >= hi:
+        hi = lo + 0.5
+    return lo, hi
+
+
 _solve_cache_key: Optional[Tuple[str, int]] = None
 _solve_cache_grids: Dict[str, np.ndarray] = {}
 _solve_cache_metadata: Dict[str, Dict] = {}
@@ -132,22 +193,20 @@ def render_floorplan(floor_id: str) -> Image.Image:
         if not floorplans:
             raise HTTPException(status_code=404, detail="Floorplans not found")
         grids, metadata = solve_all_floorplans_cached(floorplans)
-        ranges = []
-        for floor_key in sorted(floorplans.keys()):
-            grid = grids.get(floor_key)
-            if grid is None:
-                continue
-            fp = FloorplanV1.parse_obj(floorplans[floor_key])
-            ranges.append(resolve_temperature_range(fp, grid))
-        if not ranges:
-            raise HTTPException(status_code=404, detail="Floorplans not found")
-        min_f = min(range_pair[0] for range_pair in ranges)
-        max_f = max(range_pair[1] for range_pair in ranges)
         images = []
         ordered_floor_ids = sorted(floorplans.keys())
         parsed_floorplans: List[FloorplanV1] = []
         for floor_key in ordered_floor_ids:
             parsed_floorplans.append(FloorplanV1.parse_obj(floorplans[floor_key]))
+        # One robust, outlier-resistant color scale shared by every floor.
+        range_pairs = [
+            (parsed_floorplans[idx], grids[floor_key])
+            for idx, floor_key in enumerate(ordered_floor_ids)
+            if grids.get(floor_key) is not None
+        ]
+        if not range_pairs:
+            raise HTTPException(status_code=404, detail="Floorplans not found")
+        min_f, max_f = compute_shared_auto_range(range_pairs)
         for floor_key in ordered_floor_ids:
             grid = grids.get(floor_key)
             if grid is None:
@@ -185,9 +244,11 @@ def render_floorplan(floor_id: str) -> Image.Image:
     grid = grids.get(floor_id)
     if grid is None:
         raise HTTPException(status_code=404, detail="Floorplan not found")
-    base_image = render_floorplan_base_image(floor_id, floorplans[floor_id], grid, metadata.get(floor_id, {}))
     fp = FloorplanV1.parse_obj(floorplans[floor_id])
-    min_f, max_f = resolve_temperature_range(fp, grid)
+    min_f, max_f = compute_shared_auto_range([(fp, grid)])
+    base_image = render_floorplan_base_image(
+        floor_id, floorplans[floor_id], grid, metadata.get(floor_id, {}), range_override=(min_f, max_f)
+    )
     sidebar_context = resolve_sidebar_context([fp], min_f, max_f)
     sidebar_image = render_sidebar_image(sidebar_context, align="top", target_height=base_image.height)
     return attach_sidebar_to_floorplan(base_image, sidebar_image)
@@ -696,7 +757,23 @@ def render_shape_layer(fp: FloorplanV1, size: Tuple[int, int]) -> Image.Image:
     """Render walls and markers on a supersampled transparent layer for smooth,
     anti-aliased edges, then downscale with high-quality resampling."""
     s = SHAPE_SS
-    layer = Image.new("RGBA", (size[0] * s, size[1] * s), (0, 0, 0, 0))
+    big = (size[0] * s, size[1] * s)
+    layer = Image.new("RGBA", big, (0, 0, 0, 0))
+
+    # Soft drop shadow beneath the walls so each room reads with a little depth,
+    # as if gently raised off the background.
+    if fp.render.show_walls and fp.walls:
+        shadow = Image.new("RGBA", big, (0, 0, 0, 0))
+        sdraw = ImageDraw.Draw(shadow)
+        offset = int(round(1.6 * s))
+        shadow_w = max(1, int(round(3.4 * s)))
+        for wall in fp.walls:
+            points = [(p[0] * s + offset, p[1] * s + offset) for p in wall.points]
+            if len(points) >= 2:
+                sdraw.line(points, fill=WALL_SHADOW, width=shadow_w, joint="curve")
+        shadow = shadow.filter(ImageFilter.GaussianBlur(2.4 * s))
+        layer = Image.alpha_composite(layer, shadow)
+
     draw = ImageDraw.Draw(layer)
 
     if fp.render.show_walls:
@@ -1662,32 +1739,40 @@ def compute_sidebar_panel_height(context: SidebarContext, components: List[Sideb
     return height
 
 
+def sidebar_component_width(
+    component: SidebarComponentConfig,
+    context: SidebarContext,
+    font,
+) -> int:
+    """Footprint width of a single sidebar component, used both for sizing the
+    panel and for centering each component within it."""
+    fp = context.primary_floorplan
+    if component.type == "timestamp":
+        return compute_timestamp_block_width(fp)
+    if component.type == "outside_temp":
+        outside_info = resolve_outside_temperature_for_floorplans(context.floorplans)
+        if outside_info:
+            _outside_temp_value, outside_text, outside_fp = outside_info
+            box_size = max(16, int((outside_fp.render.text_font_size or 12) * 1.4))
+            return box_size + 8 + measure_text_width(font, outside_text)
+        return 0
+    if component.type == "temperature_chart":
+        return max(160, component.width or fp.render.chart_width)
+    if component.type == "legend":
+        return 200
+    if component.type in {"thermostat_action_chart", "thermostat_setpoint_chart"}:
+        return max(180, component.width or fp.render.thermostat_chart_width)
+    return 0
+
+
 def compute_sidebar_panel_width(
     context: SidebarContext,
     components: List[SidebarComponentConfig],
 ) -> int:
-    fp = context.primary_floorplan
-    font, font_size = resolve_font(fp, 12)
+    font, _font_size = resolve_font(context.primary_floorplan, 12)
     width = 0
     for component in components:
-        component_width = 0
-        if component.type == "timestamp":
-            component_width = compute_timestamp_block_width(fp)
-        elif component.type == "outside_temp":
-            outside_info = resolve_outside_temperature_for_floorplans(context.floorplans)
-            if outside_info:
-                _outside_temp_value, outside_text, outside_fp = outside_info
-                box_size = max(16, int((outside_fp.render.text_font_size or 12) * 1.4))
-                component_width = box_size + 6 + measure_text_width(font, outside_text)
-        elif component.type == "temperature_chart":
-            component_width = max(160, component.width or fp.render.chart_width)
-        elif component.type == "legend":
-            component_width = 200
-        elif component.type == "thermostat_action_chart":
-            component_width = max(180, component.width or fp.render.thermostat_chart_width)
-        elif component.type == "thermostat_setpoint_chart":
-            component_width = max(180, component.width or fp.render.thermostat_chart_width)
-        width = max(width, component_width)
+        width = max(width, sidebar_component_width(component, context, font))
     return int(width)
 
 
@@ -1711,8 +1796,12 @@ def draw_info_panel(
     y_cursor = start_y - margin
     section_gap = 18
     item_gap = 10
-    left = margin
+    font, _font_size = resolve_font(fp, 12)
+    content_width = compute_sidebar_panel_width(context, components)
     for component in components:
+        # Center each component horizontally within the sidebar column.
+        comp_width = sidebar_component_width(component, context, font)
+        left = margin + max(0, (content_width - comp_width) // 2)
         if component.type == "timestamp":
             draw_timestamp(draw, fp, (left, y_cursor + margin), now=now)
             y_cursor += compute_timestamp_block_height(fp)
@@ -1939,35 +2028,58 @@ def image_to_png_bytes(image: Image.Image) -> bytes:
     return output.getvalue()
 
 
+def render_title_pill(text: str, font_size: int) -> Image.Image:
+    """A centered floor title inside a soft rounded 'pill', supersampled for
+    clean edges."""
+    s = SHAPE_SS
+    font = get_font(font_size * s)
+    text_w, text_h = measure_text_size(font, text)
+    pad_x = int(font_size * s * 0.85)
+    pad_y = int(font_size * s * 0.42)
+    w = text_w + pad_x * 2
+    h = text_h + pad_y * 2
+    radius = h // 2
+    layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    ld = ImageDraw.Draw(layer)
+    ld.rounded_rectangle((0, 0, w - 1, h - 1), radius=radius, fill=PANEL_FILL, outline=PANEL_BORDER, width=s)
+    # Center the glyphs using the font bbox so vertical metrics look balanced.
+    bbox = font.getbbox(text)
+    tx = (w - (bbox[2] - bbox[0])) // 2 - bbox[0]
+    ty = (h - (bbox[3] - bbox[1])) // 2 - bbox[1]
+    ld.text((tx + s, ty + s), text, font=font, fill=TEXT_SHADOW)
+    ld.text((tx, ty), text, font=font, fill=LABEL_COLOR)
+    return layer.resize((w // s, h // s), Image.Resampling.LANCZOS)
+
+
 def stitch_images_horizontally(
     images: List[Tuple[Optional[str], Image.Image]],
     border_px: int,
     label_font_size: int,
 ) -> Image.Image:
-    font = get_font(label_font_size) if label_font_size > 0 else None
-    widths = []
-    heights = []
-    label_heights = []
-    for label, image in images:
-        widths.append(image.width)
-        heights.append(image.height)
-        if label and font:
-            text_width, text_height = measure_text_size(font, label)
-            label_heights.append(text_height)
+    # Pre-render a title pill for each labeled panel (floor names prettified).
+    pills: List[Optional[Image.Image]] = []
+    for label, _image in images:
+        if label and label_font_size > 0:
+            pills.append(render_title_pill(prettify_floor_name(label), label_font_size))
+        else:
+            pills.append(None)
+
+    heights = [image.height for _label, image in images]
+    widths = [image.width for _label, image in images]
     max_height = max(heights)
-    label_height = max(label_heights) if label_heights else 0
+    pill_height = max((p.height for p in pills if p is not None), default=0)
+    title_band = pill_height + (10 if pill_height else 0)
     total_width = sum(widths) + border_px * (len(images) - 1)
-    stitched_height = max_height + border_px + label_height
+    stitched_height = max_height + border_px + title_band
     stitched = Image.new("RGBA", (total_width, stitched_height), BG_COLOR)
-    draw = ImageDraw.Draw(stitched)
     x_cursor = 0
-    for (label, image), image_height in zip(images, heights):
-        y_offset = label_height + border_px
+    for (label, image), pill in zip(images, pills):
+        y_offset = title_band + border_px
         stitched.paste(image, (x_cursor, y_offset))
-        if label and font:
-            text_width, text_height = measure_text_size(font, label)
-            text_x = x_cursor + max(0, (image.width - text_width) // 2)
-            draw_text_with_shadow(draw, (text_x, 0), label, font, LABEL_COLOR)
+        if pill is not None:
+            px = x_cursor + max(0, (image.width - pill.width) // 2)
+            py = max(0, (title_band - pill.height) // 2)
+            stitched.paste(pill, (px, py), pill)
         x_cursor += image.width + border_px
     return stitched.convert("RGB")
 
