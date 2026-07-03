@@ -3,111 +3,286 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Floorplan Builder</title>
+    <title>TempMap Editor</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%23ff8a5c'/%3E%3Cstop offset='1' stop-color='%235aa7ff'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='32' height='32' rx='7' fill='url(%23g)'/%3E%3C/svg%3E" />
     <style>
       :root {
         color-scheme: dark;
-        --bg: #0f1115;
-        --panel: #191c24;
-        --panel-2: #141722;
-        --accent: #4ea1ff;
-        --text: #e6e9ef;
-        --muted: #9aa3b2;
+        --bg: #0b0d12;
+        --panel: #151823;
+        --panel-2: #1c2030;
+        --panel-3: #232840;
+        --border: #262c3f;
+        --border-light: #333a52;
+        --accent: #5aa7ff;
+        --accent-hover: #7ab8ff;
+        --accent-dim: rgba(90, 167, 255, 0.14);
+        --text: #e8ebf2;
+        --muted: #8b93a7;
         --danger: #ff6b6b;
-        --grid: rgba(255, 255, 255, 0.05);
+        --danger-dim: rgba(255, 107, 107, 0.12);
+        --success: #51cf8e;
+        --warning: #ffc75a;
+        --radius: 8px;
+        --shadow: 0 10px 32px rgba(0, 0, 0, 0.45);
+        --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+        --mono: ui-monospace, "SFMono-Regular", "Consolas", "Liberation Mono", monospace;
       }
       * {
         box-sizing: border-box;
       }
-      body {
+      html, body {
         margin: 0;
-        font-family: "Segoe UI", sans-serif;
+        height: 100%;
+      }
+      body {
+        font-family: var(--font);
         background: var(--bg);
         color: var(--text);
-        height: 100vh;
         overflow: hidden;
+        font-size: 13px;
+        -webkit-font-smoothing: antialiased;
+      }
+      button {
+        font-family: inherit;
       }
       #app {
         display: flex;
         flex-direction: column;
         height: 100vh;
       }
+
+      /* ---------- Top bar ---------- */
       .topbar {
         display: flex;
         align-items: center;
-        justify-content: space-between;
-        padding: 10px 16px;
-        background: var(--panel);
-        border-bottom: 1px solid #262a36;
-        gap: 16px;
+        padding: 8px 12px;
+        background: linear-gradient(180deg, #181c29, #141722);
+        border-bottom: 1px solid var(--border);
+        gap: 14px;
+        flex-wrap: wrap;
+        min-height: 52px;
+      }
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-weight: 650;
+        font-size: 14px;
+        letter-spacing: 0.2px;
+        white-space: nowrap;
+      }
+      .brand .logo {
+        width: 22px;
+        height: 22px;
+        border-radius: 6px;
+        background: linear-gradient(135deg, #ff8a5c, #5aa7ff);
+        display: inline-block;
+        flex-shrink: 0;
       }
       .tabs {
         display: flex;
-        gap: 8px;
+        gap: 4px;
+        background: var(--panel-2);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 3px;
       }
       .tab {
         background: transparent;
-        border: 1px solid #30364a;
-        color: var(--text);
-        padding: 6px 14px;
-        border-radius: 6px;
+        border: none;
+        color: var(--muted);
+        padding: 5px 14px;
+        border-radius: 7px;
         cursor: pointer;
+        font-size: 12.5px;
+        font-weight: 550;
+        transition: background 0.15s, color 0.15s;
+      }
+      .tab:hover {
+        color: var(--text);
       }
       .tab.active {
         background: var(--accent);
         color: #0b1020;
-        border-color: transparent;
       }
-      .top-actions {
+      .top-group {
         display: flex;
         align-items: center;
-        gap: 10px;
+        gap: 6px;
+      }
+      .top-group.grow {
+        flex: 1;
+        justify-content: flex-end;
         flex-wrap: wrap;
       }
-      .top-actions select,
-      .top-actions button {
+      .top-divider {
+        width: 1px;
+        height: 24px;
+        background: var(--border);
+        margin: 0 2px;
+        flex-shrink: 0;
+      }
+      .topbar select,
+      .topbar button,
+      .zoombar button {
         background: var(--panel-2);
         color: var(--text);
-        border: 1px solid #32384d;
-        border-radius: 6px;
-        padding: 6px 10px;
+        border: 1px solid var(--border-light);
+        border-radius: var(--radius);
+        padding: 6px 11px;
+        font-size: 12.5px;
         cursor: pointer;
+        transition: background 0.15s, border-color 0.15s;
       }
-      .top-actions button.primary {
+      .topbar select {
+        max-width: 180px;
+      }
+      .topbar button:hover:not(:disabled),
+      .zoombar button:hover:not(:disabled) {
+        background: var(--panel-3);
+        border-color: #414a6b;
+      }
+      .topbar button:disabled {
+        opacity: 0.45;
+        cursor: not-allowed;
+      }
+      .topbar button.primary {
         background: var(--accent);
         color: #0b1020;
-        border: none;
+        border-color: transparent;
+        font-weight: 600;
+        position: relative;
       }
+      .topbar button.primary:hover:not(:disabled) {
+        background: var(--accent-hover);
+      }
+      .topbar button.danger-btn {
+        color: var(--danger);
+        border-color: rgba(255, 107, 107, 0.35);
+      }
+      .topbar button.danger-btn:hover:not(:disabled) {
+        background: var(--danger-dim);
+      }
+      .topbar button.icon-btn {
+        padding: 6px 8px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .topbar button svg,
+      .zoombar button svg {
+        display: block;
+        width: 15px;
+        height: 15px;
+        fill: none;
+        stroke: currentColor;
+        stroke-width: 1.8;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
+      #saveBtn .dirty-dot {
+        display: none;
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: #0b1020;
+        margin-left: 6px;
+        vertical-align: 1px;
+      }
+      #saveBtn.dirty .dirty-dot {
+        display: inline-block;
+        animation: pulse 1.6s ease-in-out infinite;
+      }
+      @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.35; }
+      }
+
+      /* ---------- Main layout ---------- */
       .main {
         flex: 1;
         display: grid;
-        grid-template-columns: 80px 1fr 280px;
+        grid-template-columns: 92px 1fr 300px;
         overflow: hidden;
+        min-height: 0;
       }
+
+      /* ---------- Tool rail ---------- */
       .toolbar {
         background: var(--panel);
-        border-right: 1px solid #262a36;
+        border-right: 1px solid var(--border);
         padding: 10px 8px;
         display: flex;
         flex-direction: column;
-        gap: 8px;
+        gap: 4px;
+        overflow-y: auto;
         overflow-x: hidden;
-        overflow-y: hidden;
       }
       .tool-button {
         background: transparent;
-        border: 1px solid #30364a;
-        color: var(--text);
-        padding: 8px;
-        border-radius: 6px;
-        font-size: 11px;
+        border: 1px solid transparent;
+        color: var(--muted);
+        padding: 7px 4px 5px;
+        border-radius: var(--radius);
+        font-size: 10px;
+        font-weight: 550;
         cursor: pointer;
         text-align: center;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 3px;
+        position: relative;
+        transition: background 0.12s, color 0.12s;
+      }
+      .tool-button svg {
+        width: 19px;
+        height: 19px;
+        fill: none;
+        stroke: currentColor;
+        stroke-width: 1.7;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
+      .tool-button:hover {
+        background: var(--panel-2);
+        color: var(--text);
       }
       .tool-button.active {
-        background: var(--accent);
-        color: #0b1020;
-        border-color: transparent;
+        background: var(--accent-dim);
+        border-color: rgba(90, 167, 255, 0.45);
+        color: var(--accent);
+      }
+      .tool-button kbd {
+        position: absolute;
+        top: 3px;
+        right: 4px;
+        font-family: var(--mono);
+        font-size: 8.5px;
+        color: var(--muted);
+        opacity: 0.7;
+        border: 1px solid var(--border);
+        border-radius: 3px;
+        padding: 0 3px;
+        line-height: 1.4;
+        background: var(--panel);
+      }
+      .tool-button.active kbd {
+        color: var(--accent);
+        border-color: rgba(90, 167, 255, 0.4);
+      }
+      .toolbar hr {
+        border: none;
+        border-top: 1px solid var(--border);
+        margin: 6px 2px;
+        width: calc(100% - 4px);
+      }
+      .toolbar .snap-controls {
+        display: flex;
+        flex-direction: column;
+        gap: 7px;
+        padding: 2px 4px;
       }
       .toolbar label {
         font-size: 11px;
@@ -115,41 +290,123 @@
         display: flex;
         gap: 6px;
         align-items: center;
-        max-width: 100%;
+        cursor: pointer;
+        user-select: none;
+      }
+      .toolbar label input[type="checkbox"] {
+        accent-color: var(--accent);
+        margin: 0;
       }
       .toolbar label.toolbar-grid {
         flex-direction: column;
         align-items: flex-start;
+        gap: 4px;
       }
       .toolbar label input[type="number"] {
         width: 100%;
         min-width: 0;
+        background: var(--panel-2);
+        color: var(--text);
+        border: 1px solid var(--border-light);
+        border-radius: 6px;
+        padding: 4px 6px;
+        font-size: 11px;
       }
+
+      /* ---------- Canvas ---------- */
       .canvas-wrap {
         position: relative;
-        background: #10131c;
+        background: #0d1018;
+        min-width: 0;
+        overflow: hidden;
       }
       canvas {
         width: 100%;
         height: 100%;
         display: block;
       }
+      .tool-hint {
+        position: absolute;
+        top: 10px;
+        left: 50%;
+        transform: translateX(-50%);
+        background: rgba(21, 24, 35, 0.92);
+        border: 1px solid var(--border-light);
+        color: var(--muted);
+        font-size: 11.5px;
+        padding: 5px 12px;
+        border-radius: 999px;
+        pointer-events: none;
+        white-space: nowrap;
+        transition: opacity 0.2s;
+        backdrop-filter: blur(4px);
+      }
+      .tool-hint:empty {
+        display: none;
+      }
+      .tool-hint b {
+        color: var(--text);
+        font-weight: 600;
+      }
+      .zoombar {
+        position: absolute;
+        right: 12px;
+        bottom: 12px;
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        background: rgba(21, 24, 35, 0.92);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 4px;
+        backdrop-filter: blur(4px);
+      }
+      .zoombar button {
+        padding: 4px 8px;
+        font-size: 12px;
+        border-radius: 6px;
+        border-color: transparent;
+        background: transparent;
+      }
+      .zoombar #zoomLevel {
+        min-width: 46px;
+        text-align: center;
+        font-family: var(--mono);
+        font-size: 11px;
+        color: var(--muted);
+      }
+
+      /* ---------- Properties panel ---------- */
       .properties {
         background: var(--panel);
-        border-left: 1px solid #262a36;
+        border-left: 1px solid var(--border);
         padding: 12px;
         overflow-y: auto;
       }
       .properties h3 {
-        margin-top: 0;
-        font-size: 14px;
+        margin: 0 0 10px;
+        font-size: 13px;
+        font-weight: 650;
         color: var(--text);
+        text-transform: uppercase;
+        letter-spacing: 0.6px;
+      }
+      .properties h3 .type-badge {
+        display: inline-block;
+        background: var(--accent-dim);
+        color: var(--accent);
+        border-radius: 5px;
+        padding: 1px 7px;
+        font-size: 11px;
+        letter-spacing: 0.4px;
+        margin-right: 6px;
+        vertical-align: 1px;
       }
       .properties .field {
-        margin-bottom: 10px;
+        margin-bottom: 9px;
       }
-      .properties label {
-        font-size: 12px;
+      .properties .field label {
+        font-size: 11.5px;
         color: var(--muted);
         display: block;
         margin-bottom: 4px;
@@ -160,66 +417,154 @@
         width: 100%;
         background: var(--panel-2);
         color: var(--text);
-        border: 1px solid #32384d;
-        border-radius: 6px;
+        border: 1px solid var(--border-light);
+        border-radius: 7px;
         padding: 6px 8px;
         font-size: 12px;
+        transition: border-color 0.15s;
+      }
+      .properties input:focus,
+      .properties select:focus,
+      .properties textarea:focus {
+        outline: none;
+        border-color: var(--accent);
+      }
+      .properties .field.checkbox-field label {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        color: var(--text);
+        cursor: pointer;
+        margin-bottom: 0;
+        font-size: 12px;
+      }
+      .properties .field.checkbox-field input[type="checkbox"] {
+        width: auto;
+        accent-color: var(--accent);
+        margin: 0;
+      }
+      .properties .field.range-field .range-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .properties .field.range-field input[type="range"] {
+        flex: 1;
+        padding: 0;
+        accent-color: var(--accent);
+        background: transparent;
+        border: none;
+      }
+      .properties .field.range-field .range-value {
+        font-family: var(--mono);
+        font-size: 11px;
+        color: var(--muted);
+        min-width: 34px;
+        text-align: right;
       }
       .properties button {
         width: 100%;
         background: var(--panel-2);
         color: var(--text);
-        border: 1px solid #32384d;
-        border-radius: 6px;
+        border: 1px solid var(--border-light);
+        border-radius: 7px;
         padding: 6px 8px;
         font-size: 12px;
         cursor: pointer;
+        transition: background 0.15s;
+      }
+      .properties button:hover:not(:disabled) {
+        background: var(--panel-3);
+      }
+      .properties button.danger-btn {
+        color: var(--danger);
+        border-color: rgba(255, 107, 107, 0.35);
+      }
+      .properties button.danger-btn:hover:not(:disabled) {
+        background: var(--danger-dim);
       }
       .properties details {
-        border: 1px solid #2b3142;
-        border-radius: 8px;
+        border: 1px solid var(--border);
+        border-radius: 10px;
         margin-bottom: 10px;
         background: var(--panel-2);
+        overflow: hidden;
       }
       .properties summary {
-        padding: 6px 8px;
+        padding: 8px 10px;
         cursor: pointer;
         font-size: 12px;
+        font-weight: 600;
         color: var(--text);
         list-style: none;
+        display: flex;
+        align-items: center;
+        user-select: none;
       }
       .properties summary::-webkit-details-marker {
         display: none;
       }
+      .properties summary::before {
+        content: "";
+        display: inline-block;
+        width: 5px;
+        height: 5px;
+        border-right: 1.5px solid var(--muted);
+        border-bottom: 1.5px solid var(--muted);
+        transform: rotate(-45deg);
+        margin-right: 8px;
+        transition: transform 0.15s;
+      }
+      .properties details[open] summary::before {
+        transform: rotate(45deg);
+      }
       .properties details[open] summary {
-        border-bottom: 1px solid #2b3142;
+        border-bottom: 1px solid var(--border);
       }
       .properties .section-body {
-        padding: 8px;
+        padding: 10px;
       }
+      .properties .hint {
+        font-size: 11px;
+        color: var(--muted);
+        margin: 2px 0 10px;
+        line-height: 1.5;
+      }
+      .properties button:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+
+      /* ---------- Modals ---------- */
       .modal {
         position: fixed;
         inset: 0;
-        background: rgba(8, 10, 14, 0.72);
+        background: rgba(6, 8, 12, 0.72);
         display: flex;
         align-items: center;
         justify-content: center;
         z-index: 100;
+        backdrop-filter: blur(2px);
       }
       .modal.hidden {
         display: none;
       }
       .modal-content {
         background: var(--panel);
-        border: 1px solid #2b3142;
-        border-radius: 12px;
+        border: 1px solid var(--border-light);
+        border-radius: 14px;
         width: min(1100px, 92vw);
         height: min(90vh, 900px);
         display: flex;
         flex-direction: column;
         padding: 16px;
         gap: 12px;
-        box-shadow: 0 20px 60px rgba(0, 0, 0, 0.55);
+        box-shadow: var(--shadow);
+      }
+      .modal-content.compact {
+        height: auto;
+        max-height: 90vh;
+        width: min(560px, 92vw);
       }
       .modal-header {
         display: flex;
@@ -229,131 +574,321 @@
       }
       .modal-header h3 {
         margin: 0;
-        font-size: 16px;
+        font-size: 15px;
       }
       .modal-actions {
         display: flex;
         gap: 8px;
+        align-items: center;
       }
       .modal-actions button {
         background: var(--panel-2);
         color: var(--text);
-        border: 1px solid #32384d;
-        border-radius: 6px;
+        border: 1px solid var(--border-light);
+        border-radius: var(--radius);
         padding: 6px 12px;
         font-size: 12px;
         cursor: pointer;
+        transition: background 0.15s;
+      }
+      .modal-actions button:hover {
+        background: var(--panel-3);
       }
       .modal-actions button.primary {
         background: var(--accent);
         color: #0b1020;
-        border: none;
+        border-color: transparent;
+        font-weight: 600;
+      }
+      .modal-actions button.primary:hover {
+        background: var(--accent-hover);
+      }
+      .modal-actions label {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 12px;
+        color: var(--muted);
+        user-select: none;
+        cursor: pointer;
+      }
+      .modal-actions label input {
+        accent-color: var(--accent);
+        margin: 0;
       }
       #jsonEditor {
         flex: 1;
         width: 100%;
         background: var(--panel-2);
         color: var(--text);
-        border: 1px solid #32384d;
-        border-radius: 8px;
+        border: 1px solid var(--border-light);
+        border-radius: 10px;
         padding: 12px;
-        font-family: "SFMono-Regular", "Consolas", "Liberation Mono", monospace;
+        font-family: var(--mono);
         font-size: 11px;
         line-height: 1.5;
         resize: none;
       }
-      .properties button:disabled {
-        opacity: 0.6;
-        cursor: not-allowed;
+      #jsonEditor:focus {
+        outline: none;
+        border-color: var(--accent);
       }
-      .statusbar {
-        padding: 6px 12px;
-        background: var(--panel);
-        border-top: 1px solid #262a36;
-        font-size: 12px;
+
+      /* ---------- Preview modal ---------- */
+      #previewBody {
+        flex: 1;
+        min-height: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: var(--panel-2);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        overflow: auto;
+        position: relative;
+      }
+      #previewImg {
+        max-width: 100%;
+        max-height: 100%;
+        object-fit: contain;
+        display: block;
+      }
+      #previewStatus {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
         color: var(--muted);
+        font-size: 13px;
+        text-align: center;
+        padding: 24px;
+        pointer-events: none;
+      }
+      #previewStatus.hidden {
+        display: none;
+      }
+
+      /* ---------- Help / shortcuts ---------- */
+      .shortcuts {
+        overflow-y: auto;
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 4px 24px;
+        padding: 4px 2px;
+      }
+      .shortcut-row {
         display: flex;
         justify-content: space-between;
+        align-items: center;
+        gap: 12px;
+        padding: 5px 0;
+        border-bottom: 1px solid var(--border);
+        font-size: 12.5px;
+      }
+      .shortcut-row span {
+        color: var(--muted);
+      }
+      .shortcut-row kbd {
+        font-family: var(--mono);
+        font-size: 11px;
+        background: var(--panel-2);
+        border: 1px solid var(--border-light);
+        border-bottom-width: 2px;
+        border-radius: 5px;
+        padding: 2px 7px;
+        color: var(--text);
+        white-space: nowrap;
+      }
+      .shortcuts-title {
+        grid-column: 1 / -1;
+        font-size: 11px;
+        font-weight: 650;
+        text-transform: uppercase;
+        letter-spacing: 0.8px;
+        color: var(--accent);
+        margin-top: 10px;
+      }
+      .shortcuts-title:first-child {
+        margin-top: 0;
+      }
+
+      /* ---------- Status bar ---------- */
+      .statusbar {
+        padding: 5px 12px;
+        background: var(--panel);
+        border-top: 1px solid var(--border);
+        font-size: 11.5px;
+        color: var(--muted);
+        display: flex;
+        align-items: center;
+        gap: 18px;
+        white-space: nowrap;
+        overflow: hidden;
       }
       .status-pill {
         display: inline-flex;
         align-items: center;
         gap: 6px;
+        flex-shrink: 0;
+      }
+      .status-pill.right {
+        margin-left: auto;
+      }
+      #coordReadout, #measureReadout {
+        font-family: var(--mono);
+        font-size: 11px;
       }
       .danger {
         color: var(--danger);
       }
+
+      /* ---------- Toast ---------- */
       .toast {
         position: fixed;
         right: 16px;
-        top: 16px;
+        top: 62px;
         background: var(--panel);
-        border: 1px solid #32384d;
+        border: 1px solid var(--border-light);
+        border-left: 3px solid var(--accent);
         color: var(--text);
         padding: 10px 14px;
-        border-radius: 8px;
-        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+        border-radius: 10px;
+        box-shadow: var(--shadow);
         opacity: 0;
         transform: translateY(-8px);
         pointer-events: none;
         transition: opacity 0.2s ease, transform 0.2s ease;
-        z-index: 50;
-        max-width: 280px;
+        z-index: 200;
+        max-width: 320px;
+        font-size: 12.5px;
       }
       .toast.visible {
         opacity: 1;
         transform: translateY(0);
       }
       .toast.error {
-        border-color: rgba(255, 107, 107, 0.6);
+        border-left-color: var(--danger);
         color: var(--danger);
+      }
+
+      ::-webkit-scrollbar {
+        width: 10px;
+        height: 10px;
+      }
+      ::-webkit-scrollbar-track {
+        background: transparent;
+      }
+      ::-webkit-scrollbar-thumb {
+        background: var(--border-light);
+        border-radius: 6px;
+        border: 2px solid var(--panel);
+      }
+      ::-webkit-scrollbar-thumb:hover {
+        background: #414a6b;
       }
     </style>
   </head>
   <body>
     <div id="app">
       <header class="topbar">
+        <div class="brand"><span class="logo"></span>TempMap Editor</div>
         <div class="tabs">
           <button class="tab" data-floor="floor1">First Story</button>
           <button class="tab" data-floor="floor2">Second Story</button>
         </div>
-        <div class="top-actions">
-          <label for="loadSelect">Load</label>
-          <select id="loadSelect"></select>
-          <button id="loadBtn">Load</button>
-          <button id="assignStoryBtn">Set Story</button>
-          <button id="newBtn">New</button>
-          <button id="deleteBtn">Delete</button>
-          
+        <div class="top-group grow">
+          <select id="loadSelect" title="Saved floorplans"></select>
+          <button id="loadBtn" title="Load the selected floorplan">Load</button>
+          <button id="assignStoryBtn" title="Assign the selected floorplan to the active story tab">Set Story</button>
+          <button id="newBtn" title="Start a blank floorplan">New</button>
+          <button id="deleteBtn" class="danger-btn" title="Delete the selected floorplan from disk">Delete</button>
+          <div class="top-divider"></div>
           <input type="file" id="bgUpload" accept="image/*" style="display: none;" />
-          <button id="bgUploadBtn">Upload BG</button>
-          <button id="bgRemoveBtn">Remove BG</button>
-          <button id="saveBtn" class="primary">Save</button>
-          <button id="undoBtn">Undo</button>
-          <button id="redoBtn">Redo</button>
+          <button id="bgUploadBtn" title="Upload a floorplan image to trace over">Trace Image</button>
+          <button id="bgRemoveBtn" title="Remove the tracing image">Remove</button>
+          <div class="top-divider"></div>
+          <button id="undoBtn" class="icon-btn" title="Undo (Ctrl+Z)" aria-label="Undo">
+            <svg viewBox="0 0 24 24"><path d="M9 14 4 9l5-5" /><path d="M4 9h10a6 6 0 0 1 0 12h-3" /></svg>
+          </button>
+          <button id="redoBtn" class="icon-btn" title="Redo (Ctrl+Shift+Z)" aria-label="Redo">
+            <svg viewBox="0 0 24 24"><path d="m15 14 5-5-5-5" /><path d="M20 9H10a6 6 0 0 0 0 12h3" /></svg>
+          </button>
+          <div class="top-divider"></div>
+          <button id="previewBtn" title="Preview the rendered heatmap (P)">Preview</button>
+          <button id="helpBtn" class="icon-btn" title="Keyboard shortcuts (?)" aria-label="Help">
+            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" /><path d="M9.5 9.5a2.5 2.5 0 1 1 3.4 2.33c-.74.28-1.4.92-1.4 1.72v.45" /><line x1="11.5" y1="17" x2="11.5" y2="17.01" /></svg>
+          </button>
+          <button id="saveBtn" class="primary" title="Save floorplan (Ctrl+S)">Save<span class="dirty-dot"></span></button>
         </div>
       </header>
       <div class="main">
         <aside class="toolbar">
-          <button class="tool-button" data-tool="select">Select</button>
-          <button class="tool-button" data-tool="wall">Wall</button>
-          <button class="tool-button" data-tool="door">Door</button>
-          <button class="tool-button" data-tool="sensor">Sensor</button>
-          <button class="tool-button" data-tool="thermostat">Thermostat</button>
-          <button class="tool-button" data-tool="room_label">Room Label</button>
-          <button class="tool-button" data-tool="stairwell">Stairwell</button>
-          <button class="tool-button" data-tool="scale">Scale</button>
-          <button class="tool-button" data-tool="erase">Erase</button>
+          <button class="tool-button" data-tool="select" title="Select / move items (V)">
+            <kbd>V</kbd>
+            <svg viewBox="0 0 24 24"><path d="M5 3l14 8-6.5 1.5L9 19z" /></svg>
+            Select
+          </button>
+          <button class="tool-button" data-tool="wall" title="Draw walls — click to add points, Enter or double-click to finish (W)">
+            <kbd>W</kbd>
+            <svg viewBox="0 0 24 24"><path d="M3 20V10h18v10" /><path d="M3 15h18" /><path d="M8 10v5M14 15v5M11 10v0" /></svg>
+            Wall
+          </button>
+          <button class="tool-button" data-tool="door" title="Draw a door segment — click and drag (D)">
+            <kbd>D</kbd>
+            <svg viewBox="0 0 24 24"><path d="M4 21h16" /><path d="M6 21V4h9v17" /><path d="M15 4a9 9 0 0 1-9 9" /></svg>
+            Door
+          </button>
+          <button class="tool-button" data-tool="sensor" title="Place a temperature sensor (S)">
+            <kbd>S</kbd>
+            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="2.4" /><path d="M7.5 7.5a6.4 6.4 0 0 0 0 9" /><path d="M16.5 7.5a6.4 6.4 0 0 1 0 9" /></svg>
+            Sensor
+          </button>
+          <button class="tool-button" data-tool="thermostat" title="Place a thermostat (T)">
+            <kbd>T</kbd>
+            <svg viewBox="0 0 24 24"><path d="M10 4a2 2 0 1 1 4 0v9.3a4.5 4.5 0 1 1-4 0z" /><line x1="12" y1="9" x2="12" y2="15" /></svg>
+            Thermo
+          </button>
+          <button class="tool-button" data-tool="room_label" title="Place a room label (R)">
+            <kbd>R</kbd>
+            <svg viewBox="0 0 24 24"><path d="M5 6V4h14v2" /><line x1="12" y1="4" x2="12" y2="20" /><path d="M9 20h6" /></svg>
+            Label
+          </button>
+          <button class="tool-button" data-tool="stairwell" title="Draw the stairwell polygon — click points, Enter or double-click to close (A)">
+            <kbd>A</kbd>
+            <svg viewBox="0 0 24 24"><path d="M4 20h4v-4h4v-4h4V8h4V4" /></svg>
+            Stairs
+          </button>
+          <button class="tool-button" data-tool="scale" title="Calibrate scale — click two points of a known distance (C)">
+            <kbd>C</kbd>
+            <svg viewBox="0 0 24 24"><rect x="2.5" y="9" width="19" height="6" rx="1.5" /><path d="M7 9v3M11 9v2.4M15 9v3M19 9v2.4" /></svg>
+            Scale
+          </button>
+          <button class="tool-button" data-tool="erase" title="Erase items — click to delete (E)">
+            <kbd>E</kbd>
+            <svg viewBox="0 0 24 24"><path d="m7 20-4-4L13.5 5.5a2 2 0 0 1 2.8 0l3.2 3.2a2 2 0 0 1 0 2.8L11 20z" /><path d="M7 20h14" /></svg>
+            Erase
+          </button>
           <hr />
-          <label><input type="checkbox" id="snapToggle" checked /> Snap</label>
-          <label><input type="checkbox" id="orthoToggle" checked /> Ortho</label>
-          <label class="toolbar-grid">
-            Grid
-            <input type="number" id="gridSizeInput" min="5" max="200" step="5" />
-          </label>
+          <div class="snap-controls">
+            <label title="Snap points to the grid (G)"><input type="checkbox" id="snapToggle" checked /> Snap</label>
+            <label title="Constrain new segments to horizontal/vertical (O)"><input type="checkbox" id="orthoToggle" checked /> Ortho</label>
+            <label class="toolbar-grid" title="Grid spacing in pixels">
+              Grid px
+              <input type="number" id="gridSizeInput" min="5" max="200" step="5" />
+            </label>
+          </div>
         </aside>
         <section class="canvas-wrap">
           <canvas id="canvas"></canvas>
+          <div class="tool-hint" id="toolHint"></div>
+          <div class="zoombar">
+            <button id="zoomOutBtn" title="Zoom out (-)">−</button>
+            <span id="zoomLevel">100%</span>
+            <button id="zoomInBtn" title="Zoom in (+)">+</button>
+            <button id="zoomFitBtn" title="Zoom to fit content (F)">Fit</button>
+            <button id="zoomResetBtn" title="Reset zoom to 100% (0)">1:1</button>
+          </div>
         </section>
         <aside class="properties">
           <div id="properties"></div>
@@ -362,8 +897,9 @@
       <footer class="statusbar">
         <div class="status-pill" id="statusText">Ready</div>
         <div class="status-pill" id="statusMeta"></div>
-        <div class="status-pill" id="coordReadout"></div>
-        <div class="status-pill">Space + Drag to Pan • Mouse Wheel to Zoom</div>
+        <div class="status-pill" id="measureReadout"></div>
+        <div class="status-pill right" id="coordReadout"></div>
+        <div class="status-pill">Space+Drag or Middle-Click to Pan • Wheel to Zoom • ? for Shortcuts</div>
       </footer>
     </div>
     <div id="jsonModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="jsonModalTitle">
@@ -378,6 +914,63 @@
         <div class="modal-actions">
           <button id="jsonResetBtn" type="button">Reset</button>
           <button id="jsonApplyBtn" class="primary" type="button">Apply JSON</button>
+        </div>
+      </div>
+    </div>
+    <div id="previewModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="previewModalTitle">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h3 id="previewModalTitle">Live Render Preview</h3>
+          <div class="modal-actions">
+            <label><input type="checkbox" id="previewAutoRefresh" /> Auto-refresh</label>
+            <button id="previewRefreshBtn" type="button">Refresh</button>
+            <button id="previewSaveRefreshBtn" class="primary" type="button">Save &amp; Refresh</button>
+            <button id="previewCloseBtn" type="button">Close</button>
+          </div>
+        </div>
+        <div id="previewBody">
+          <img id="previewImg" alt="Rendered floorplan preview" />
+          <div id="previewStatus" class="hidden"></div>
+        </div>
+      </div>
+    </div>
+    <div id="helpModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="helpModalTitle">
+      <div class="modal-content compact">
+        <div class="modal-header">
+          <h3 id="helpModalTitle">Keyboard Shortcuts</h3>
+          <div class="modal-actions">
+            <button id="helpCloseBtn" type="button">Close</button>
+          </div>
+        </div>
+        <div class="shortcuts">
+          <div class="shortcuts-title">Tools</div>
+          <div class="shortcut-row"><span>Select / move</span><kbd>V</kbd></div>
+          <div class="shortcut-row"><span>Wall</span><kbd>W</kbd></div>
+          <div class="shortcut-row"><span>Door</span><kbd>D</kbd></div>
+          <div class="shortcut-row"><span>Sensor</span><kbd>S</kbd></div>
+          <div class="shortcut-row"><span>Thermostat</span><kbd>T</kbd></div>
+          <div class="shortcut-row"><span>Room label</span><kbd>R</kbd></div>
+          <div class="shortcut-row"><span>Stairwell</span><kbd>A</kbd></div>
+          <div class="shortcut-row"><span>Scale calibration</span><kbd>C</kbd></div>
+          <div class="shortcut-row"><span>Erase</span><kbd>E</kbd></div>
+          <div class="shortcuts-title">Editing</div>
+          <div class="shortcut-row"><span>Finish wall / stairwell</span><kbd>Enter</kbd></div>
+          <div class="shortcut-row"><span>Undo last point / cancel / deselect</span><kbd>Esc</kbd></div>
+          <div class="shortcut-row"><span>Delete selection</span><kbd>Del</kbd></div>
+          <div class="shortcut-row"><span>Duplicate selection</span><kbd>Ctrl+D</kbd></div>
+          <div class="shortcut-row"><span>Nudge selection 1px</span><kbd>Arrows</kbd></div>
+          <div class="shortcut-row"><span>Nudge selection by grid</span><kbd>Shift+Arrows</kbd></div>
+          <div class="shortcut-row"><span>Undo / Redo</span><kbd>Ctrl+Z / Ctrl+Shift+Z</kbd></div>
+          <div class="shortcut-row"><span>Save</span><kbd>Ctrl+S</kbd></div>
+          <div class="shortcuts-title">View</div>
+          <div class="shortcut-row"><span>Pan</span><kbd>Space+Drag</kbd></div>
+          <div class="shortcut-row"><span>Zoom</span><kbd>Wheel</kbd></div>
+          <div class="shortcut-row"><span>Zoom in / out</span><kbd>+ / −</kbd></div>
+          <div class="shortcut-row"><span>Zoom to fit</span><kbd>F</kbd></div>
+          <div class="shortcut-row"><span>Reset zoom</span><kbd>0</kbd></div>
+          <div class="shortcut-row"><span>Toggle grid snap</span><kbd>G</kbd></div>
+          <div class="shortcut-row"><span>Toggle ortho</span><kbd>O</kbd></div>
+          <div class="shortcut-row"><span>Render preview</span><kbd>P</kbd></div>
         </div>
       </div>
     </div>

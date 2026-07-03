@@ -59,6 +59,7 @@ class Sensor(BaseModel):
     label_offset_x: int = 10
     label_offset_y: int = -8
     font_size: int = 12
+    label_align: Literal["left", "center", "right"] = "left"
 
 
 class Thermostat(BaseModel):
@@ -75,6 +76,9 @@ class Thermostat(BaseModel):
     label_offset_x: int = 12
     label_offset_y: int = -8
     font_size: int = 12
+    label_align: Literal["left", "center", "right"] = "left"
+    # Editor-only preview setting; persisted so the editor restores it on load.
+    preview_mode: str = "heat_cool"
 
 
 class Stairwell(BaseModel):
@@ -159,6 +163,7 @@ class RoomLabel(BaseModel):
     font_size: int = 16
     label_offset_x: int = 0
     label_offset_y: int = 0
+    label_align: Literal["left", "center", "right"] = "left"
 
 
 class FloorplanV1(BaseModel):
