@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import bisect
+import functools
 import hashlib
-import heapq
 import io
 import json
 import math
 import re
+import threading
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -147,10 +149,65 @@ _solve_cache_key: Optional[Tuple[str, int]] = None
 _solve_cache_grids: Dict[str, np.ndarray] = {}
 _solve_cache_metadata: Dict[str, Dict] = {}
 
+# Stop diffusing once an iteration no longer moves any cell by more than this
+# many degrees. Well below the color resolution of the rendered gradient, so
+# the output is visually identical while idle floors converge early.
+CONVERGENCE_EPS = 1e-4
+_CONVERGENCE_CHECK_INTERVAL = 10
+
+# Geometry-derived intermediates (edge conductance, per-sensor distance
+# fields, stairwell masks, wall/marker layers, flood-fill masks) depend only
+# on the floorplan definition and door open/closed states — not on the sensor
+# temperatures — so they are cached and reused across solves and renders.
+_render_cache_lock = threading.Lock()
+_edge_cache: "OrderedDict[Tuple, Tuple[np.ndarray, np.ndarray]]" = OrderedDict()
+_distance_weight_cache: "OrderedDict[Tuple, np.ndarray]" = OrderedDict()
+_stairwell_mask_cache: "OrderedDict[str, np.ndarray]" = OrderedDict()
+_shape_layer_cache: "OrderedDict[Tuple, Image.Image]" = OrderedDict()
+_flood_mask_cache: "OrderedDict[Tuple, np.ndarray]" = OrderedDict()
+_base_image_cache: "OrderedDict[Tuple, Image.Image]" = OrderedDict()
+
+
+def _cache_get(cache: "OrderedDict", key):
+    with _render_cache_lock:
+        return cache.get(key)
+
+
+def _cache_put(cache: "OrderedDict", key, value, max_entries: int) -> None:
+    with _render_cache_lock:
+        cache[key] = value
+        while len(cache) > max_entries:
+            cache.popitem(last=False)
+
 
 def _floorplans_signature(floorplans: Dict[str, Dict]) -> str:
     payload = json.dumps(floorplans, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _payload_signature(payload: Dict) -> str:
+    data = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+
+def _model_signature(fp: FloorplanV1) -> str:
+    dump = fp.model_dump_json() if hasattr(fp, "model_dump_json") else fp.json()
+    return hashlib.sha256(dump.encode("utf-8")).hexdigest()
+
+
+def _door_state_key(fp: FloorplanV1) -> Tuple[bool, ...]:
+    return tuple(is_door_open(fp, door) for door in fp.doors)
+
+
+def edge_conductance_cached(
+    fp: FloorplanV1, sig: str, door_key: Tuple[bool, ...]
+) -> Tuple[np.ndarray, np.ndarray]:
+    key = (sig, door_key)
+    edges = _cache_get(_edge_cache, key)
+    if edges is None:
+        edges = build_edge_conductance(fp)
+        _cache_put(_edge_cache, key, edges, 8)
+    return edges
 
 
 def solve_all_floorplans_cached(floorplans: Dict[str, Dict]) -> Tuple[Dict[str, np.ndarray], Dict[str, Dict]]:
@@ -237,16 +294,64 @@ def render_floorplan(floor_id: str) -> Image.Image:
 
 
 def solve_all_floorplans(floorplans: Dict[str, Dict]) -> Tuple[Dict[str, np.ndarray], Dict[str, Dict]]:
-    parsed = {}
+    parsed: Dict[str, FloorplanV1] = {}
+    sigs: Dict[str, str] = {}
     for floor_id, payload in floorplans.items():
         parsed[floor_id] = FloorplanV1.parse_obj(payload)
-    grids = {floor_id: initialize_grid(fp) for floor_id, fp in parsed.items()}
+        sigs[floor_id] = _payload_signature(payload)
+
+    # Precompute everything that stays constant across iterations: edge
+    # conductance (walls/doors), padded neighbor weights, and a single
+    # snapshot of the sensor states used both to seed the grid and to pin
+    # sensor cells on every iteration.
+    solver_state: Dict[str, Dict] = {}
+    stair_masks: Dict[str, np.ndarray] = {}
+    for floor_id, fp in parsed.items():
+        door_key = _door_state_key(fp)
+        h_edges, v_edges = edge_conductance_cached(fp, sigs[floor_id], door_key)
+        w_left = np.pad(h_edges, ((0, 0), (1, 0)), mode="constant", constant_values=0)
+        w_right = np.pad(h_edges, ((0, 0), (0, 1)), mode="constant", constant_values=0)
+        w_up = np.pad(v_edges, ((1, 0), (0, 0)), mode="constant", constant_values=0)
+        w_down = np.pad(v_edges, ((0, 1), (0, 0)), mode="constant", constant_values=0)
+        denominator = w_left + w_right + w_up + w_down
+        mask = denominator > 0
+        samples = collect_sensor_samples(fp)
+        pull_samples = [
+            (gy, gx, min(max(fp.solver.sensor_pull * weight, 0.0), 1.0), temp)
+            for gx, gy, temp, weight in samples
+        ]
+        solver_state[floor_id] = {
+            "sig": sigs[floor_id],
+            "door_key": door_key,
+            "h_edges": h_edges,
+            "v_edges": v_edges,
+            "denominator": denominator,
+            "mask": mask,
+            "samples": samples,
+            "pull_samples": pull_samples,
+        }
+        if fp.stairwell and fp.stairwell.link_to_floor_id:
+            stair_masks[floor_id] = stairwell_mask_cached(fp, sigs[floor_id])
+
+    grids = {
+        floor_id: initialize_grid(fp, solver_state[floor_id])
+        for floor_id, fp in parsed.items()
+    }
     metadata: Dict[str, Dict] = {floor_id: {} for floor_id in parsed}
     max_iterations = max((fp.solver.iterations for fp in parsed.values()), default=0)
-    for _ in range(max_iterations):
-        for floor_id, fp in parsed.items():
-            grids[floor_id] = diffuse_grid(fp, grids[floor_id])
-        apply_stairwell_coupling(parsed, grids)
+    for iteration in range(max_iterations):
+        check = CONVERGENCE_EPS > 0 and (iteration + 1) % _CONVERGENCE_CHECK_INTERVAL == 0
+        previous = {floor_id: grid.copy() for floor_id, grid in grids.items()} if check else None
+        for floor_id in parsed:
+            grids[floor_id] = diffuse_grid(grids[floor_id], solver_state[floor_id])
+        apply_stairwell_coupling(parsed, grids, stair_masks)
+        if check:
+            max_delta = max(
+                (float(np.max(np.abs(grids[floor_id] - previous[floor_id]))) for floor_id in grids),
+                default=0.0,
+            )
+            if max_delta < CONVERGENCE_EPS:
+                break
     for floor_id, fp in parsed.items():
         metadata[floor_id] = {
             "grid_width": fp.solver.grid_w,
@@ -256,9 +361,10 @@ def solve_all_floorplans(floorplans: Dict[str, Dict]) -> Tuple[Dict[str, np.ndar
     return grids, metadata
 
 
-def initialize_grid(fp: FloorplanV1) -> np.ndarray:
-    sensor_samples: List[Tuple[int, int, float, float]] = []
-    temps: List[float] = []
+def collect_sensor_samples(fp: FloorplanV1) -> List[Tuple[int, int, float, float]]:
+    """Snapshot (grid_x, grid_y, temperature, weight) for every sensor with a
+    usable state, taken once per solve so every iteration sees the same data."""
+    samples: List[Tuple[int, int, float, float]] = []
     with ha_lock:
         for sensor in fp.sensors:
             state = ha_states.get(sensor.entity) if sensor.entity else None
@@ -272,23 +378,46 @@ def initialize_grid(fp: FloorplanV1) -> np.ndarray:
             gy = int(sy / fp.canvas.height * fp.solver.grid_h)
             gx = min(max(gx, 0), fp.solver.grid_w - 1)
             gy = min(max(gy, 0), fp.solver.grid_h - 1)
-            weight = max(sensor.weight, 0.01)
-            sensor_samples.append((gx, gy, temp, weight))
-            temps.append(temp)
+            samples.append((gx, gy, temp, sensor.weight))
+    return samples
 
+
+def distance_weight_field(
+    sig: str,
+    door_key: Tuple[bool, ...],
+    gx: int,
+    gy: int,
+    h_edges: np.ndarray,
+    v_edges: np.ndarray,
+) -> np.ndarray:
+    """1/(distance^4 + 1) falloff field for a sensor cell. Depends only on the
+    wall/door geometry, so it is cached across solves — temperature changes
+    reuse the cached field instead of re-running a full graph search."""
+    key = (sig, door_key, gx, gy)
+    field = _cache_get(_distance_weight_cache, key)
+    if field is None:
+        distances = bfs_distances(gx, gy, h_edges, v_edges)
+        field = 1.0 / (distances**4 + 1.0)
+        _cache_put(_distance_weight_cache, key, field, 32)
+    return field
+
+
+def initialize_grid(fp: FloorplanV1, state: Dict) -> np.ndarray:
+    samples = state["samples"]
+    temps = [temp for _gx, _gy, temp, _weight in samples]
     default_temp = float(np.mean(temps)) if temps else 70.0
-    if not sensor_samples:
+    if not samples:
         return np.full((fp.solver.grid_h, fp.solver.grid_w), default_temp, dtype=float)
 
-    h_edges, v_edges = build_edge_conductance(fp)
     height, width = fp.solver.grid_h, fp.solver.grid_w
-
     weighted_sum = np.zeros((height, width), dtype=float)
     weight_sum = np.zeros((height, width), dtype=float)
 
-    for gx, gy, temp, weight in sensor_samples:
-        distances = dijkstra_distances(gx, gy, h_edges, v_edges)
-        sensor_weight = weight * (1.0 / (distances**4 + 1.0))
+    for gx, gy, temp, weight in samples:
+        field = distance_weight_field(
+            state["sig"], state["door_key"], gx, gy, state["h_edges"], state["v_edges"]
+        )
+        sensor_weight = max(weight, 0.01) * field
         weighted_sum += sensor_weight * temp
         weight_sum += sensor_weight
 
@@ -301,26 +430,24 @@ def initialize_grid(fp: FloorplanV1) -> np.ndarray:
     return grid
 
 
-def diffuse_grid(fp: FloorplanV1, grid: np.ndarray) -> np.ndarray:
-    h_edges, v_edges = build_edge_conductance(fp)
-    w_left = np.pad(h_edges, ((0, 0), (1, 0)), mode="constant", constant_values=0)
-    w_right = np.pad(h_edges, ((0, 0), (0, 1)), mode="constant", constant_values=0)
-    w_up = np.pad(v_edges, ((1, 0), (0, 0)), mode="constant", constant_values=0)
-    w_down = np.pad(v_edges, ((0, 1), (0, 0)), mode="constant", constant_values=0)
+def diffuse_grid(grid: np.ndarray, state: Dict) -> np.ndarray:
+    h_edges = state["h_edges"]
+    v_edges = state["v_edges"]
 
-    n_left = np.roll(grid, 1, axis=1)
-    n_right = np.roll(grid, -1, axis=1)
-    n_up = np.roll(grid, 1, axis=0)
-    n_down = np.roll(grid, -1, axis=0)
+    # Conductance-weighted neighbor sum, accumulated left/right/up/down via
+    # slices. Border cells simply receive no contribution from outside the
+    # grid (their edge weight is zero in the denominator).
+    numerator = np.zeros_like(grid)
+    numerator[:, 1:] += grid[:, :-1] * h_edges
+    numerator[:, :-1] += grid[:, 1:] * h_edges
+    numerator[1:, :] += grid[:-1, :] * v_edges
+    numerator[:-1, :] += grid[1:, :] * v_edges
 
-    numerator = (n_left * w_left) + (n_right * w_right) + (n_up * w_up) + (n_down * w_down)
-    denominator = w_left + w_right + w_up + w_down
-
-    mask = denominator > 0
     new_grid = grid.copy()
-    new_grid[mask] = numerator[mask] / denominator[mask]
+    np.divide(numerator, state["denominator"], out=new_grid, where=state["mask"])
 
-    apply_sensor_pull(fp, new_grid)
+    for gy, gx, pull, temp in state["pull_samples"]:
+        new_grid[gy, gx] = (1 - pull) * new_grid[gy, gx] + pull * temp
     return new_grid
 
 
@@ -381,55 +508,47 @@ def rasterize_line_to_mask(fp: FloorplanV1, a: List[float], b: List[float], mask
             mask[gy, gx] = True
 
 
-def dijkstra_distances(start_x: int, start_y: int, h_edges: np.ndarray, v_edges: np.ndarray) -> np.ndarray:
+def bfs_distances(start_x: int, start_y: int, h_edges: np.ndarray, v_edges: np.ndarray) -> np.ndarray:
+    """Shortest 4-neighbor path length from the start cell, honoring blocked
+    edges. All edges cost 1, so a vectorized frontier expansion produces the
+    same distances as Dijkstra with none of the per-cell Python overhead."""
     height, width = h_edges.shape[0], h_edges.shape[1] + 1
+    open_h = h_edges > 0
+    open_v = v_edges > 0
     distances = np.full((height, width), np.inf, dtype=float)
     distances[start_y, start_x] = 0.0
-    heap: List[Tuple[float, int, int]] = [(0.0, start_y, start_x)]
-    while heap:
-        cost, y, x = heapq.heappop(heap)
-        if cost > distances[y, x]:
-            continue
-
-        # Neighbor checks
-        if x > 0 and h_edges[y, x - 1] > 0:
-            if cost + 1.0 < distances[y, x - 1]:
-                distances[y, x - 1] = cost + 1.0
-                heapq.heappush(heap, (cost + 1.0, y, x - 1))
-        if x < width - 1 and h_edges[y, x] > 0:
-            if cost + 1.0 < distances[y, x + 1]:
-                distances[y, x + 1] = cost + 1.0
-                heapq.heappush(heap, (cost + 1.0, y, x + 1))
-        if y > 0 and v_edges[y - 1, x] > 0:
-            if cost + 1.0 < distances[y - 1, x]:
-                distances[y - 1, x] = cost + 1.0
-                heapq.heappush(heap, (cost + 1.0, y - 1, x))
-        if y < height - 1 and v_edges[y, x] > 0:
-            if cost + 1.0 < distances[y + 1, x]:
-                distances[y + 1, x] = cost + 1.0
-                heapq.heappush(heap, (cost + 1.0, y + 1, x))
-    return distances
+    frontier = np.zeros((height, width), dtype=bool)
+    frontier[start_y, start_x] = True
+    visited = frontier.copy()
+    step = 0
+    while True:
+        nxt = np.zeros_like(frontier)
+        nxt[:, 1:] |= frontier[:, :-1] & open_h
+        nxt[:, :-1] |= frontier[:, 1:] & open_h
+        nxt[1:, :] |= frontier[:-1, :] & open_v
+        nxt[:-1, :] |= frontier[1:, :] & open_v
+        nxt &= ~visited
+        if not nxt.any():
+            return distances
+        step += 1
+        distances[nxt] = step
+        visited |= nxt
+        frontier = nxt
 
 
-def apply_sensor_pull(fp: FloorplanV1, grid: np.ndarray) -> None:
-    for sensor in fp.sensors:
-        with ha_lock:
-            state = ha_states.get(sensor.entity) if sensor.entity else None
-        if not state:
-            continue
-        temp = parse_float(state.state)
-        if temp == 0.0:
-            continue
-        sx, sy = point_xy(sensor.pos)
-        gx = int(sx / fp.canvas.width * fp.solver.grid_w)
-        gy = int(sy / fp.canvas.height * fp.solver.grid_h)
-        gx = min(max(gx, 0), fp.solver.grid_w - 1)
-        gy = min(max(gy, 0), fp.solver.grid_h - 1)
-        pull = min(max(fp.solver.sensor_pull * sensor.weight, 0.0), 1.0)
-        grid[gy, gx] = (1 - pull) * grid[gy, gx] + pull * temp
+def stairwell_mask_cached(fp: FloorplanV1, sig: str) -> np.ndarray:
+    mask = _cache_get(_stairwell_mask_cache, sig)
+    if mask is None:
+        mask = polygon_mask(fp, fp.stairwell.polygon)
+        _cache_put(_stairwell_mask_cache, sig, mask, 16)
+    return mask
 
 
-def apply_stairwell_coupling(parsed: Dict[str, FloorplanV1], grids: Dict[str, np.ndarray]) -> None:
+def apply_stairwell_coupling(
+    parsed: Dict[str, FloorplanV1],
+    grids: Dict[str, np.ndarray],
+    masks: Dict[str, np.ndarray],
+) -> None:
     for floor_id, fp in parsed.items():
         stair = fp.stairwell
         if not stair or not stair.link_to_floor_id:
@@ -439,7 +558,9 @@ def apply_stairwell_coupling(parsed: Dict[str, FloorplanV1], grids: Dict[str, np
             continue
         source_grid = grids[floor_id]
         target_grid = grids[target]
-        mask = polygon_mask(fp, stair.polygon)
+        mask = masks.get(floor_id)
+        if mask is None:
+            continue
         coupling = stair.coupling
         source_grid[mask] = source_grid[mask] + coupling * (target_grid[mask] - source_grid[mask])
         target_grid[mask] = target_grid[mask] + coupling * (source_grid[mask] - target_grid[mask])
@@ -483,6 +604,14 @@ def render_floorplan_base_image(
     metadata: Dict,
     range_override: Optional[Tuple[float, float]] = None,
 ) -> Image.Image:
+    # The rendered image is fully determined by the floorplan definition, the
+    # HA state revision (temperatures, door/thermostat states) and the color
+    # range, so identical requests (dashboard polling, frame capture) reuse
+    # the cached result instead of re-rendering.
+    cache_key = (floor_id, _payload_signature(payload), current_state_revision(), range_override)
+    cached = _cache_get(_base_image_cache, cache_key)
+    if cached is not None:
+        return cached
     fp = FloorplanV1.parse_obj(payload)
     canvas = make_background((fp.canvas.width, fp.canvas.height))
     min_f, max_f = range_override or resolve_temperature_range(fp, grid)
@@ -503,7 +632,9 @@ def render_floorplan_base_image(
         if crop_box:
             canvas, crop_box = expand_canvas_for_crop(canvas, crop_box)
             canvas = canvas.crop(crop_box)
-    return canvas.convert("RGB")
+    image = canvas.convert("RGB")
+    _cache_put(_base_image_cache, cache_key, image, 8)
+    return image
 
 
 def render_house_shadow(mask: np.ndarray, size: Tuple[int, int]) -> Image.Image:
@@ -529,6 +660,11 @@ def render_house_shadow(mask: np.ndarray, size: Tuple[int, int]) -> Image.Image:
 
 def build_floorplan_mask_floodfill(fp: FloorplanV1) -> np.ndarray:
     """Creates a mask of the 'inside' of the floorplan using flood fill from sensors."""
+    # Depends only on geometry and door open/closed states, so cache it.
+    cache_key = (_model_signature(fp), _door_state_key(fp))
+    cached = _cache_get(_flood_mask_cache, cache_key)
+    if cached is not None:
+        return cached
     # 1. Setup low-res mask
     w, h = fp.canvas.width // 4, fp.canvas.height // 4
     mask_img = Image.new("L", (w, h), 0)
@@ -555,9 +691,10 @@ def build_floorplan_mask_floodfill(fp: FloorplanV1) -> np.ndarray:
             # If door is CLOSED, draw WHITE (255) to seal it
             draw.line(pts, fill=255, width=2)
 
-    # 4. Flood Fill from Sensors
+    # 4. Flood Fill from Sensors (vectorized frontier expansion)
     arr = np.array(mask_img)  # Barriers=255, Empty=0
-    filled = np.zeros_like(arr, dtype=bool)
+    free = arr == 0
+    filled = np.zeros_like(free)
 
     seeds = []
     for s in fp.sensors:
@@ -565,23 +702,20 @@ def build_floorplan_mask_floodfill(fp: FloorplanV1) -> np.ndarray:
     for t in fp.thermostats:
         seeds.append((int(t.pos[0] / 4), int(t.pos[1] / 4)))
 
-    stack = []
     for (sx, sy) in seeds:
-        if 0 <= sx < w and 0 <= sy < h and arr[sy, sx] == 0:
-            stack.append((sx, sy))
+        if 0 <= sx < w and 0 <= sy < h and free[sy, sx]:
+            filled[sy, sx] = True
 
-    visited = set(stack)
-    while stack:
-        cx, cy = stack.pop()
-        filled[cy, cx] = True
-
-        for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-            nx, ny = cx + dx, cy + dy
-            if 0 <= nx < w and 0 <= ny < h:
-                # Pass if not visited AND not a barrier (0)
-                if (nx, ny) not in visited and arr[ny, nx] == 0:
-                    visited.add((nx, ny))
-                    stack.append((nx, ny))
+    frontier = filled.copy()
+    while frontier.any():
+        nxt = np.zeros_like(frontier)
+        nxt[1:, :] |= frontier[:-1, :]
+        nxt[:-1, :] |= frontier[1:, :]
+        nxt[:, 1:] |= frontier[:, :-1]
+        nxt[:, :-1] |= frontier[:, 1:]
+        nxt &= free & ~filled
+        filled |= nxt
+        frontier = nxt
 
     # 5. Fallback: If map is empty (no valid sensors), show everything
     if not np.any(filled):
@@ -589,7 +723,9 @@ def build_floorplan_mask_floodfill(fp: FloorplanV1) -> np.ndarray:
 
     # 6. Resize to full resolution
     full_mask = Image.fromarray(filled).resize((fp.canvas.width, fp.canvas.height), Image.Resampling.NEAREST)
-    return np.array(full_mask)
+    result = np.array(full_mask)
+    _cache_put(_flood_mask_cache, cache_key, result, 8)
+    return result
 
 
 def render_heatmap(
@@ -775,6 +911,13 @@ def draw_floorplan_overlay(
 def render_shape_layer(fp: FloorplanV1, size: Tuple[int, int]) -> Image.Image:
     """Render walls and markers on a supersampled transparent layer for smooth,
     anti-aliased edges, then downscale with high-quality resampling."""
+    # Purely geometric (walls, doors, marker positions), so cache per
+    # floorplan — supersampling plus Gaussian blur is one of the most
+    # expensive steps in a render and never changes between state updates.
+    cache_key = (_model_signature(fp), size)
+    cached = _cache_get(_shape_layer_cache, cache_key)
+    if cached is not None:
+        return cached
     s = SHAPE_SS
     big = (size[0] * s, size[1] * s)
     layer = Image.new("RGBA", big, (0, 0, 0, 0))
@@ -845,7 +988,9 @@ def render_shape_layer(fp: FloorplanV1, size: Tuple[int, int]) -> Image.Image:
             width=max(1, int(round(2 * s))),
         )
 
-    return layer.resize(size, Image.Resampling.LANCZOS)
+    result = layer.resize(size, Image.Resampling.LANCZOS)
+    _cache_put(_shape_layer_cache, cache_key, result, 8)
+    return result
 
 
 def thermostat_label_lines(fp: FloorplanV1, thermo: Thermostat) -> List[str]:
@@ -1593,8 +1738,29 @@ def draw_thermostat_setpoint_chart(
     return total_height
 
 
+_font_cache_local = threading.local()
+
+
 def get_font(size: int, font_path: Optional[str] = None) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    """Tries to load a scalable font. Falls back to default if unavailable."""
+    """Tries to load a scalable font. Falls back to default if unavailable.
+
+    Fonts are cached per thread (FreeType font objects are not thread-safe)
+    so repeated label drawing doesn't reload the TTF from disk every call."""
+    cache = getattr(_font_cache_local, "fonts", None)
+    if cache is None:
+        cache = _font_cache_local.fonts = {}
+    cache_key = (size, font_path)
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+    font = _load_font(size, font_path)
+    if len(cache) > 64:
+        cache.clear()
+    cache[cache_key] = font
+    return font
+
+
+def _load_font(size: int, font_path: Optional[str] = None) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     # Common paths for DejaVuSans on Linux/Debian
     candidates = [font_path] if font_path else []
     candidates += [
@@ -2113,9 +2279,11 @@ def image_to_png_bytes(image: Image.Image) -> bytes:
     return output.getvalue()
 
 
+@functools.lru_cache(maxsize=32)
 def render_title_pill(text: str, font_size: int) -> Image.Image:
     """A centered floor title inside a soft rounded 'pill', supersampled for
-    clean edges."""
+    clean edges. Cached — timelapse builds stitch the same pills onto
+    thousands of frames."""
     s = SHAPE_SS
     font = get_font(font_size * s)
     text_w, text_h = measure_text_size(font, text)
