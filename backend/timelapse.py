@@ -70,7 +70,19 @@ def save_frame(floor_id: str, image: Image.Image) -> None:
     image.save(path)
 
 
+_last_frame_cleanup = 0.0
+_FRAME_CLEANUP_INTERVAL_SECONDS = 600.0
+
+
 def cleanup_frames() -> None:
+    # Scanning tens of thousands of frame files every poll cycle is wasted
+    # work — with a retention window measured in hours, sweeping every ten
+    # minutes is more than enough.
+    global _last_frame_cleanup
+    now = time.time()
+    if now - _last_frame_cleanup < _FRAME_CLEANUP_INTERVAL_SECONDS:
+        return
+    _last_frame_cleanup = now
     cutoff = time.time() - (config.timelapse_frame_retention_hours * 60 * 60)
     frames_root = Path(config.data_path) / "frames"
     for floor_dir in frames_root.glob("*"):
