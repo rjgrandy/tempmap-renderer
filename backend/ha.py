@@ -9,6 +9,7 @@ import requests
 
 from .config import config
 from .models import EntityState, FloorplanV1
+from . import stats
 
 ha_lock = threading.Lock()
 ha_states: Dict[str, EntityState] = {}
@@ -99,6 +100,7 @@ def poll_home_assistant(entities: List[str]) -> None:
         }
         if changed:
             ha_state_revision += 1
+            stats.incr("state_revision_bumps")
         ha_states.clear()
         ha_states.update(states)
         ha_missing.clear()
@@ -221,7 +223,9 @@ def _cached_history_raw(
             or (end_time - fetched_end).total_seconds() <= _HISTORY_CACHE_TTL_SECONDS
         )
         if covered:
+            stats.incr("history_cache_hits")
             return _slice_series(series, start, end_time)
+    stats.incr("history_http_fetches")
     fetch_end = max(end_time, now_dt)
     series = _fetch_history_raw(entity_id, start, fetch_end)
     if series is None:

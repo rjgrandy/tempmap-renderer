@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Tuple
 from fastapi import HTTPException
 from PIL import Image
 
+from . import stats
 from .config import config
 from .ha import current_state_revision
 from .models import FloorplanV1, SidebarContext
@@ -68,6 +69,7 @@ def save_frame(floor_id: str, image: Image.Image) -> None:
     timestamp = int(time.time())
     path = frames_dir / f"{timestamp}.png"
     image.save(path)
+    stats.incr("frames_written")
 
 
 _last_frame_cleanup = 0.0
@@ -113,7 +115,7 @@ def maybe_render_rolling_timelapses(floorplans: Dict[str, Dict]) -> None:
 
 def render_rolling_timelapses(floorplans: Dict[str, Dict]) -> None:
     global timelapse_is_running
-    with timelapse_lock:
+    with timelapse_lock, stats.timed("rolling_timelapse_build"):
         if timelapse_is_running:
             return
         timelapse_is_running = True
