@@ -8,6 +8,7 @@ import json
 import math
 import re
 import threading
+import time
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,6 +18,7 @@ import numpy as np
 from fastapi import HTTPException
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
+from . import stats
 from .config import config
 from .ha import (
     format_entity_temperature,
@@ -214,8 +216,10 @@ def solve_all_floorplans_cached(floorplans: Dict[str, Dict]) -> Tuple[Dict[str, 
     global _solve_cache_key, _solve_cache_grids, _solve_cache_metadata
     key = (_floorplans_signature(floorplans), current_state_revision())
     if _solve_cache_key == key:
+        stats.incr("solve_cache_hits")
         return _solve_cache_grids, _solve_cache_metadata
-    grids, metadata = solve_all_floorplans(floorplans)
+    with stats.timed("solve"):
+        grids, metadata = solve_all_floorplans(floorplans)
     _solve_cache_key = key
     _solve_cache_grids = grids
     _solve_cache_metadata = metadata
@@ -611,7 +615,9 @@ def render_floorplan_base_image(
     cache_key = (floor_id, _payload_signature(payload), current_state_revision(), range_override)
     cached = _cache_get(_base_image_cache, cache_key)
     if cached is not None:
+        stats.incr("base_image_cache_hits")
         return cached
+    render_start = time.perf_counter()
     fp = FloorplanV1.parse_obj(payload)
     canvas = make_background((fp.canvas.width, fp.canvas.height))
     min_f, max_f = range_override or resolve_temperature_range(fp, grid)
@@ -634,6 +640,7 @@ def render_floorplan_base_image(
             canvas = canvas.crop(crop_box)
     image = canvas.convert("RGB")
     _cache_put(_base_image_cache, cache_key, image, 8)
+    stats.observe("base_image_render", time.perf_counter() - render_start)
     return image
 
 
@@ -2155,15 +2162,16 @@ def render_sidebar_image(
     panel_width = compute_sidebar_panel_width(context, components)
     if panel_height <= 0 or panel_width <= 0:
         return None
-    margin = context.primary_floorplan.render.exterior_margin
-    width = panel_width + (margin * 2)
-    height = panel_height + (margin * 2)
-    if target_height is not None:
-        height = max(height, target_height)
-    canvas = Image.new("RGBA", (width, height), BG_COLOR)
-    draw = ImageDraw.Draw(canvas)
-    draw_info_panel(draw, context, canvas.size, align=align, now=now)
-    return canvas.convert("RGB")
+    with stats.timed("sidebar_render"):
+        margin = context.primary_floorplan.render.exterior_margin
+        width = panel_width + (margin * 2)
+        height = panel_height + (margin * 2)
+        if target_height is not None:
+            height = max(height, target_height)
+        canvas = Image.new("RGBA", (width, height), BG_COLOR)
+        draw = ImageDraw.Draw(canvas)
+        draw_info_panel(draw, context, canvas.size, align=align, now=now)
+        return canvas.convert("RGB")
 
 
 def attach_sidebar_to_floorplan(

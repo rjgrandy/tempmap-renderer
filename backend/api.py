@@ -7,6 +7,7 @@ import requests
 from fastapi import APIRouter, HTTPException, Response
 from fastapi.responses import FileResponse
 
+from . import stats
 from .config import config
 from .ha import get_entity_states
 from .models import RenameFloorplanRequest
@@ -105,9 +106,16 @@ def get_ha_states(entities: Optional[str] = None) -> Dict[str, Dict[str, str]]:
 
 @router.get("/render/live/{floor_id}.png")
 def render_live_png(floor_id: str) -> Response:
-    image = render_floorplan(floor_id)
-    image_bytes = image_to_png_bytes(image)
+    with stats.timed("live_png_request"):
+        image = render_floorplan(floor_id)
+        image_bytes = image_to_png_bytes(image)
     return Response(content=image_bytes, media_type="image/png", headers={"Cache-Control": "no-store"})
+
+
+@router.get("/api/debug/stats")
+def debug_stats() -> Dict:
+    """CPU/work attribution counters for diagnosing high usage."""
+    return stats.snapshot()
 
 
 @router.get("/api/timelapse/{floor_id}")
