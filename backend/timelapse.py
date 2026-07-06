@@ -240,12 +240,18 @@ def build_timelapse_video(
             min_f = min(range_pair[0] for range_pair in ranges)
             max_f = max(range_pair[1] for range_pair in ranges)
             sidebar_context = resolve_sidebar_context(parsed_floorplans, min_f, max_f)
+    # The encoded video only ever contains target_duration * fps frames, so
+    # pick the kept sample times BEFORE compositing instead of rendering the
+    # full window and throwing most of it away afterwards. The selection uses
+    # the same stride formula as the old post-render downsampling, so the
+    # resulting video frames are identical.
+    max_frames = max(1, int(target_duration_seconds * fps))
     with tempfile.TemporaryDirectory() as tmp_dir:
         temp_dir = Path(tmp_dir)
         if stitch and len(available_floor_ids) > 1:
             generate_stitched_frames(
                 temp_dir=temp_dir,
-                sample_times=sample_times,
+                sample_times=downsample_frames(sample_times, max_frames),
                 frames_by_floor=frames_by_floor,
                 floor_ids=available_floor_ids,
                 sidebar_context=sidebar_context,
@@ -257,20 +263,12 @@ def build_timelapse_video(
                 frames_by_floor=frames_by_floor,
                 floor_id=available_floor_ids[0],
                 sidebar_context=sidebar_context,
+                max_frames=max_frames,
             )
         frame_paths = sorted(temp_dir.glob("frame_*.png"))
         if not frame_paths:
             raise HTTPException(status_code=404, detail="No frames available to build timelapse")
-        max_frames = max(1, int(target_duration_seconds * fps))
-        frames_dir = temp_dir
-        if len(frame_paths) > max_frames:
-            frame_paths = downsample_frames(frame_paths, max_frames)
-            frames_dir = temp_dir / "downsampled"
-            frames_dir.mkdir(exist_ok=True)
-            for idx, path in enumerate(frame_paths):
-                new_path = frames_dir / f"frame_{idx:05d}.png"
-                new_path.write_bytes(path.read_bytes())
-        run_ffmpeg_encode(frames_dir, fps, output_path)
+        run_ffmpeg_encode(temp_dir, fps, output_path)
 
 
 def load_frame_index(floor_id: str, start_ts: float) -> List[Tuple[int, Path]]:
@@ -306,15 +304,21 @@ def generate_single_floor_frames(
     frames_by_floor: Dict[str, List[Tuple[int, Path]]],
     floor_id: str,
     sidebar_context: Optional[SidebarContext],
+    max_frames: int,
 ) -> None:
     frames = frames_by_floor.get(floor_id, [])
     if not frames:
         return
-    idx = 0
+    # Resolve first (cheap), then keep only the frames that will actually end
+    # up in the video before doing any compositing (expensive).
+    resolved: List[Tuple[int, Path]] = []
     for sample_time in sample_times:
         frame_path = resolve_frame_for_time(frames, sample_time)
-        if frame_path is None:
-            continue
+        if frame_path is not None:
+            resolved.append((sample_time, frame_path))
+    resolved = downsample_frames(resolved, max_frames)
+    stats.incr("timelapse_frames_composited", len(resolved))
+    for idx, (sample_time, frame_path) in enumerate(resolved):
         target = temp_dir / f"frame_{idx:05d}.png"
         if sidebar_context is None:
             target.write_bytes(frame_path.read_bytes())
@@ -327,8 +331,10 @@ def generate_single_floor_frames(
                     now=datetime.fromtimestamp(sample_time, tz=timezone.utc),
                 )
                 combined = attach_sidebar_to_floorplan(image.convert("RGB"), sidebar_image)
-                combined.save(target)
-        idx += 1
+                # These frames are transient ffmpeg input; a low PNG
+                # compression level trades scratch-disk bytes for much less
+                # CPU with pixel-identical output.
+                combined.save(target, compress_level=1)
 
 
 def generate_stitched_frames(
@@ -356,6 +362,7 @@ def generate_stitched_frames(
         else:
             fallback_images[floor_id] = Image.new("RGBA", base_size, (0, 0, 0, 255))
     frame_idx = 0
+    stats.incr("timelapse_frames_composited", len(sample_times))
     try:
         for sample_time in sample_times:
             images: List[Tuple[Optional[str], Image.Image]] = []
@@ -389,7 +396,7 @@ def generate_stitched_frames(
                 config.timelapse_label_font_size,
             )
             target = temp_dir / f"frame_{frame_idx:05d}.png"
-            stitched.save(target)
+            stitched.save(target, compress_level=1)
             frame_idx += 1
             for image in opened_images:
                 image.close()
@@ -398,13 +405,15 @@ def generate_stitched_frames(
             image.close()
 
 
-def downsample_frames(frame_paths: List[Path], max_frames: int) -> List[Path]:
+def downsample_frames(items: List, max_frames: int) -> List:
+    """Evenly stride a list down to max_frames entries (used for both sample
+    times and resolved frame tuples)."""
     if max_frames <= 0:
         return []
-    if len(frame_paths) <= max_frames:
-        return frame_paths
-    stride = len(frame_paths) / max_frames
-    return [frame_paths[int(i * stride)] for i in range(max_frames)]
+    if len(items) <= max_frames:
+        return items
+    stride = len(items) / max_frames
+    return [items[int(i * stride)] for i in range(max_frames)]
 
 
 def run_ffmpeg_encode(temp_dir: Path, fps: int, output_path: Path) -> None:
@@ -419,6 +428,10 @@ def run_ffmpeg_encode(temp_dir: Path, fps: int, output_path: Path) -> None:
         "scale=trunc(iw/2)*2:trunc(ih/2)*2",
         "-c:v",
         "libx264",
+        # veryfast encodes at the same quality target (CRF) for roughly a
+        # third of the CPU of the default preset, at slightly larger files.
+        "-preset",
+        "veryfast",
         "-pix_fmt",
         "yuv420p",
         str(output_path),
